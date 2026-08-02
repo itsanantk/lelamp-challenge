@@ -146,7 +146,12 @@ class MemoryAgent:
 
     def _execute_tool(self, name: str, tool_input: dict) -> dict:
         if name == "recall_object_location":
-            obs = self.store.get_latest_by_class(tool_input.get("object_name", ""))
+            # `.get(key, "")` only falls back to "" when the key is
+            # *missing* -- a tool call with an explicit {"object_name":
+            # null} still gets None through, which normalize_class then
+            # crashes on (.strip() on None). `or ""` catches None and
+            # empty string the same way.
+            obs = self.store.get_latest_by_class(str(tool_input.get("object_name") or ""))
             if obs is None:
                 self.last_recall = RecallResult()
                 return {"found": False}
@@ -201,10 +206,22 @@ class MemoryAgent:
         )
         while response.stop_reason == "tool_use":
             self.messages.append({"role": "assistant", "content": response.content})
+            # Anthropic requires every tool_use in that message to have a
+            # matching tool_result in the next one -- if _execute_tool
+            # raised here and skipped straight to the except, the tool_use
+            # above would be left permanently unpaired in self.messages
+            # (an instance attribute kept across turns), poisoning every
+            # future call in the session with the same 400, not just this
+            # one. An error result keeps the pairing intact either way and
+            # lets the model react to the failure instead of the whole
+            # exchange dying.
             results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    result = self._execute_tool(block.name, block.input)
+                    try:
+                        result = self._execute_tool(block.name, block.input)
+                    except Exception as e:
+                        result = {"error": f"tool failed: {e}"}
                     results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(result)})
             self.messages.append({"role": "user", "content": results})
             response = self.client.messages.create(
@@ -230,9 +247,15 @@ class MemoryAgent:
 
         while message.tool_calls:
             self.messages.append(message.model_dump(exclude_none=True))
+            # Same reasoning as the Anthropic loop below -- every tool_call
+            # here needs a matching "tool" role reply in self.messages, or
+            # the gap persists across turns for the rest of the session.
             for call in message.tool_calls:
-                args = json.loads(call.function.arguments or "{}")
-                result = self._execute_tool(call.function.name, args)
+                try:
+                    args = json.loads(call.function.arguments or "{}")
+                    result = self._execute_tool(call.function.name, args)
+                except Exception as e:
+                    result = {"error": f"tool failed: {e}"}
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
             response = self.client.chat.completions.create(
                 model=config.OPENAI_MODEL, messages=self.messages, tools=tools, tool_choice="auto",

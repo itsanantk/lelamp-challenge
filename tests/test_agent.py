@@ -84,3 +84,72 @@ def test_ask_resets_last_light_action_and_last_recall_at_the_start_of_each_turn(
 
     assert agent.last_light_action is None
     assert agent.last_recall.observation is None
+
+
+class _FakeStore:
+    def get_latest_by_class(self, object_class):
+        assert isinstance(object_class, str), "must never reach the store as None"
+        return None
+
+
+def test_recall_with_an_explicit_null_object_name_does_not_crash():
+    # .get("object_name", "") only falls back to "" when the key is
+    # *missing* -- a tool call with an explicit {"object_name": null}
+    # still passes None through, which used to crash inside
+    # normalize_class (None.strip()).
+    agent = _agent()
+    agent.store = _FakeStore()
+    result = agent._execute_tool("recall_object_location", {"object_name": None})
+    assert result == {"found": False}
+
+
+class _FakeToolUseBlock:
+    def __init__(self, name, tool_input, id_="toolu_test123"):
+        self.type = "tool_use"
+        self.name = name
+        self.input = tool_input
+        self.id = id_
+
+
+class _SequencedMessages:
+    def __init__(self, responses):
+        self._responses = list(responses)
+
+    def create(self, **kwargs):
+        return self._responses.pop(0)
+
+
+class _SequencedClient:
+    def __init__(self, responses):
+        self.messages = _SequencedMessages(responses)
+
+
+def test_a_tool_that_raises_still_gets_a_paired_tool_result():
+    # Real bug, reproduced live: if _execute_tool raised, the code used to
+    # skip straight past appending the matching tool_result, leaving that
+    # turn's tool_use permanently unpaired in self.messages (an instance
+    # attribute kept across turns). Every later call in the session then
+    # resent that same broken history and failed with Anthropic's "tool_use
+    # ids were found without tool_result blocks" 400 -- not just that one
+    # turn, every turn after it too. An error result must keep the pairing
+    # intact instead.
+    agent = _agent()
+    agent.provider = "anthropic"
+    agent.messages = []
+    tool_use = _FakeToolUseBlock("recall_object_location", {"object_name": "phone"})
+    first_response = type("R", (), {"stop_reason": "tool_use", "content": [tool_use]})()
+    second_response = _FakeResponse("here's what I found")
+    agent.client = _SequencedClient([first_response, second_response])
+
+    def _boom(name, tool_input):
+        raise RuntimeError("simulated tool failure")
+
+    agent._execute_tool = _boom
+
+    reply = agent.ask("where's my phone?")
+
+    assert reply == "here's what I found"
+    tool_result_msg = agent.messages[2]
+    assert tool_result_msg["role"] == "user"
+    assert tool_result_msg["content"][0]["tool_use_id"] == "toolu_test123"
+    assert "error" in tool_result_msg["content"][0]["content"]
