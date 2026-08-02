@@ -1,0 +1,10 @@
+opencv-python>=5.0
+mediapipe>=1.0
+ultralytics>=8.4
+torch>=2.10
+anthropic>=0.120
+openai>=2.30
+pyttsx3>=2.99
+openai-whisper>=20250625
+sounddevice>=0.5
+numpy>=2.4

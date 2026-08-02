@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+models/*.task
+models/*.pt
+logs/*.csv
+logs/*.sqlite3
+logs/*.json
+recordings/*.mp4
+.venv/
+SW_CV Challenge.pdf
