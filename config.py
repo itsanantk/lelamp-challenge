@@ -70,6 +70,14 @@ YOLO_SCAN_INTERVAL_S = 0.35       # normal cadence, interval-triggered (CPU only
 YOLO_FAST_SCAN_INTERVAL_S = 0.18  # cadence while actively watching a tracked object
 YOLO_IMG_SIZE = 320
 
+# Cheap frame-diff pre-check (perception/scene_change.py) skips a scan
+# entirely when the scene hasn't visibly changed since the last one that
+# ran -- only applies to normal-cadence scanning, not while fast-scanning
+# a tracked object (see vision_memory.py). MAX_SKIPS forces a scan every
+# so often regardless, so a genuinely static scene doesn't go stale.
+SCENE_CHANGE_THRESHOLD = 0.02
+SCENE_CHANGE_MAX_SKIPS = 6
+
 # Tracked classes (see below) get their own, more lenient confidence bar
 # instead of lowering YOLO_CONF_THRESHOLD globally -- a global drop would
 # also let weaker, more ambiguous detections across all 80 COCO classes

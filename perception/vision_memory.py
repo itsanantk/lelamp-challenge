@@ -29,6 +29,7 @@ from ultralytics import YOLO
 
 import config
 from memory.store import MemoryStore
+from perception.scene_change import SceneChangeDetector
 
 
 @dataclass
@@ -54,6 +55,8 @@ class VisionMemory:
         self.last_detections: list[Detection] = []
         self.last_scan_latency_ms: float | None = None
         self.fast_mode = False
+        self._scene_change = SceneChangeDetector(threshold=config.SCENE_CHANGE_THRESHOLD)
+        self._skipped_since_scan = 0
 
     def maybe_scan(self, frame: np.ndarray, now: float | None = None) -> list[Detection] | None:
         """Call every loop tick. Only actually runs YOLO once the scan
@@ -67,14 +70,36 @@ class VisionMemory:
             return None
         self._last_scan_t = now
 
+        if self.fast_mode:
+            # Actively tracking something -- keep the change detector's
+            # reference frame fresh so it doesn't misread a big jump once
+            # fast_mode ends, but don't gate on it here: a moving object
+            # usually does register as change, but a phone held very
+            # still is exactly the case fast_mode exists to stay
+            # responsive for, so this cadence always scans regardless.
+            self._scene_change.changed(frame)
+        else:
+            changed = self._scene_change.changed(frame)
+            if not changed:
+                self._skipped_since_scan += 1
+                if self._skipped_since_scan < config.SCENE_CHANGE_MAX_SKIPS:
+                    return None
+            self._skipped_since_scan = 0
+
         t0 = time.perf_counter()
         # Run inference at the lower of the two confidence bars so a
         # tracked-class detection that scores between the two thresholds
         # isn't discarded by YOLO itself before the per-class check below
         # ever gets a chance to see it.
         scan_conf = min(config.YOLO_CONF_THRESHOLD, config.TRACKED_CLASS_CONF_THRESHOLD)
+        # agnostic_nms=True: ultralytics' NMS suppression is per-class by
+        # default, so one physical object can legitimately produce two
+        # overlapping boxes with different labels (e.g. a phone scored as
+        # both "cell phone" and "remote") and both survive, since they're
+        # never compared against each other. Cross-class suppression keeps
+        # only the higher-confidence label for a given region.
         results = self.model.predict(
-            frame, imgsz=config.YOLO_IMG_SIZE, conf=scan_conf, verbose=False,
+            frame, imgsz=config.YOLO_IMG_SIZE, conf=scan_conf, agnostic_nms=True, verbose=False,
         )[0]
         self.last_scan_latency_ms = (time.perf_counter() - t0) * 1000
 
