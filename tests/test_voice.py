@@ -1,7 +1,8 @@
 """Unit tests for conversation/voice.py's pure logic (wake-word matching,
-RMS gating). The actual mic I/O (record_until_silence's InputStream
-plumbing) is hardware-dependent and live-verified separately, same as
-perception/audio_monitor.py -- see docs/ARCHITECTURE.md.
+RMS gating). The actual mic I/O (record_until_silence's and
+wait_for_wake_word's InputStream plumbing) is hardware-dependent and
+live-verified separately, same as perception/audio_monitor.py -- see
+docs/ARCHITECTURE.md.
 Run with: python -m pytest tests/ -v
 """
 import sys
@@ -43,107 +44,84 @@ def test_transcribe_of_empty_audio_short_circuits_without_loading_whisper():
     assert voice.transcribe(np.zeros(0, dtype="float32")) == ""
 
 
-def test_wait_for_wake_word_ignores_silent_chunks_and_transcribes_only_loud_ones(monkeypatch):
+# _check_wake_chunk is what wait_for_wake_word's InputStream plumbing
+# calls per buffered chunk -- tested directly, same split as
+# record_until_silence's hardware I/O vs its own testable RMS logic (see
+# module docstring). wait_for_wake_word's actual mic capture is
+# live-verified instead, not unit tested.
+
+_SR = 16000
+
+
+def test_check_wake_chunk_ignores_silent_audio_and_never_transcribes_it(monkeypatch):
     transcribed = []
-    chunks = iter([
-        (0.0, "n/a"),                       # silent -- should be skipped, never transcribed
-        (1.0, "just some background noise"),
-        (1.0, "hey lamp what time is it"),
-    ])
-    state = {}
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: transcribed.append("called") or "n/a")
 
-    def fake_record(duration_s, samplerate=None):
-        rms_val, text = next(chunks)
-        state["pending_text"] = text
-        return np.full(10, rms_val, dtype="float32")
+    silent = np.zeros(10, dtype="float32")
+    result, prev_text = voice._check_wake_chunk(silent, _SR, "hey lamp", "lamp", "")
 
-    def fake_transcribe(audio):
-        transcribed.append(state["pending_text"])
-        return state["pending_text"]
+    assert result is None
+    assert transcribed == []  # silent chunk must never reach transcribe()
 
-    monkeypatch.setattr(voice, "record", fake_record)
-    monkeypatch.setattr(voice, "transcribe", fake_transcribe)
-    monkeypatch.setattr(voice, "preload", lambda: None)
 
-    result = voice.wait_for_wake_word("hey lamp", chunk_s=0.01)
+def test_check_wake_chunk_matches_the_wake_word_in_loud_audio(monkeypatch):
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "hey lamp what time is it")
 
-    # the silent first chunk must never have reached transcribe()
-    assert transcribed == ["just some background noise", "hey lamp what time is it"]
+    loud = np.ones(10, dtype="float32")
+    result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")
+
     assert result == "wake"
 
 
-def test_wait_for_wake_word_matches_phrase_split_across_a_chunk_boundary(monkeypatch):
-    """The wake phrase can get cut in half between one chunk's recording
-    and the next -- concatenating each chunk's transcript with the
-    previous one is what catches that instead of silently missing both
-    halves. Neither chunk alone contains "lamp"."""
-    chunks = iter(["turn on the hey", "lamp please"])
+def test_check_wake_chunk_matches_phrase_split_across_a_chunk_boundary(monkeypatch):
+    """The wake phrase can get cut in half between one chunk and the
+    next -- concatenating each chunk's transcript with the previous one
+    is what catches that instead of silently missing both halves. Neither
+    chunk alone contains "lamp"."""
+    loud = np.ones(10, dtype="float32")
 
-    def fake_record(duration_s, samplerate=None):
-        return np.ones(10, dtype="float32")
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "turn on the hey")
+    result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")
+    assert result is None
 
-    def fake_transcribe(audio):
-        return next(chunks)
-
-    monkeypatch.setattr(voice, "record", fake_record)
-    monkeypatch.setattr(voice, "transcribe", fake_transcribe)
-    monkeypatch.setattr(voice, "preload", lambda: None)
-
-    result = voice.wait_for_wake_word("hey lamp", chunk_s=0.01)
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "lamp please")
+    result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", prev_text)
     assert result == "wake"
 
 
-def test_wait_for_wake_word_requires_the_distinctive_word_not_just_hey(monkeypatch):
+def test_check_wake_chunk_requires_the_distinctive_word_not_just_hey(monkeypatch):
     """"hey" alone is common enough (filler word, Whisper artifact) that
     it shouldn't trigger it by itself -- only "lamp" (the last, most
     distinctive word of the phrase) actually has to be heard."""
-    calls = {"n": 0}
-    chunks = iter(["hey there, how's it going", "ok hey lamp for real this time"])
+    loud = np.ones(10, dtype="float32")
 
-    def fake_record(duration_s, samplerate=None):
-        return np.ones(10, dtype="float32")
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "hey there, how's it going")
+    result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")
+    assert result is None, "should NOT have matched on 'hey' alone"
 
-    def fake_transcribe(audio):
-        calls["n"] += 1
-        return next(chunks)
-
-    monkeypatch.setattr(voice, "record", fake_record)
-    monkeypatch.setattr(voice, "transcribe", fake_transcribe)
-    monkeypatch.setattr(voice, "preload", lambda: None)
-
-    result = voice.wait_for_wake_word("hey lamp", chunk_s=0.01)
-    assert result == "wake"
-    assert calls["n"] == 2, "should NOT have matched on the first ('hey' only) chunk"
-
-
-def test_wait_for_wake_word_matches_case_insensitively(monkeypatch):
-    calls = {"n": 0}
-
-    def fake_record(duration_s, samplerate=None):
-        return np.ones(10, dtype="float32")
-
-    def fake_transcribe(audio):
-        calls["n"] += 1
-        return "HEY LAMP are you there"
-
-    monkeypatch.setattr(voice, "record", fake_record)
-    monkeypatch.setattr(voice, "transcribe", fake_transcribe)
-    monkeypatch.setattr(voice, "preload", lambda: None)
-
-    result = voice.wait_for_wake_word("hey lamp", chunk_s=0.01)
-    assert calls["n"] == 1
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "ok hey lamp for real this time")
+    result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", prev_text)
     assert result == "wake"
 
 
-def test_wait_for_wake_word_recognizes_quit_without_needing_the_wake_word_first(monkeypatch):
+def test_check_wake_chunk_matches_case_insensitively(monkeypatch):
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "HEY LAMP are you there")
+
+    loud = np.ones(10, dtype="float32")
+    result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")
+
+    assert result == "wake"
+
+
+def test_check_wake_chunk_recognizes_quit_without_needing_the_wake_word_first(monkeypatch):
     """A wake-gated loop with no quit path of its own is a dead end short
     of Ctrl-C -- the user has to be able to leave voice mode without first
     successfully waking it up."""
-    monkeypatch.setattr(voice, "record", lambda duration_s, samplerate=None: np.ones(10, dtype="float32"))
-    monkeypatch.setattr(voice, "transcribe", lambda audio: "quit")
-    monkeypatch.setattr(voice, "preload", lambda: None)
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "quit")
 
-    result = voice.wait_for_wake_word("hey lamp", chunk_s=0.01)
+    loud = np.ones(10, dtype="float32")
+    result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")
+
     assert result == "quit"
 
 

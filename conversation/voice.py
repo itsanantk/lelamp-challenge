@@ -109,11 +109,18 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
         return np.concatenate(chunks, axis=0).flatten()
 
 
-def transcribe(audio: np.ndarray) -> str:
+def transcribe(audio: np.ndarray, initial_prompt: str | None = None) -> str:
+    """initial_prompt biases Whisper's decoding toward expected vocabulary
+    -- a real lever for a short, out-of-context wake phrase specifically
+    (see _check_wake_chunk), since a lone word or two with no surrounding
+    sentence is a genuinely harder input for a model that leans on
+    language-model context to disambiguate acoustics. Left unset for
+    real conversational questions, where biasing toward the wake phrase
+    would be actively wrong."""
     if audio.size == 0:
         return ""
     preload()
-    result = _whisper_model.transcribe(audio, fp16=False, language="en")
+    result = _whisper_model.transcribe(audio, fp16=False, language="en", initial_prompt=initial_prompt)
     return result["text"].strip()
 
 
@@ -150,11 +157,20 @@ def wait_for_wake_word(wake_word: str = config.WAKE_WORD, chunk_s: float = confi
     to "what's your question" -- matters because without it there'd be no
     way to leave voice mode without first successfully waking it up: a
     wake-gated loop with no quit path of its own is a dead end short of
-    Ctrl-C. Polls in short fixed chunks rather than a real always-on
-    wake-word engine (no extra heavy dependency, reuses the Whisper model
-    already loaded for real questions) -- each chunk only gets transcribed
-    if it actually had sound in it, so idle silence doesn't cost a Whisper
-    call.
+    Ctrl-C. Polls in short chunks rather than a real always-on wake-word
+    engine (no extra heavy dependency, reuses the Whisper model already
+    loaded for real questions) -- each chunk only gets transcribed if it
+    actually had sound in it, so idle silence doesn't cost a Whisper call.
+
+    Captures continuously via a background InputStream rather than
+    sequential blocking record() calls -- the earlier blocking version
+    stopped capturing audio entirely while a chunk that cleared the
+    volume gate was being transcribed (small.en takes a couple of
+    seconds), so anything said during that window was never recorded at
+    all, not just split across a boundary. The background stream keeps
+    appending to the buffer regardless of how long transcription takes, so
+    nothing said in the meantime is lost -- it just shows up in the next
+    flush, occasionally longer than chunk_s, which Whisper handles fine.
 
     Two things that make matching more forgiving than a literal substring
     check on the whole phrase: only the *last word* of wake_word actually
@@ -163,44 +179,68 @@ def wait_for_wake_word(wake_word: str = config.WAKE_WORD, chunk_s: float = confi
     distinctiveness, while "lamp" is unusual enough on its own to rarely
     false-trigger. And each chunk's transcript is checked concatenated
     with the previous one, not alone, so a phrase split across a chunk
-    boundary (the end of one recording, the start of the next) still
-    matches instead of silently going unheard on both sides of the split.
-    Every chunk prints its RMS level, silent or not -- not just the ones
-    that pass the volume gate and get transcribed. That matters because a
-    gate set wrong (too strict for your mic's actual gain/distance) fails
-    *silently*: every chunk gets skipped before transcription ever runs,
-    so there'd be nothing to print if only non-silent chunks logged
-    anything -- indistinguishable from the loop not running at all. Kept
-    to one short line per chunk on purpose (just the number, no restated
-    threshold/explanation -- that's already in the one-time line printed
-    below) since this repeats continuously while idle: verbose per-chunk
-    logging is exactly the kind of output that's cheap to print and
-    expensive to have pasted back for debugging. Numbers that never get
-    close to the threshold shown below mean the gate itself is the
-    problem (fix: lower config.VOICE_GATE_RMS_THRESHOLD); numbers that
-    cross it but a transcript that's never the right word means it's a
-    Whisper accuracy or matching problem instead."""
+    boundary still matches instead of silently going unheard on both
+    sides of the split. Every chunk prints its RMS level, silent or not --
+    not just the ones that pass the volume gate and get transcribed. That
+    matters because a gate set wrong (too strict for your mic's actual
+    gain/distance) fails *silently*: every chunk gets skipped before
+    transcription ever runs, so there'd be nothing to print if only
+    non-silent chunks logged anything -- indistinguishable from the loop
+    not running at all. Kept to one short line per chunk on purpose (just
+    the number, no restated threshold/explanation -- that's already in
+    the one-time line printed below) since this repeats continuously
+    while idle. Numbers that never get close to the threshold shown below
+    mean the gate itself is the problem (fix: lower
+    config.VOICE_GATE_RMS_THRESHOLD); numbers that cross it but a
+    transcript that's never the right word means it's a Whisper accuracy
+    or matching problem instead."""
     preload()
     _print_input_device_once()
     print(f'[voice] say "{wake_word}" to talk to it, or "quit" to exit... '
           f'(volume gate: {config.VOICE_GATE_RMS_THRESHOLD})')
     match_word = wake_word.lower().split()[-1]
     prev_text = ""
-    while True:
-        audio = record(chunk_s, samplerate=samplerate)
-        rms = _peak_rms(audio, samplerate)
-        if rms < config.VOICE_GATE_RMS_THRESHOLD:
-            print(f'[voice] rms={rms:.4f}')
-            prev_text = ""  # a real silent gap -- nothing here could be one half of a split phrase
-            continue
-        text = transcribe(audio).lower()
-        print(f'[voice] rms={rms:.4f} heard: "{text}"')
-        combined = f"{prev_text} {text}".strip()
-        if match_word in combined:
-            return "wake"
-        if any(q in combined for q in _QUIT_WORDS):
-            return "quit"
-        prev_text = text
+
+    buffer_lock = threading.Lock()
+    buffer: list[np.ndarray] = []
+
+    def _callback(indata, frames, time_info, status) -> None:
+        with buffer_lock:
+            buffer.append(indata.copy())
+
+    with sd.InputStream(samplerate=samplerate, channels=1, dtype="float32", callback=_callback):
+        while True:
+            sd.sleep(int(chunk_s * 1000))
+            with buffer_lock:
+                if not buffer:
+                    continue
+                audio = np.concatenate(buffer, axis=0).flatten()
+                buffer.clear()
+
+            result, prev_text = _check_wake_chunk(audio, samplerate, wake_word, match_word, prev_text)
+            if result is not None:
+                return result
+
+
+def _check_wake_chunk(audio: np.ndarray, samplerate: int, wake_word: str, match_word: str,
+                       prev_text: str) -> tuple[str | None, str]:
+    """RMS-gate + transcribe + match logic for one buffered chunk, pulled
+    out of wait_for_wake_word's InputStream plumbing so it's unit
+    testable without touching real audio hardware -- same split as
+    record_until_silence's hardware I/O vs its own RMS logic. Returns
+    (result, new_prev_text) where result is "wake"/"quit"/None."""
+    rms = _peak_rms(audio, samplerate)
+    if rms < config.VOICE_GATE_RMS_THRESHOLD:
+        print(f'[voice] rms={rms:.4f}')
+        return None, ""  # a real silent gap -- nothing here could be one half of a split phrase
+    text = transcribe(audio, initial_prompt=wake_word).lower()
+    print(f'[voice] rms={rms:.4f} heard: "{text}"')
+    combined = f"{prev_text} {text}".strip()
+    if match_word in combined:
+        return "wake", text
+    if any(q in combined for q in _QUIT_WORDS):
+        return "quit", text
+    return None, text
 
 
 def listen() -> str:
