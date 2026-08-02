@@ -22,10 +22,12 @@ import numpy as np
 import config
 from lamp import kinematics
 from lamp.hal import LampActuator
+from lamp.motion import lerp_color
 
 IDLE_COLOR = (40, 110, 200)       # BGR, dim warm amber
 ENGAGED_COLOR = (255, 220, 140)    # BGR, bright cool alert
-ATTENTION_PULSE_COLOR = (0, 165, 255)  # BGR, warm orange pulse
+ATTENTION_PULSE_COLOR = (0, 165, 255)     # BGR, warm orange pulse -- first attempt
+ATTENTION_PULSE_URGENT_COLOR = (0, 80, 255)  # BGR, more saturated red-orange -- last attempt
 
 LOOK_UP_PITCH_DEG = -15.0  # desk-level lamp looking slightly up at a seated person
 
@@ -138,9 +140,17 @@ class BehaviorFSM:
         self._attention_phase = 1
         self._attention_phase_timer = 0.0
 
-        curious = kinematics.pose_for_look_at(self._last_user_bearing + 18.0, -5.0, alertness=0.55)
+        # The exact same gesture on every attempt reads as a broken loop,
+        # not persistence -- lean in further and pulse brighter each try,
+        # capped at max_attempts so the last one is the most noticeable.
+        intensity = min(self._attempts / self.attention_seek_max_attempts, 1.0)
+        bearing_offset = 14.0 + 10.0 * intensity
+        alertness = 0.5 + 0.3 * intensity
+        color = lerp_color(ATTENTION_PULSE_COLOR, ATTENTION_PULSE_URGENT_COLOR, intensity)
+
+        curious = kinematics.pose_for_look_at(self._last_user_bearing + bearing_offset, -5.0, alertness=alertness)
         self.lamp.set_target_pose(curious, duration=0.35, anticipation=True, overshoot=True)
-        self.lamp.set_light(ATTENTION_PULSE_COLOR, transition_s=0.25)
+        self.lamp.set_light(color, transition_s=0.25)
         self.lamp.play_sound("attention_seek")
 
     def _tick_attention_seek(self, dt: float) -> None:

@@ -3,7 +3,11 @@
 A 6-DOF lamp that tracks whether someone's looking at it, reacts with
 motion/light/sound, keeps a memory of objects it's seen, and can answer
 questions about that memory through an LLM. Full writeup with diagrams is
-in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); a criteria-by-criteria
+mapping to the challenge brief is in
+[docs/requirements_traceability.md](docs/requirements_traceability.md);
+the demo recording walkthrough is in
+[docs/demo_script.md](docs/demo_script.md).
 
 I don't have a physical LeLamp, so the arm/light/speaker are simulated
 behind a small hardware abstraction layer (`lamp/hal.py`). A real driver
@@ -246,4 +250,6 @@ tests/test_viz.py
 tests/test_voice.py
 tests/test_emotion.py
 docs/ARCHITECTURE.md       full writeup
+docs/requirements_traceability.md   challenge brief -> where it's addressed
+docs/demo_script.md        demo recording walkthrough
 ```

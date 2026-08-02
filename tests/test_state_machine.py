@@ -138,6 +138,30 @@ def test_gives_up_after_max_attempts():
     assert fsm._attempts == config.ATTENTION_SEEK_MAX_ATTEMPTS
 
 
+def test_attention_seek_escalates_across_attempts():
+    """The same gesture on every attempt reads as a broken loop, not
+    persistence -- later attempts should lean in further (bigger bearing
+    offset) and pulse a more saturated color than the first."""
+    fsm = BehaviorFSM(lamp=FakeLamp())
+    fsm.update(engaged=True, user_bearing_deg=0.0, dt=0.03)
+    fsm.update(engaged=False, user_bearing_deg=0.0, dt=0.03)
+
+    light_colors = []
+    t = 0.0
+    max_t = (config.DISENGAGE_GRACE_S + config.ATTENTION_SEEK_MAX_ATTEMPTS *
+              (config.ATTENTION_SEEK_COOLDOWN_S + 1.5) + 5.0)
+    prev_state = fsm.state
+    while t < max_t and fsm.state != State.IDLE:
+        fsm.update(engaged=False, user_bearing_deg=0.0, dt=0.05)
+        if prev_state != State.ATTENTION_SEEKING and fsm.state == State.ATTENTION_SEEKING:
+            light_colors.append(next(c for kind, c in reversed(fsm.lamp.calls) if kind == "light"))
+        prev_state = fsm.state
+        t += 0.05
+
+    assert len(light_colors) == config.ATTENTION_SEEK_MAX_ATTEMPTS
+    assert light_colors[0] != light_colors[-1]
+
+
 def test_give_up_settles_the_real_lamp_not_just_fsm_state():
     """The final attention-seek attempt used to cut off mid-animation (state
     flipped to IDLE while _attention_phase was still nonzero), leaving the
