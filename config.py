@@ -1,0 +1,156 @@
+"""Paths and tuning constants live here so every module agrees on the
+project root and so the thresholds that actually shape behavior aren't
+buried inside the modules that use them.
+"""
+import os
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent
+MODELS_DIR = ROOT_DIR / "models"
+LOGS_DIR = ROOT_DIR / "logs"
+RECORDINGS_DIR = ROOT_DIR / "recordings"
+
+FACE_LANDMARKER_MODEL = MODELS_DIR / "face_landmarker.task"
+YOLO_MODEL = MODELS_DIR / "yolo11s.pt"
+MEMORY_DB = LOGS_DIR / "memory.sqlite3"
+
+for _d in (MODELS_DIR, LOGS_DIR, RECORDINGS_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+CAMERA_INDEX = 0
+# 1920x1080 is this webcam's actual max (confirmed by probing supported
+# modes -- it doesn't do a higher-res 4:3 like 1280x960, only steps up
+# through 16:9 modes), used instead of the original 640x480 for a
+# noticeably bigger, sharper live window -- rendering natively at this
+# resolution rather than upscaling a smaller capture into a bigger
+# window, which would just be a blurrier version of the same detail.
+FRAME_WIDTH = 1920
+FRAME_HEIGHT = 1080
+
+# No camera calibration step, so this is a guess at the webcam's horizontal
+# FOV, just precise enough to turn "where in the frame" into a bearing angle.
+CAMERA_HFOV_DEG = 60.0
+
+# --- Engagement hysteresis -----------------------------------------------
+# ENTER_* is the tight cone that starts engagement (has to be clearly
+# looking); EXIT_* is the looser cone that ends it (has to clearly look
+# away). The gap between them is a deadband against boundary flicker, and
+# the dwell-frame counts eat single-frame landmark noise on top of that.
+ENGAGE_ENTER_YAW_DEG = 15.0
+ENGAGE_ENTER_PITCH_DEG = 15.0
+ENGAGE_EXIT_YAW_DEG = 25.0
+ENGAGE_EXIT_PITCH_DEG = 25.0
+ENGAGE_ENTER_DWELL_FRAMES = 5
+ENGAGE_EXIT_DWELL_FRAMES = 8
+ENGAGE_EMA_ALPHA = 0.35  # higher = less smoothing, more responsive
+
+# --- Behavior timing -------------------------------------------------------
+DISENGAGE_GRACE_S = 2.5          # brief hold before giving up on someone
+ATTENTION_SEEK_DELAY_S = 4.0     # how long disengaged before trying to re-engage
+ATTENTION_SEEK_MAX_ATTEMPTS = 3  # stop after this many tries
+ATTENTION_SEEK_COOLDOWN_S = 6.0  # spacing between attempts
+
+# --- Memory formation -------------------------------------------------------
+# yolo11s over yolo11n: ~47 vs ~39.5 mAP on COCO, for +8ms/scan on this
+# CPU (28ms vs 20ms at 320px) -- a meaningfully better hit rate for not
+# much latency. yolo11m tested even better but ran 60-100ms/scan here,
+# enough to show up as a visible stutter in the live window when a scan
+# lands, so not worth it for a CPU-only interval scan. Bump YOLO_MODEL
+# in config.py to yolo11m.pt if you want to trade a little smoothness for
+# more accuracy.
+#
+# Scan intervals assume typical (plugged-in, not power-throttled) CPU
+# performance -- measured live at ~28-90ms/scan on AC power (see
+# docs/ARCHITECTURE.md). On battery, Windows' power plan can throttle this
+# machine hard enough to more than double scan latency, which shows up as
+# general sluggishness across the whole app, not just detection -- worth
+# ruling out before re-tuning these if things still feel slow.
+YOLO_CONF_THRESHOLD = 0.45
+YOLO_SCAN_INTERVAL_S = 0.35       # normal cadence, interval-triggered (CPU only)
+YOLO_FAST_SCAN_INTERVAL_S = 0.18  # cadence while actively watching a tracked object
+YOLO_IMG_SIZE = 320
+
+# Tracked classes (see below) get their own, more lenient confidence bar
+# instead of lowering YOLO_CONF_THRESHOLD globally -- a global drop would
+# also let weaker, more ambiguous detections across all 80 COCO classes
+# into scene memory. A phone is large and visually distinctive enough
+# that a lower bar is low-risk specifically for it, and this is what
+# actually helps the "doesn't detect at an angle" case: an off-angle
+# phone is exactly the kind of detection that scores just under 0.45 but
+# is still almost certainly a real phone.
+TRACKED_CLASS_CONF_THRESHOLD = 0.30
+
+# --- Object watching ("follow my phone when I put it down") ---------------
+# Object classes that trigger the watch-and-remember behavior. COCO class
+# names -- "cell phone" is what YOLO actually calls a phone.
+TRACKED_CLASSES = ["cell phone"]
+WATCH_REAIM_DEG = 4.0     # only issue a new pose command once it's moved at least
+                           # this much since the last one -- avoids the arm jittering
+                           # on frame-to-frame bbox noise while it's just sitting there
+WATCH_LOST_GRACE_S = 2.0  # tolerate this long without a detection before treating it
+                           # as actually gone and settling back -- rides out a few
+                           # missed scans (a bad angle, brief occlusion) instead of
+                           # the gesture flickering on and off with every miss
+WATCH_FAST_SCAN_SETTLE_S = 1.5  # drop out of fast-scan mode once it's been this long
+                                  # since the object last actually moved (not just been
+                                  # visible) -- a stationary phone shouldn't pin the loop
+                                  # at the fast interval forever
+
+# --- Conversational recall -------------------------------------------------
+# "anthropic" or "openai" -- whichever key you actually have credit on.
+LLM_PROVIDER = os.environ.get("LELAMP_LLM_PROVIDER", "anthropic").lower()
+ANTHROPIC_MODEL = "claude-sonnet-5"
+OPENAI_MODEL = "gpt-4o-mini"
+
+# --- Voice I/O ---------------------------------------------------------
+# Both directions run locally so voice mode doesn't depend on which LLM
+# key is funded. small.en over base.en trades a bigger one-time download
+# (~460MB vs ~140MB) and somewhat higher per-turn latency for meaningfully
+# better transcription accuracy -- base.en was mishearing plain speech
+# often enough in testing to be the complaint, not just the wake word.
+WHISPER_MODEL = "small.en"
+VOICE_SAMPLE_RATE = 16000
+
+# Wake-word gated instead of a blind fixed-length recording window: the
+# mic passively polls in short chunks, only transcribing a chunk (via the
+# same local Whisper model) once it actually contains sound, and only
+# starts recording the real question once WAKE_WORD shows up in one of
+# those chunks. Keeps mic activity from being interpreted as a question
+# at random, and means you don't have to time your speech into an
+# arbitrary window that starts the instant the script gets there.
+WAKE_WORD = "hey lamp"
+WAKE_CHUNK_S = 2.5   # kept short-ish so the wake phrase rarely spans a chunk boundary
+VOICE_SILENCE_TIMEOUT_S = 1.2   # stop recording the question after this much continuous silence
+VOICE_NO_SPEECH_TIMEOUT_S = 3.0  # bail out this fast if nothing at all was said after waking
+                                  # (e.g. a false-positive wake trigger) -- otherwise this case
+                                  # would run all the way to VOICE_MAX_RECORD_S with no benefit
+VOICE_MAX_RECORD_S = 12.0       # hard cap so a stuck-open mic can't record forever
+
+# After a wake+answer, chat.py stays listening for a follow-up instead of
+# requiring the wake word again -- this is both the no-speech patience and
+# the max_s ceiling for that follow-up listen (see chat.py's _listen).
+CONVERSATION_FOLLOWUP_TIMEOUT_S = 60.0
+
+# RMS level (float32 samples, [-1, 1]) above which a voice-mode chunk
+# counts as "something worth transcribing," separate from
+# AUDIO_GATE_RMS_THRESHOLD below -- they look like the same kind of
+# number but calibrate two different situations. AUDIO_GATE_RMS_THRESHOLD
+# is tuned for detecting ambient room activity (talking, TV) from the
+# lamp's position on a desk; this one is tuned for actually-trying-to-
+# talk-to-it speech into a laptop's built-in mic. 0.02 turned out to be
+# well above real speech at normal distance/volume on a laptop mic --
+# live-captured RMS values while saying the wake phrase peaked around
+# 0.010-0.016 and never once crossed 0.02, so every chunk was silently
+# discarded no matter how clearly it was spoken. 0.008 sits comfortably
+# below those observed peaks and above the ambient noise floor seen in
+# the same session (mostly 0.0000-0.0066).
+VOICE_GATE_RMS_THRESHOLD = 0.008
+
+# --- Interruption awareness -------------------------------------------------
+# RMS level (float32 samples, [-1, 1]) above which the mic counts as
+# "something's going on" -- talking, TV, music. Measured ambient noise
+# floor on this machine was ~0.00003; this leaves well over 2 orders of
+# magnitude of headroom. Mic gain/distance varies by setup, so treat this
+# as a starting point, not a calibrated constant.
+AUDIO_GATE_RMS_THRESHOLD = 0.02
+AUDIO_GATE_SUSTAIN_S = 0.6  # how long "recently active" holds true after the last loud block
