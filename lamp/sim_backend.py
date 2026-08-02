@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 import sounddevice as sd
 
-from . import kinematics
+from . import color, kinematics
 from .hal import LampActuator
 from .motion import Trajectory, lerp_color
 
@@ -152,7 +152,12 @@ class SimulatedLamp(LampActuator):
         self._lock = threading.RLock()
         self._pose = kinematics.NEUTRAL_POSE.copy()
         self._trajectory: Trajectory | None = None
-        self._light_from = (40, 110, 200)  # BGR, dim warm amber (idle)
+        # Persistent (warmth, brightness) baseline -- see lamp/color.py.
+        # Only set_mood() (an explicit user choice, e.g. a voice preset)
+        # changes this; everything else nudges a delta off it and reverts.
+        self._mood_warmth = 0.6
+        self._mood_brightness = 0.55
+        self._light_from = color.from_dials(self._mood_warmth, self._mood_brightness)
         self._light_to = self._light_from
         self._light_t = 1.0
         self._light_duration = 0.4
@@ -181,6 +186,14 @@ class SimulatedLamp(LampActuator):
     def set_breathing(self, enabled: bool) -> None:
         with self._lock:
             self._breathing_enabled = enabled
+
+    def set_mood(self, warmth: float, brightness: float) -> None:
+        with self._lock:
+            self._mood_warmth = float(np.clip(warmth, 0.0, 1.0))
+            self._mood_brightness = float(np.clip(brightness, 0.0, 1.0))
+
+    def get_mood(self) -> tuple[float, float]:
+        return (self._mood_warmth, self._mood_brightness)
 
     def set_target_pose(self, angles, duration=0.6, anticipation=True, overshoot=True) -> None:
         with self._lock:
@@ -241,23 +254,66 @@ class SimulatedLamp(LampActuator):
         origin = (CANVAS_SIZE // 2, int(CANVAS_SIZE * 0.82))
         scale = 8.0 * _SCALE
 
-        points = kinematics.forward_kinematics(self.get_current_pose())
-        screen_pts = [_project(p, origin, scale) for p in points]
+        pose = self.get_current_pose()
+        points = kinematics.forward_kinematics(pose)
+        arm_pts = [_project(p, origin, scale) for p in points]
 
         cv2.circle(canvas, origin, int(26 * _SCALE), (50, 48, 45), -1)  # desk base
 
         line_w = max(1, int(6 * _SCALE))
         joint_r = max(1, int(6 * _SCALE))
-        for a, b in zip(screen_pts[:-1], screen_pts[1:]):
+        for a, b in zip(arm_pts[:-1], arm_pts[1:]):
             cv2.line(canvas, a, b, ARM_COLOR, line_w, cv2.LINE_AA)
-        for p in screen_pts[:-1]:
+        for p in arm_pts[:-1]:
             cv2.circle(canvas, p, joint_r, JOINT_COLOR, -1, cv2.LINE_AA)
 
+        # The shade as a 2D "billboard" cone: apex (the sharp, thin back of
+        # the shade) hidden behind a wide opening that faces the viewer
+        # head-on at base_yaw=0, rotating toward edge-on as base_yaw swings
+        # toward either limit -- the same way a cone (or a coin) actually
+        # looks as you turn it: the opening narrows into an oval and the
+        # apex becomes visible poking out past the rim on the side it's
+        # turned toward.
+        #
+        # Deliberately NOT derived from the true 3D chain projected through
+        # this isometric camera (an earlier version was) -- the camera's own
+        # "facing the viewer" direction isn't the same as base_yaw=0 in this
+        # projection (confirmed by the actual trig: aligning them exactly
+        # would need base_yaw near 45 deg and the shoulder/elbow resting
+        # geometry reworked to match, which risks every other pose already
+        # tuned against it), so a "true" 3D shade never looked round when
+        # centered on the user, which is the most common case. Faking the
+        # rotation directly in 2D against base_yaw sidesteps that mismatch
+        # entirely and just draws what was actually asked for.
+        head = arm_pts[4]
+        yaw_rad = np.radians(float(pose[0]))
+        shade_r = int(26 * _SCALE)  # smaller overall -- 34 read as oversized next to the arm
+        rx = max(int(shade_r * 0.05), int(shade_r * abs(np.cos(yaw_rad))))  # lower floor -- reads
+                                                                              # noticeably thinner
+                                                                              # once turned, not just
+                                                                              # nearly-full-width always
+        ry = shade_r
+        # How far the apex pokes out past the narrowed rim -- positive
+        # base_yaw is the user's right (established bearing convention),
+        # which is the right side of this un-mirrored sim panel too, so the
+        # apex offsets the same direction the lamp is actually turning.
+        apex_dx = int(shade_r * 0.85 * np.sin(yaw_rad))
+        apex = (head[0] + apex_dx, head[1])
         light_color = self.get_current_light()
-        head = screen_pts[-1]
-        head_r = int(30 * _SCALE)
-        cv2.circle(canvas, head, head_r, light_color, -1, cv2.LINE_AA)
-        cv2.circle(canvas, head, head_r, (255, 255, 255), max(1, int(1 * _SCALE)), cv2.LINE_AA)
+
+        side_w = max(1, int(2 * _SCALE))
+        outline_w = max(1, int(1 * _SCALE))
+        if abs(apex_dx) > int(shade_r * 0.15):  # only visible once turned enough to matter
+            cv2.line(canvas, (head[0], head[1] - ry), apex, ARM_COLOR, side_w, cv2.LINE_AA)
+            cv2.line(canvas, (head[0], head[1] + ry), apex, ARM_COLOR, side_w, cv2.LINE_AA)
+        cv2.ellipse(canvas, head, (rx, ry), 0, 0, 360, light_color, -1, cv2.LINE_AA)
+        cv2.ellipse(canvas, head, (rx, ry), 0, 0, 360, (255, 255, 255), outline_w, cv2.LINE_AA)
+        # A small dark "seam" mark nudged by wrist_roll/head_twist -- the
+        # billboard above is driven by base_yaw alone, so this is what
+        # keeps those two joints visibly meaningful instead of inert.
+        seam = (head[0] + int(rx * 0.5 * (float(pose[5]) / 60.0)),
+                head[1] + int(ry * 0.5 * (float(pose[4]) / 45.0)))
+        cv2.circle(canvas, seam, max(1, int(4 * _SCALE)), (35, 30, 28), -1, cv2.LINE_AA)
 
         cv2.putText(canvas, "SIMULATED LAMP", (int(12 * _SCALE), int(24 * _SCALE)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55 * _SCALE, (150, 150, 150),

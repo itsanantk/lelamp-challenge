@@ -34,12 +34,13 @@ import chat
 import config
 import viz
 from behavior.adaptation import AdaptationEngine
-from behavior.object_watch import ObjectWatcher
+from behavior.object_watch import ObjectWatcher, play_wave_back
 from behavior.state_machine import BehaviorFSM, State
 from lamp import SimulatedLamp
 from memory.store import MemoryStore
 from perception.audio_monitor import AudioActivityMonitor
 from perception.engagement import EngagementPipeline
+from perception.hand_wave import HandWaveDetector
 from perception.vision_memory import VisionMemory
 
 
@@ -84,6 +85,14 @@ def run(args: argparse.Namespace) -> None:
         audio_monitor = AudioActivityMonitor()
         audio_monitor.start()
 
+    hand_wave = None
+    if not args.no_hand_wave:
+        if config.HAND_LANDMARKER_MODEL.exists():
+            hand_wave = HandWaveDetector()
+        else:
+            print(f"[main] hand-wave detection disabled: {config.HAND_LANDMARKER_MODEL} not found "
+                  f"(see README for the download command)")
+
     chat_thread = None
     chat_shutdown = None
     if args.chat:
@@ -111,6 +120,7 @@ def run(args: argparse.Namespace) -> None:
     frame_count = 0
     interactive_elapsed = 0.0
     prev_fsm_state = fsm.state
+    pan_bearing_ema = 0.0  # smoothed follower for viz.pan_crop_frame -- see config.CAMERA_PAN_FOLLOW_HZ
     info_panel_cache = None
     INFO_PANEL_REFRESH_EVERY = 4  # debug text panel is cheap to read stale for a few frames, expensive to redraw every frame at this resolution
     window_name = "LeLamp Challenge - webcam | lamp sim | fsm"
@@ -143,22 +153,63 @@ def run(args: argparse.Namespace) -> None:
                 adapt_engine.apply_to(fsm)  # keep the FSM synced as the engine adapts mid-session
             prev_fsm_state = fsm_state
 
+            if not args.no_camera_pan:
+                # base_yaw is the same degrees-of-bearing convention as
+                # pose_for_look_at's yaw_deg input (positive = user's
+                # right), whatever subsystem last set the target pose --
+                # tracking, attention-seeking, an engaged look, even idle
+                # sway -- so reading it back is a simpler and more honest
+                # "what is the lamp currently looking at" than trying to
+                # separately track which subsystem currently owns the gaze.
+                # Computed before the YOLO scan below (not just before
+                # display) so both the detector's simulated FOV and the
+                # on-screen pan follow the exact same bearing this tick.
+                target_bearing = float(lamp.get_current_pose()[0])
+                follow = min(1.0, dt * config.CAMERA_PAN_FOLLOW_HZ)
+                pan_bearing_ema += (target_bearing - pan_bearing_ema) * follow
+
             yolo_latency_ms = None
             if vision_memory is not None:
-                scanned = vision_memory.maybe_scan(frame)
+                # Only object detection is restricted to the pan window --
+                # engagement/face detection (above) always sees the full
+                # frame. Those are conceptually two different sensing
+                # channels here: whether a person is present and looking
+                # at it is something a lamp would want to notice
+                # regardless of which way its head happens to be turned;
+                # "what objects are around" is what the FOV constraint is
+                # actually meant to simulate (a camera mounted on the head
+                # that can't see what it isn't pointed at).
+                pan_zoom = config.CAMERA_PAN_ZOOM if not args.no_camera_pan else None
+                scanned = vision_memory.maybe_scan(frame, pan_bearing_deg=pan_bearing_ema, pan_zoom=pan_zoom)
                 if scanned is not None:  # only a real sample on ticks that actually ran YOLO
                     yolo_latency_ms = vision_memory.last_scan_latency_ms
                 object_watcher.update(vision_memory.last_detections, fsm_state, dt, user_bearing_deg=bearing)
                 vision_memory.fast_mode = object_watcher.should_scan_fast()
+
+            if hand_wave is not None and fsm_state == State.ENGAGED:
+                # Only while ENGAGED -- waving hello is a thing you do
+                # when it's already paying attention to you, and it bounds
+                # this third model's cost to exactly the situations where
+                # a wave means anything (see config.py's own note).
+                wave_bearing = hand_wave.update(frame, now)
+                if wave_bearing is not None:
+                    play_wave_back(lamp, wave_bearing)
 
             # Detection/engagement math above all runs on the raw,
             # un-flipped frame (that's what the corrected user-relative
             # bearing math in perception/ assumes) -- mirroring only
             # happens here, for what's actually drawn on screen.
             display_frame = viz.mirror_frame(frame)
+            mirrored_detections = (viz.mirror_detections(vision_memory.last_detections, frame.shape[1])
+                                    if vision_memory is not None else [])
+
+            if not args.no_camera_pan:
+                display_frame, crop_x0, crop_scale = viz.pan_crop_frame(
+                    display_frame, pan_bearing_ema, config.CAMERA_HFOV_DEG, zoom=config.CAMERA_PAN_ZOOM)
+                mirrored_detections = viz.remap_boxes_for_pan(mirrored_detections, crop_x0, crop_scale)
+
             webcam_hud = viz.draw_webcam_hud(display_frame, reading, fsm_state.name)
             if vision_memory is not None:
-                mirrored_detections = viz.mirror_detections(vision_memory.last_detections, frame.shape[1])
                 webcam_hud = viz.draw_detections(webcam_hud, mirrored_detections)
             lamp_panel = lamp.render()
 
@@ -258,6 +309,8 @@ def run(args: argparse.Namespace) -> None:
         lamp.close()
         if audio_monitor is not None:
             audio_monitor.stop()
+        if hand_wave is not None:
+            hand_wave.close()
         if adapt_engine is not None:
             adapt_engine.save()
             print(f"[adapt] {adapt_engine.summary()}")
@@ -295,6 +348,10 @@ def parse_args() -> argparse.Namespace:
                     help="with --chat --voice: identify which face was talking when more than one is in frame")
     p.add_argument("--wake-word", type=str, default=config.WAKE_WORD,
                     help=f'with --chat --voice: phrase that wakes it up to listen (default: "{config.WAKE_WORD}")')
+    p.add_argument("--no-camera-pan", action="store_true",
+                    help="disable the webcam view panning to follow the lamp's own gaze")
+    p.add_argument("--no-hand-wave", action="store_true",
+                    help="disable hand-wave detection (a third CPU model, only run while ENGAGED)")
     args = p.parse_args()
     if args.chat and not args.voice:
         # Typed chat blocks on input(), which no shutdown_event can reach

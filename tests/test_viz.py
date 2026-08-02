@@ -67,6 +67,66 @@ def test_draw_detections_mutates_its_input_in_place():
     assert not np.array_equal(frame, np.zeros((480, 640, 3), dtype=np.uint8))
 
 
+def test_pan_crop_centered_bearing_is_a_pure_zoom():
+    # bearing 0.0 -- centered -- should crop symmetrically and preserve
+    # output shape (a digital zoom in place, not a shift).
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    cropped, x0, scale = viz.pan_crop_frame(frame, 0.0, hfov_deg=60.0, zoom=1.25)
+    assert cropped.shape == frame.shape
+    crop_w = 200 / 1.25
+    assert abs(x0 - (200 - crop_w) / 2) <= 1  # centered crop window
+    assert abs(scale - 1.25) < 1e-6
+
+
+def test_pan_crop_follows_a_rightward_bearing():
+    # Positive bearing = user's right = right side of a mirrored frame
+    # (same convention mirror_detections already uses) -- the crop window
+    # should shift toward the right edge, not the left.
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    _, x0_center, _ = viz.pan_crop_frame(frame, 0.0, hfov_deg=60.0, zoom=1.25)
+    _, x0_right, _ = viz.pan_crop_frame(frame, 20.0, hfov_deg=60.0, zoom=1.25)
+    assert x0_right > x0_center
+
+
+def test_pan_crop_unmirrored_uses_the_opposite_sign():
+    # perception/vision_memory.py crops the *raw* (unmirrored) frame --
+    # the raw-frame bearing convention is already flipped relative to the
+    # mirrored display convention (see mirror_detections' docstring), so
+    # a positive bearing should shift the unmirrored crop window left,
+    # not right.
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    _, x0_center, _ = viz.pan_crop_frame(frame, 0.0, hfov_deg=60.0, zoom=1.25, mirrored=False)
+    _, x0_right_bearing, _ = viz.pan_crop_frame(frame, 20.0, hfov_deg=60.0, zoom=1.25, mirrored=False)
+    assert x0_right_bearing < x0_center
+
+
+def test_pan_crop_clamps_to_frame_edges():
+    # A bearing far past the frame's actual FOV shouldn't crop past the
+    # frame boundary or produce a negative/out-of-range window.
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    cropped, x0, scale = viz.pan_crop_frame(frame, 200.0, hfov_deg=60.0, zoom=1.25)
+    crop_w = round(200 / 1.25)
+    assert 0 <= x0 <= 200 - crop_w
+    assert cropped.shape == frame.shape
+
+
+def test_remap_boxes_for_pan_keeps_boxes_on_the_object():
+    # A box drawn against the raw (already-mirrored) frame should land in
+    # the same *visual* place once the pan crop is applied -- i.e.
+    # applying the crop's own x0/scale to the box coordinates, not left
+    # pointing at the pre-crop position.
+    det = _Det("cell phone", 0.9, (110.0, 40.0, 130.0, 60.0))
+    remapped = viz.remap_boxes_for_pan([det], crop_x0=100, x_scale=2.0)
+    x1, y1, x2, y2 = remapped[0].bbox_xyxy
+    assert x1 == 20.0 and x2 == 60.0  # (110-100)*2, (130-100)*2
+    assert y1 == 40.0 and y2 == 60.0  # vertical untouched -- pan is horizontal-only
+
+
+def test_remap_boxes_for_pan_handles_empty_and_none():
+    assert viz.remap_boxes_for_pan([], crop_x0=0, x_scale=1.0) == []
+    assert viz.remap_boxes_for_pan(None, crop_x0=0, x_scale=1.0) == []
+
+
 if __name__ == "__main__":
     test_mirror_frame_flips_pixels_left_right()
     test_mirror_frame_preserves_shape()

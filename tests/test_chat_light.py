@@ -17,9 +17,10 @@ from behavior.state_machine import State
 
 
 class _FakeLamp:
-    def __init__(self, current_light=(100, 100, 100)):
+    def __init__(self, current_light=(100, 100, 100), mood=(0.6, 0.55)):
         self.calls = []
         self._light = current_light
+        self._mood = mood
         self.closed = False
 
     def set_light(self, rgb, transition_s=0.4):
@@ -28,6 +29,12 @@ class _FakeLamp:
 
     def get_current_light(self):
         return self._light
+
+    def set_mood(self, warmth, brightness):
+        self._mood = (warmth, brightness)
+
+    def get_mood(self):
+        return self._mood
 
     def set_target_pose(self, *args, **kwargs):
         pass
@@ -62,43 +69,45 @@ def test_off_is_fully_dark():
     assert lamp.calls[-1] == (0, 0, 0)
 
 
-def test_dim_scales_down_from_whatever_is_currently_showing():
-    lamp = _FakeLamp(current_light=(100, 100, 100))
+def test_dim_lowers_the_brightness_dial_without_touching_warmth():
+    lamp = _FakeLamp(mood=(0.6, 0.8))
     chat._apply_light_command(lamp, "dim", show_gui=False, seconds=0.0)
-    dimmed = lamp.calls[-1]
-    assert all(c < 100 for c in dimmed)
-    assert all(c > 0 for c in dimmed)
+    warmth, brightness = lamp.get_mood()
+    assert brightness < 0.8
+    assert warmth == 0.6
 
 
-def test_repeated_dim_never_reaches_pure_black():
-    # Repeated "dim" should settle near-off, not hit literal (0,0,0) --
+def test_repeated_dim_never_reaches_zero_brightness():
+    # Repeated "dim" should settle near-off, not hit literal 0 brightness --
     # that's what "off" is explicitly for, dim should stay a distinct action.
-    lamp = _FakeLamp(current_light=(100, 100, 100))
+    lamp = _FakeLamp(mood=(0.6, 0.8))
     for _ in range(20):
         chat._apply_light_command(lamp, "dim", show_gui=False, seconds=0.0)
-    assert all(c >= chat._DIM_FLOOR for c in lamp.calls[-1])
+    _, brightness = lamp.get_mood()
+    assert brightness >= chat._BRIGHTNESS_FLOOR
     assert lamp.calls[-1] != (0, 0, 0)
 
 
-def test_on_brightens_the_current_hue_instead_of_a_flat_gray():
-    # "on" used to be a fixed (180,180,180) preset -- asking for full
-    # brightness on a warm color turned it flat gray instead of a
-    # brighter version of the same hue.
-    lamp = _FakeLamp(current_light=(20, 100, 50))
+def test_on_sets_brightness_high_while_preserving_warmth():
+    # "on" used to scale whatever raw color was showing -- now it's purely
+    # a brightness-dial move, so hue (warmth) is untouched by construction
+    # instead of needing separate hue-preserving math.
+    lamp = _FakeLamp(mood=(0.2, 0.3))
     target = chat._apply_light_command(lamp, "on", show_gui=False, seconds=0.0)
-    assert max(target) == 255
-    # ratios preserved (proportionally the same hue, just brighter)
-    b, g, r = (20, 100, 50)
-    assert round(target[1] / target[0], 1) == round(g / b, 1)
-    assert round(target[2] / target[0], 1) == round(r / b, 1)
+    warmth, brightness = lamp.get_mood()
+    assert warmth == 0.2
+    assert brightness == chat._ON_BRIGHTNESS
+    assert target == chat.color.from_dials(0.2, chat._ON_BRIGHTNESS)
 
 
-def test_on_from_off_restores_a_sensible_default_not_black_times_anything():
-    # Scaling (0, 0, 0) up by any factor is still (0, 0, 0) -- "on" after
-    # "off" needs an actual fallback color, not a no-op.
-    lamp = _FakeLamp(current_light=(0, 0, 0))
+def test_on_from_off_still_produces_real_brightness():
+    # Dial-based brightness has no "scaling zero by anything is still
+    # zero" failure mode -- "on" after "off" just sets the dial outright.
+    lamp = _FakeLamp(mood=(0.5, 0.0))
     target = chat._apply_light_command(lamp, "on", show_gui=False, seconds=0.0)
-    assert target == chat.ENGAGED_COLOR
+    assert target != (0, 0, 0)
+    _, brightness = lamp.get_mood()
+    assert brightness == chat._ON_BRIGHTNESS
 
 
 def test_reactive_tones_are_exactly_tense_and_quiet():
@@ -344,6 +353,132 @@ def test_calm_speech_never_triggers_a_tone_flash(monkeypatch):
     assert flashed == []
 
 
+def test_recall_points_at_the_object_before_speaking_and_confirms_if_live(monkeypatch):
+    # "the lamp should look to the phone FIRST and checked if it was
+    # there" -- used to speak the (memory-only) reply first and only then
+    # point/check. Order must be point-then-speak, and a live find should
+    # get an audible confirmation the memory-only reply text couldn't have
+    # included. Points toward the *remembered* bearing (not the live one)
+    # -- the whole reason to point before checking is so the pan-crop
+    # tracking the lamp's aim has a chance to actually include the object
+    # by the time the live check runs (see _point_toward's docstring).
+    monkeypatch.setattr(chat.voice, "preload", lambda: None)
+    monkeypatch.setattr(chat.voice, "wait_for_wake_word", lambda *a, **k: "wake")
+
+    order = []
+    monkeypatch.setattr(chat.voice, "speak", lambda text: order.append(("speak", text)))
+
+    real_point_toward = chat._point_toward
+
+    def _tracked_point_toward(lamp, bearing_deg, fsm=None):
+        order.append(("point", bearing_deg))
+        return real_point_toward(lamp, bearing_deg, fsm=fsm)
+
+    monkeypatch.setattr(chat, "_point_toward", _tracked_point_toward)
+    monkeypatch.setattr(chat, "_find_live_bearing", lambda vm, cls, window_s=1.6: 12.0)
+
+    calls = {"n": 0}
+
+    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "where is my phone", None, 0, np.zeros(1600, dtype="float32")
+        return "quit", None, 0, np.zeros(1600, dtype="float32")
+
+    monkeypatch.setattr(chat, "_listen", _fake_listen)
+    monkeypatch.setattr(chat.emotion, "analyze",
+                         lambda audio: type("T", (), {"label": "calm", "rms": 0.0,
+                                                       "speaking_rate_hz": 0.0,
+                                                       "pitch_variability_hz": None})())
+
+    class _FakeObs:
+        object_class = "cell phone"
+        bearing_deg = 30.0
+
+    class _FakeAgent:
+        def __init__(self, store):
+            self.last_light_action = None
+            self.last_recall = type("R", (), {"observation": _FakeObs()})()
+
+        def ask(self, question):
+            return "I last saw your phone on the desk."
+
+    monkeypatch.setattr(chat, "MemoryAgent", _FakeAgent)
+
+    class _FakeStore:
+        def list_known_classes(self):
+            return []
+
+        def close(self):
+            pass
+
+    args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
+                               multi_user=False, wake_word="hey lamp")
+
+    chat.run(args, lamp=_FakeLamp(), store=_FakeStore())
+
+    # point -> an audible "let me check" filler -> the final confirmed reply,
+    # in that order. The filler makes the check itself audible instead of
+    # just a gap between question and answer; the final reply is still what
+    # actually confirms the find.
+    assert [kind for kind, _ in order] == ["point", "speak", "speak"]
+    assert order[0][1] == 30.0  # pointed at the remembered bearing -- see docstring above
+    assert order[2][1].startswith("It's right there --")
+
+
+def test_recall_does_not_add_a_live_confirmation_when_not_currently_visible(monkeypatch):
+    monkeypatch.setattr(chat.voice, "preload", lambda: None)
+    spoken = []
+    monkeypatch.setattr(chat.voice, "speak", lambda text: spoken.append(text))
+    monkeypatch.setattr(chat.voice, "wait_for_wake_word", lambda *a, **k: "wake")
+    monkeypatch.setattr(chat, "_find_live_bearing", lambda vm, cls, window_s=1.6: None)
+
+    calls = {"n": 0}
+
+    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "where is my phone", None, 0, np.zeros(1600, dtype="float32")
+        return "quit", None, 0, np.zeros(1600, dtype="float32")
+
+    monkeypatch.setattr(chat, "_listen", _fake_listen)
+    monkeypatch.setattr(chat.emotion, "analyze",
+                         lambda audio: type("T", (), {"label": "calm", "rms": 0.0,
+                                                       "speaking_rate_hz": 0.0,
+                                                       "pitch_variability_hz": None})())
+
+    class _FakeObs:
+        object_class = "cell phone"
+        bearing_deg = 30.0
+
+    class _FakeAgent:
+        def __init__(self, store):
+            self.last_light_action = None
+            self.last_recall = type("R", (), {"observation": _FakeObs()})()
+
+        def ask(self, question):
+            return "I last saw your phone on the desk."
+
+    monkeypatch.setattr(chat, "MemoryAgent", _FakeAgent)
+
+    class _FakeStore:
+        def list_known_classes(self):
+            return []
+
+        def close(self):
+            pass
+
+    args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
+                               multi_user=False, wake_word="hey lamp")
+
+    chat.run(args, lamp=_FakeLamp(), store=_FakeStore())
+
+    # The "let me check" filler still plays (it's audible regardless of
+    # outcome), but no "It's right there" confirmation gets prefixed since
+    # the live check came back empty.
+    assert spoken == ["Let me check.", "I last saw your phone on the desk."]
+
+
 class _FakeDetection:
     def __init__(self, object_class, bearing_deg):
         self.object_class = object_class
@@ -395,4 +530,30 @@ def test_find_live_bearing_gives_up_after_its_timeout_if_the_scan_never_lands():
             pass  # scan_count never advances -- simulates main.py's loop not running
 
     # Must return (not hang forever) even if nothing ever ticks scan_count.
-    assert chat._find_live_bearing(_StuckVisionMemory(), "cell phone", timeout_s=0.05) is None
+    assert chat._find_live_bearing(_StuckVisionMemory(), "cell phone", window_s=0.05) is None
+
+
+def test_listen_skips_transcription_on_pure_ambient_noise(monkeypatch):
+    # A patient engaged/follow-up listen can run its whole window on
+    # nothing but ambient noise -- Whisper doesn't reliably return "" on
+    # that (it can hallucinate a short phrase), which live testing showed
+    # as "it keeps thinking I'm talking even when I don't say anything."
+    # Below the gate, transcribe() must never even get called.
+    quiet_audio = np.random.uniform(-0.0005, 0.0005, 1600).astype("float32")
+    monkeypatch.setattr(chat.voice, "record_until_silence", lambda **kwargs: quiet_audio)
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("transcribe() must not be called on audio that never crossed the gate")
+    monkeypatch.setattr(chat.voice, "transcribe", _must_not_be_called)
+
+    text, bearing, n_faces, audio = chat._listen(None)
+    assert text == ""
+
+
+def test_listen_still_transcribes_real_speech(monkeypatch):
+    loud_audio = np.random.uniform(-0.5, 0.5, 1600).astype("float32")
+    monkeypatch.setattr(chat.voice, "record_until_silence", lambda **kwargs: loud_audio)
+    monkeypatch.setattr(chat.voice, "transcribe", lambda audio, **k: "hello lamp")
+
+    text, bearing, n_faces, audio = chat._listen(None)
+    assert text == "hello lamp"

@@ -84,7 +84,10 @@ def forward_kinematics(angles: np.ndarray) -> list[np.ndarray]:
     """Return the 3D joint positions (world frame) for a given pose.
 
     Output is a list of 5 points: [base, shoulder, elbow, wrist, head_tip],
-    each an (x, y, z) numpy array. z is "up".
+    each an (x, y, z) numpy array. z is "up". The shade itself is rendered
+    separately as a 2D billboard driven directly by base_yaw (see
+    sim_backend.render) rather than from a 3D shape projected through
+    these points -- see that function's docstring for why.
     """
     base_yaw, shoulder_pitch, elbow_pitch, wrist_pitch, wrist_roll, head_twist = angles
 
@@ -100,9 +103,7 @@ def forward_kinematics(angles: np.ndarray) -> list[np.ndarray]:
     T = T @ _rot_y(wrist_pitch) @ _rot_x(wrist_roll)
     wrist = T[:3, 3].copy()
 
-    T = T @ _rot_z(head_twist) @ _translate(0, 0, HEAD_LEN)
-    head_tip = T[:3, 3].copy()
-
+    head_tip = (T @ _rot_z(head_twist) @ _translate(0, 0, HEAD_LEN))[:3, 3].copy()
     return [base, shoulder, elbow, wrist, head_tip]
 
 

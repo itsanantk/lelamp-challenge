@@ -158,6 +158,9 @@ class _FakeLamp:
     def get_current_pose(self):
         return None
 
+    def get_mood(self):
+        return (0.6, 0.55)
+
 
 def test_multi_round_learning_with_a_consistently_responsive_user():
     """Drives the FSM through several disengage -> attention-seek ->

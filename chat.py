@@ -45,47 +45,36 @@ if sys.stdout.encoding.lower() != "utf-8":
     # an em dash, mangling otherwise-correct model output into "?" or "*"
     sys.stdout.reconfigure(encoding="utf-8")
 import viz
-from behavior.state_machine import ENGAGED_COLOR, State
-from lamp import SimulatedLamp, kinematics
+from behavior.state_machine import ENGAGED_NUDGE, IDLE_COLOR, State
+from lamp import SimulatedLamp, color, kinematics
 from memory.store import MemoryStore
 from conversation.agent import MemoryAgent
 from conversation import emotion, voice
 from perception.multi_face import SpeakerDetector
 
-FOUND_COLOR = (210, 235, 255)  # BGR, bright warm spotlight -- distinct from
-                                 # the orange attention-seek pulse and the
-                                 # green object-watch tint
-IDLE_COLOR = (40, 110, 200)
+# "Found it" reads as a bright, slightly cooler spotlight -- a nudge off
+# whatever mood is currently showing, not an unrelated fixed hue (see
+# lamp/color.py's module docstring for why nudging instead of replacing
+# is what actually keeps the palette feeling coherent).
+FOUND_NUDGE = (-0.2, 0.35)
+# tense reads as a little warmer/brighter (agitated); quiet as cooler/
+# dimmer (subdued) -- "calm"/"energetic" never reach here, see
+# _REACTIVE_TONES below.
+_TONE_NUDGES = {"tense": (0.15, 0.25), "quiet": (-0.15, -0.25)}
 
 # Voice-controlled lighting (control_light tool in conversation/agent.py).
-# "dim"/"on" act relative to whatever's currently showing; the rest are
-# absolute mood presets. "on" has no fixed color of its own -- see
-# _brighten_to_max -- since a flat preset there would mean "brighten"
-# replaces whatever hue was showing with plain gray instead of actually
-# brightening it.
-LIGHT_PRESETS = {
-    "cozy": (40, 120, 230),    # BGR, warm amber-orange
-    "focus": (230, 225, 210),  # BGR, crisp bright white, slightly cool
-    "calm": (200, 150, 90),    # BGR, soft cool blue
-    "off": (0, 0, 0),
-}
-_DIM_STEP = 0.55  # each "dim" scales current brightness down by this factor
-_DIM_FLOOR = 4    # per-channel floor so repeated "dim" settles near-off without hitting literal (0,0,0) -- that's what "off" is for
-
-
-def _brighten_to_max(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
-    """Scales rgb up so its brightest channel hits 255, preserving hue --
-    the inverse of the "dim" step. Falls back to ENGAGED_COLOR when there's
-    essentially nothing to brighten (i.e. coming from "off"), since scaling
-    up (0, 0, 0) by any factor is still (0, 0, 0)."""
-    peak = max(rgb)
-    if peak <= _DIM_FLOOR:
-        return ENGAGED_COLOR
-    scale = 255 / peak
-    # round(), not int() -- truncating float imprecision (255/100 landing
-    # at 2.549999... instead of exactly 2.55) made the peak channel land
-    # on 254 instead of the 255 it's mathematically supposed to hit.
-    return tuple(min(round(c * scale), 255) for c in rgb)
+# All of these set the persistent (warmth, brightness) *mood* dial (see
+# lamp/color.py, SimulatedLamp.get_mood/set_mood) -- "dim"/"on" adjust the
+# brightness dial relative to whatever's current; the named presets set
+# both dials outright. LIGHT_PRESETS below (BGR, for callers/tests that
+# want the actual color a preset produces) is derived from the same
+# warmth/brightness values _apply_light_command uses, not a separate list.
+LIGHT_PRESETS = {name: color.from_dials(*wb) for name, wb in color.MOOD_PRESETS.items()}
+LIGHT_PRESETS["off"] = (0, 0, 0)
+_DIM_STEP = 0.15       # each "dim" lowers the brightness dial by this much
+_BRIGHTNESS_FLOOR = 0.03  # floor so repeated "dim" settles near-off without hitting
+                            # literal 0 brightness -- that's what "off" is explicitly for
+_ON_BRIGHTNESS = 0.95   # "on" sets brightness dial to (near-)full, warmth untouched
 
 
 def _wait_out_attention_seek(fsm, timeout: float = 1.5) -> None:
@@ -131,41 +120,49 @@ def _hold(lamp: SimulatedLamp, seconds: float, show_gui: bool, standalone: bool)
 
 def _apply_light_command(lamp: SimulatedLamp, action: str, show_gui: bool, seconds: float = 1.0,
                           standalone: bool = True, fsm=None) -> tuple[int, int, int]:
-    """Returns the color it actually applied, so callers can track it as
-    the new baseline (see run()'s base_light_color) instead of reading it
-    back mid-transition from get_current_light()."""
+    """Sets the lamp's persistent mood (warmth, brightness) dial and
+    returns the color it actually applied. "dim"/"on" only ever touch the
+    brightness dial, relative to whatever's current; the named presets set
+    both dials outright. Every other transient state (tracking, tone,
+    recall) reads the mood back via lamp.get_mood() and nudges a delta off
+    it, so it never needs tracking here beyond calling lamp.set_mood()."""
     _wait_out_attention_seek(fsm)
+    warmth, brightness = lamp.get_mood()
+    if action == "dim":
+        brightness = max(brightness - _DIM_STEP, _BRIGHTNESS_FLOOR)
+    elif action == "on":
+        brightness = _ON_BRIGHTNESS
+    elif action == "off":
+        brightness = 0.0
+    else:
+        warmth, brightness = color.MOOD_PRESETS[action]
+    lamp.set_mood(warmth, brightness)
+    target = color.from_dials(warmth, brightness)
     # set_light() only sets a transition target -- nothing advances that
     # transition or draws it without a render loop, so without one the
     # light silently changes internally while the window (if any is even
     # open) never shows it and update() never ticks it forward either.
-    if action == "dim":
-        current = lamp.get_current_light()
-        target = tuple(max(int(c * _DIM_STEP), _DIM_FLOOR) for c in current)
-    elif action == "on":
-        target = _brighten_to_max(lamp.get_current_light())
-    else:
-        target = LIGHT_PRESETS[action]
     lamp.set_light(target, transition_s=0.4 if action in ("dim", "on") else 0.5)
     _hold(lamp, seconds, show_gui, standalone)
     return target
 
 
 def _look_attentive(lamp: SimulatedLamp, bearing_deg: float | None, set_light: bool = True, fsm=None,
-                     light_color: tuple[int, int, int] = ENGAGED_COLOR) -> None:
+                     light_color: tuple[int, int, int] | None = None) -> None:
     """Held during the post-wake conversation window so the lamp visibly
     looks like it's still listening, not just idling until you say the
     wake word again. set_light=False when an explicit control_light
     command just fired that turn -- otherwise "make it cozy" would flicker
-    straight back to light_color within a second. light_color defaults to
-    the plain listening color but should be run()'s current
-    base_light_color once one exists, so a still-active custom preset
-    ("cozy") doesn't get silently wiped by the very next follow-up turn
-    that doesn't also change the light."""
+    straight back within a second. light_color defaults to a nudge off
+    the lamp's current mood (read fresh via get_mood() every call, not a
+    value tracked separately), so a still-active custom preset ("cozy")
+    isn't silently wiped by the very next follow-up turn."""
     _wait_out_attention_seek(fsm)
     pose = kinematics.pose_for_look_at(bearing_deg if bearing_deg is not None else 0.0, -10.0, alertness=0.75)
     lamp.set_target_pose(pose, duration=0.4, anticipation=False, overshoot=False)
     if set_light:
+        if light_color is None:
+            light_color = color.from_dials(*color.nudge(*lamp.get_mood(), *ENGAGED_NUDGE))
         lamp.set_light(light_color, transition_s=0.3)
 
 
@@ -173,25 +170,44 @@ def _relax_to_idle(lamp: SimulatedLamp, fsm=None) -> None:
     _wait_out_attention_seek(fsm)
     if fsm is not None and fsm.state == State.ENGAGED:
         # Still being looked at -- BehaviorFSM's own engaged look (pose +
-        # ENGAGED_COLOR, set once on entry) is already exactly right, and
-        # it won't re-assert that on its own since it only does so on its
-        # own transitions (see object_watch.py's docstring for the same
+        # color, set once on entry) is already exactly right, and it won't
+        # re-assert that on its own since it only does so on its own
+        # transitions (see object_watch.py's docstring for the same
         # reasoning applied to object tracking). Relaxing to idle here
         # would fight it for no reason.
         return
-    lamp.set_light(IDLE_COLOR, transition_s=0.6)
+    lamp.set_light(color.from_dials(*lamp.get_mood()), transition_s=0.6)
     lamp.set_target_pose(kinematics.NEUTRAL_POSE, duration=0.6, overshoot=False)
 
 
-def _point_and_render(lamp: SimulatedLamp, bearing_deg: float, show_gui: bool, seconds: float = 2.0,
-                       standalone: bool = True, fsm=None) -> None:
+def _point_toward(lamp: SimulatedLamp, bearing_deg: float, fsm=None) -> None:
+    """Moves toward bearing_deg without yet declaring anything found --
+    called before the live check (see handle()), not after, so the check
+    actually happens once the lamp is pointed the right way. This matters
+    more now than it used to: object detection is restricted to a crop
+    that follows wherever the lamp is currently aimed (see
+    vision_memory.py's pan_zoom), so checking before moving there was
+    checking blind -- the object could be completely outside the frame
+    YOLO was even given, no matter how long the check waited."""
     _wait_out_attention_seek(fsm)
-    target = kinematics.pose_for_look_at(bearing_deg, -10.0, alertness=0.85)
+    target = kinematics.pose_for_look_at(bearing_deg, -10.0, alertness=0.75)
     lamp.set_target_pose(target, duration=0.5, anticipation=True, overshoot=True)
-    lamp.set_light(FOUND_COLOR, transition_s=0.3)
-    lamp.play_sound("recall_point")
+
+
+def _settle_from_point(lamp: SimulatedLamp, show_gui: bool, seconds: float, standalone: bool,
+                        confirmed: bool) -> None:
+    """confirmed=True plays the "found it" flourish (a brighter light
+    nudge + chime) before holding; confirmed=False just holds at the
+    remembered-bearing pose quietly. Pointing at a memory and celebrating
+    exactly like a live find used to look identical either way -- the
+    gesture read as "I see it right now" even on turns where the live
+    check came back empty and the reply text said "last seen"."""
+    mood = lamp.get_mood()
+    if confirmed:
+        lamp.set_light(color.from_dials(*color.nudge(*mood, *FOUND_NUDGE)), transition_s=0.3)
+        lamp.play_sound("recall_point")
     _hold(lamp, seconds, show_gui, standalone)
-    lamp.set_light(IDLE_COLOR, transition_s=0.6)
+    lamp.set_light(color.from_dials(*mood), transition_s=0.6)
     lamp.set_target_pose(kinematics.NEUTRAL_POSE, duration=0.6, overshoot=False)
 
 
@@ -208,36 +224,46 @@ _REACTIVE_TONES = ("tense", "quiet")
 def _flash_tone(lamp: SimulatedLamp, label: str, show_gui: bool, seconds: float = 0.6,
                  standalone: bool = True, fsm=None) -> None:
     _wait_out_attention_seek(fsm)
-    tone_color = emotion.BGR_BY_LABEL.get(label, (180, 220, 180))
-    lamp.set_light(tone_color, transition_s=0.2)
+    mood = lamp.get_mood()
+    dw, db = _TONE_NUDGES.get(label, (0.0, 0.0))
+    lamp.set_light(color.from_dials(*color.nudge(*mood, dw, db)), transition_s=0.2)
     _hold(lamp, seconds, show_gui, standalone)
-    # Settle into a dimmed version of the same tone color instead of a
-    # fixed neutral amber -- this is what makes the warmth actually track
-    # how you sounded rather than just flashing and reverting.
-    settled = tuple(max(int(c * 0.5), 20) for c in tone_color)
-    lamp.set_light(settled, transition_s=0.6)
+    # Settle into a smaller nudge off the same mood instead of a fixed
+    # neutral amber -- this is what makes the reaction actually track how
+    # you sounded rather than just flashing and reverting to nothing.
+    lamp.set_light(color.from_dials(*color.nudge(*mood, dw * 0.4, db * 0.4)), transition_s=0.6)
 
 
-def _find_live_bearing(vision_memory, object_class: str, timeout_s: float = 0.5) -> float | None:
-    """Forces a fresh scan and checks whether object_class is actually
-    visible right now, rather than just trusting whatever the last
-    opportunistic scan happened to catch -- at normal cadence, a static
-    scene can go a couple seconds between real scans (see
-    VisionMemory.maybe_scan's scene-change skip logic), and "is my phone
-    still there" is exactly the question a stale read answers wrong.
+def _find_live_bearing(vision_memory, object_class: str, window_s: float = 1.6,
+                        poll_interval_s: float = 0.15) -> float | None:
+    """Repeatedly forces fresh scans for up to window_s, checking whether
+    object_class is actually visible right now -- not a single snapshot.
+    Returns as soon as it's seen (no need to burn the whole window once
+    it's found); returns None only once the window fully elapses without
+    ever seeing it. This is what makes the "look, hold, decide" sequence
+    in handle() a genuinely stable read instead of a single roll of the
+    dice -- one forced scan can land before the lamp/pan-crop has finished
+    settling on the new bearing and come back empty even when the object
+    is right there; repeating it a handful of times over ~1-2 seconds
+    (matching how long a person would actually glance and check) gives
+    it real room to catch up.
+
     vision_memory is None in standalone chat.py (no live camera loop to
     ask), where this always falls through to the remembered bearing --
     same as it always has."""
     if vision_memory is None:
         return None
-    before = vision_memory.scan_count
-    vision_memory.request_immediate_scan()
-    t0 = time.perf_counter()
-    while vision_memory.scan_count == before and time.perf_counter() - t0 < timeout_s:
-        time.sleep(0.02)
-    for d in vision_memory.last_detections:
-        if d.object_class == object_class:
-            return d.bearing_deg
+    deadline = time.perf_counter() + window_s
+    while time.perf_counter() < deadline:
+        before = vision_memory.scan_count
+        vision_memory.request_immediate_scan()
+        scan_deadline = min(deadline, time.perf_counter() + poll_interval_s * 2)
+        while vision_memory.scan_count == before and time.perf_counter() < scan_deadline:
+            time.sleep(0.02)
+        for d in vision_memory.last_detections:
+            if d.object_class == object_class:
+                return d.bearing_deg
+        time.sleep(poll_interval_s)
     return None
 
 
@@ -285,7 +311,22 @@ def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None
         audio = voice.record_until_silence(**kwargs)
         bearing, n_faces = None, 0
 
-    text = voice.transcribe(audio).strip()
+    # A patient follow-up/engaged listen can run its full window (up to
+    # CONVERSATION_FOLLOWUP_TIMEOUT_S = 60s) on pure ambient noise if
+    # nothing was ever actually said -- record_until_silence's own
+    # no-speech bail-out only fires that fast when it's genuinely short
+    # (the original post-wake case); a longer window means a lot more
+    # ambient audio can accumulate before it gives up. Whisper does not
+    # reliably return an empty string on that; it can hallucinate a short
+    # phrase from near-silent/noise-only audio, which is what live testing
+    # actually showed as "it keeps thinking I'm talking even when I don't
+    # say anything." Skip transcription entirely -- same peak-RMS gate the
+    # recording itself uses to decide "speech started" -- rather than
+    # trusting the model to notice silence on its own.
+    if audio.size and voice._peak_rms(audio, config.VOICE_SAMPLE_RATE) >= config.VOICE_GATE_RMS_THRESHOLD:
+        text = voice.transcribe(audio).strip()
+    else:
+        text = ""
     return text, bearing, n_faces, audio
 
 
@@ -336,16 +377,7 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
     else:
         print("[chat] Ask about an object's location, or 'quit' to exit.\n")
 
-    # Tracks whatever color should be considered "normal" right now --
-    # ENGAGED_COLOR until the user explicitly asks for a preset, then that
-    # preset, until the next explicit change. _look_attentive uses this
-    # instead of a hardcoded ENGAGED_COLOR so a still-active "cozy" isn't
-    # silently wiped by the very next follow-up turn that doesn't also
-    # touch the light.
-    base_light_color = ENGAGED_COLOR
-
     def handle(question: str, speaker_bearing: float | None = None, tone_label: str | None = None) -> None:
-        nonlocal base_light_color
         if speaker_bearing is not None:
             # Quick glance toward whoever was actually talking, before
             # answering -- separate gesture from the "found it" point.
@@ -368,24 +400,49 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
                 voice.speak("Sorry, I couldn't reach the model just now.")
             return
 
+        # Look FIRST, then tell you -- not the other way around. This used
+        # to speak the reply (generated purely from the remembered
+        # sighting) before ever checking or pointing at all, which read as
+        # "it says it found it, THEN the arm moves" -- backwards from how
+        # a person would actually answer ("let me check... yep, right
+        # there"). The physical point also happens *before* the live
+        # check now, not after: object detection is restricted to a crop
+        # that follows wherever the lamp is aimed (vision_memory.py's
+        # pan_zoom), so checking before moving there was checking blind,
+        # no matter how long it waited.
+        obs = agent.last_recall.observation
+        if obs is not None:
+            print(f"[chat] looking toward the last known spot for {obs.object_class}...")
+            _point_toward(lamp, obs.bearing_deg, fsm=fsm)
+            if args.voice:
+                # Deliberately audible, not just a silent pause -- makes
+                # the "let me actually go check" step something you can
+                # hear happening instead of a gap that just reads as lag
+                # between asking and getting an answer.
+                voice.speak("Let me check.")
+            # Repeatedly rescans for up to ~1.6s (see _find_live_bearing) --
+            # a real "hold still and look for a couple seconds" window, not
+            # a single roll of the dice that can land before the lamp/crop
+            # has even finished settling on the new bearing.
+            live_bearing = _find_live_bearing(vision_memory, obs.object_class)
+            print(f"[chat] {'found it live' if live_bearing is not None else 'not currently visible'} "
+                  f"-- {'confirming' if live_bearing is not None else 'going with the last known spot'}")
+            _settle_from_point(lamp, show_gui=not args.no_gui, seconds=1.2, standalone=standalone,
+                                confirmed=live_bearing is not None)
+            if live_bearing is not None:
+                # The reply text itself was composed from the remembered
+                # sighting only (re-prompting the LLM on the live-check
+                # result isn't worth a second round trip) -- this is what
+                # actually makes "yes, it's here right now" audible rather
+                # than always defaulting to "last seen" phrasing.
+                reply = f"It's right there -- {reply}"
+
         print(f"LAMP: {reply}\n")
         if args.voice:
             voice.speak(reply)
         if agent.last_light_action is not None:
-            base_light_color = _apply_light_command(lamp, agent.last_light_action, show_gui=not args.no_gui,
-                                                      standalone=standalone, fsm=fsm)
-        obs = agent.last_recall.observation
-        if obs is not None:
-            # Try to actually find it before just pointing at memory --
-            # a phone sitting still is exactly the case a stale scan can
-            # miss (see _find_live_bearing). The reply text above is
-            # already generated from the remembered sighting either way
-            # (re-prompting the LLM on a live/not-live split isn't worth
-            # the extra round trip) -- only the gesture's target bearing
-            # changes, live if found, remembered if not.
-            live_bearing = _find_live_bearing(vision_memory, obs.object_class)
-            bearing = live_bearing if live_bearing is not None else obs.bearing_deg
-            _point_and_render(lamp, bearing, show_gui=not args.no_gui, standalone=standalone, fsm=fsm)
+            _apply_light_command(lamp, agent.last_light_action, show_gui=not args.no_gui,
+                                  standalone=standalone, fsm=fsm)
 
     if args.ask:
         handle(args.ask)
@@ -424,7 +481,7 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
                         break
                     lamp.play_sound("wake")
                     time.sleep(0.2)  # let the chirp clear the speaker before the mic opens -- otherwise its tail can leak into the recording and falsely trip the silence detector
-                    _look_attentive(lamp, None, fsm=fsm, light_color=base_light_color)
+                    _look_attentive(lamp, None, fsm=fsm)
                     print("[voice] listening...")
                     question, speaker_bearing, n_faces, audio = _listen(speaker_detector, shutdown_event=shutdown_event)
                 else:
@@ -468,8 +525,7 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
             handle(question, speaker_bearing, tone_label)
             if args.voice:
                 in_conversation = True
-                _look_attentive(lamp, speaker_bearing, set_light=agent.last_light_action is None, fsm=fsm,
-                                 light_color=base_light_color)
+                _look_attentive(lamp, speaker_bearing, set_light=agent.last_light_action is None, fsm=fsm)
     finally:
         if owns_lamp:
             lamp.close()

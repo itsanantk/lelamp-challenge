@@ -5,15 +5,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config
-from behavior.object_watch import ObjectWatcher, WATCH_COLOR
-from behavior.state_machine import ENGAGED_COLOR, IDLE_COLOR, State
+from behavior.object_watch import WATCH_NUDGE, ObjectWatcher
+from behavior.state_machine import DEFAULT_MOOD, ENGAGED_NUDGE, State
+from lamp import color
 from perception.vision_memory import Detection
+
+WATCH_COLOR = color.from_dials(*color.nudge(*DEFAULT_MOOD, *WATCH_NUDGE))
+IDLE_COLOR = color.from_dials(*DEFAULT_MOOD)
+ENGAGED_COLOR = color.from_dials(*color.nudge(*DEFAULT_MOOD, *ENGAGED_NUDGE))
 
 
 class _FakeLamp:
     def __init__(self):
         self.calls = []
         self.breathing = True
+        self.mood = DEFAULT_MOOD
 
     def set_target_pose(self, angles, duration=0.6, anticipation=True, overshoot=True):
         self.calls.append(("pose", tuple(angles)))
@@ -26,6 +32,12 @@ class _FakeLamp:
 
     def set_breathing(self, enabled):
         self.breathing = enabled
+
+    def set_mood(self, warmth, brightness):
+        self.mood = (warmth, brightness)
+
+    def get_mood(self):
+        return self.mood
 
     def update(self, dt):
         pass
@@ -311,60 +323,20 @@ def test_small_bump_after_stationary_give_up_does_not_restart_the_acquire_flouri
     assert watcher.active, "a real move past the reacquire margin should restart tracking"
 
 
-def test_waving_the_object_back_and_forth_triggers_a_wave_back():
-    """Several quick direction reversals in a short window -- the phone
-    waved side to side -- should get a distinct one-shot response, not
-    just treated as ordinary repositioning."""
+def test_reaim_turns_the_head_proportionally_to_the_move():
+    """wrist_roll/head_twist used to stay at 0 while tracking -- only the
+    arm (base_yaw/shoulder/elbow) ever moved, which read as flat/static
+    even as the arm visibly swung. A re-aim should now tilt/twist the
+    head a little too, scaled by (and in the direction of) the move."""
     lamp = _FakeLamp()
     watcher = ObjectWatcher(lamp)
     watcher.update(_phone(0.0), State.IDLE, dt=0.05)
     lamp.calls.clear()
 
-    bearing = 0.0
-    step = config.WATCH_REAIM_DEG + 2.0
-    for i in range(6):  # left, right, left, right, left, right
-        bearing += step if i % 2 == 0 else -step
-        watcher.update(_phone(bearing), State.IDLE, dt=0.05)
-
-    assert any(c[0] == "sound" and c[1] == "wave_back" for c in lamp.calls), \
-        "expected a wave-back after several direction reversals"
-
-
-def test_wave_back_only_fires_once_per_acquisition():
-    lamp = _FakeLamp()
-    watcher = ObjectWatcher(lamp)
-    watcher.update(_phone(0.0), State.IDLE, dt=0.05)
-
-    bearing = 0.0
-    step = config.WATCH_REAIM_DEG + 2.0
-    for i in range(6):
-        bearing += step if i % 2 == 0 else -step
-        watcher.update(_phone(bearing), State.IDLE, dt=0.05)
-    lamp.calls.clear()
-
-    # keep waving -- shouldn't fire again until it's lost and reacquired
-    for i in range(6):
-        bearing += step if i % 2 == 0 else -step
-        watcher.update(_phone(bearing), State.IDLE, dt=0.05)
-
-    assert not any(c[0] == "sound" and c[1] == "wave_back" for c in lamp.calls), \
-        "wave-back should be debounced to once per acquisition"
-
-
-def test_ordinary_one_directional_movement_does_not_trigger_a_wave_back():
-    """Just moving the phone steadily in one direction -- not waving it --
-    must not false-trigger the wave-back."""
-    lamp = _FakeLamp()
-    watcher = ObjectWatcher(lamp)
-    watcher.update(_phone(0.0), State.IDLE, dt=0.05)
-    lamp.calls.clear()
-
-    bearing = 0.0
-    for _ in range(6):
-        bearing += config.WATCH_REAIM_DEG + 2.0
-        watcher.update(_phone(bearing), State.IDLE, dt=0.05)
-
-    assert not any(c[0] == "sound" and c[1] == "wave_back" for c in lamp.calls)
+    watcher.update(_phone(20.0), State.IDLE, dt=0.05)  # a real rightward move
+    pose = next(c[1] for c in lamp.calls if c[0] == "pose")
+    assert pose[4] > 0, f"expected wrist_roll to tilt toward the move direction, got {pose}"
+    assert pose[5] > 0, f"expected head_twist to turn toward the move direction, got {pose}"
 
 
 if __name__ == "__main__":

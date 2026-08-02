@@ -41,13 +41,6 @@ _FAST_RATE_HZ = 3.5   # sentence doesn't reliably hit "fast" the way a long exci
 _VARIABLE_PITCH_HZ = 20.0
 _AROUSAL_THRESHOLD = 0.5  # scored average of loud/fast needed to leave "calm"
 
-BGR_BY_LABEL = {
-    "energetic": (60, 200, 255),    # bright warm gold
-    "tense": (60, 60, 220),          # saturated red-ish
-    "quiet": (200, 160, 120),        # soft muted blue
-    "calm": (180, 220, 180),         # gentle green-white
-}
-
 
 @dataclass
 class VoiceTone:

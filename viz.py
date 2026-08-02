@@ -103,6 +103,60 @@ def mirror_frame(frame: np.ndarray) -> np.ndarray:
     return cv2.flip(frame, 1)
 
 
+def pan_crop_frame(frame: np.ndarray, pan_bearing_deg: float, hfov_deg: float,
+                    zoom: float = 1.35, mirrored: bool = True) -> tuple[np.ndarray, int, float]:
+    """Crops+rescales a frame to follow pan_bearing_deg -- replicates the
+    lamp visually "panning" the camera toward wherever it's currently
+    aimed. Digital crop only (never real camera PTZ). Horizontal-only --
+    the lamp's own gaze is driven by base_yaw (a pan), there's no reason
+    to also zoom vertically.
+
+    Two callers, two frame conventions: main.py's display path calls this
+    on the already-mirrored frame (mirrored=True, the default) purely as
+    a display-layer transform -- the underlying frame used for detection/
+    engagement is untouched by that call. perception/vision_memory.py
+    calls this on the *raw* frame (mirrored=False) to restrict what YOLO
+    actually gets to see to the lamp's own current "field of view" --
+    simulating a camera mounted on the lamp's head that genuinely can't
+    see what it isn't pointed at, not just a cosmetic viewport. The sign
+    flips between the two because mirroring itself flips which edge of
+    the frame a positive (user's-right) bearing sits on -- see
+    mirror_detections()'s own docstring for the raw-frame convention.
+
+    Returns (cropped_frame, crop_x0_px, x_scale) so a caller can remap
+    detection boxes (or bearings) through the exact same transform instead
+    of them drifting off the object as the view pans."""
+    h, w = frame.shape[:2]
+    crop_w = max(1, int(round(w / zoom)))
+    center_frac = (0.5 + pan_bearing_deg / hfov_deg) if mirrored else (0.5 - pan_bearing_deg / hfov_deg)
+    center_frac = float(np.clip(center_frac, 0.0, 1.0))
+    x0 = int(round(center_frac * w - crop_w / 2))
+    x0 = max(0, min(x0, w - crop_w))
+    cropped = frame[:, x0:x0 + crop_w]
+    # INTER_NEAREST, not INTER_LINEAR -- this runs on the full display
+    # frame every tick (1920x1080), and the other panel resizes in this
+    # file already learned that lesson (see compose_panels/make_text_panel):
+    # linear interpolation at this resolution is expensive enough to show
+    # up as real per-frame latency, and nobody's looking closely enough at
+    # a live webcam feed for the softer edges to matter.
+    resized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_NEAREST)
+    scale = w / crop_w
+    return resized, x0, scale
+
+
+def remap_boxes_for_pan(detections, crop_x0: int, x_scale: float) -> list[_MirroredDetection]:
+    """Remaps already-mirrored detection boxes (mirror_detections) through
+    the same crop+resize pan_crop_frame just applied, so boxes keep
+    landing on the object instead of drifting as the view pans. Vertical
+    coordinates are untouched -- the pan/zoom is horizontal-only."""
+    out = []
+    for d in detections or []:
+        x1, y1, x2, y2 = d.bbox_xyxy
+        out.append(_MirroredDetection(d.object_class, d.confidence,
+                                       ((x1 - crop_x0) * x_scale, y1, (x2 - crop_x0) * x_scale, y2)))
+    return out
+
+
 def mirror_detections(detections, frame_width: int) -> list[_MirroredDetection]:
     """Mirrors detection boxes to match a mirror_frame()'d display frame,
     so YOLO boxes still land on the object instead of its un-mirrored

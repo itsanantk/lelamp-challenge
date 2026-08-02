@@ -11,6 +11,7 @@ LOGS_DIR = ROOT_DIR / "logs"
 RECORDINGS_DIR = ROOT_DIR / "recordings"
 
 FACE_LANDMARKER_MODEL = MODELS_DIR / "face_landmarker.task"
+HAND_LANDMARKER_MODEL = MODELS_DIR / "hand_landmarker.task"
 YOLO_MODEL = MODELS_DIR / "yolo11s.pt"
 MEMORY_DB = LOGS_DIR / "memory.sqlite3"
 
@@ -31,6 +32,17 @@ FRAME_HEIGHT = 1080
 # FOV, just precise enough to turn "where in the frame" into a bearing angle.
 CAMERA_HFOV_DEG = 60.0
 
+# Camera panning (viz.pan_crop_frame): a digital crop/zoom of the display
+# frame that follows the lamp's own current gaze bearing (its base_yaw
+# joint), so the webcam view visually "pans" the way the lamp itself pans
+# to look around a scene -- never real camera PTZ, and never touches the
+# raw frame detection/engagement actually run on (see main.py).
+CAMERA_PAN_ZOOM = 1.35        # how much the view zooms in while following -- bigger
+                                # values pan further but crop out more of the edges
+CAMERA_PAN_FOLLOW_HZ = 1.2    # smoothing rate on the followed bearing -- without this
+                                # the view would jump with every small arm correction
+                                # instead of panning smoothly
+
 # --- Engagement hysteresis -----------------------------------------------
 # ENTER_* is the tight cone that starts engagement (has to be clearly
 # looking); EXIT_* is the looser cone that ends it (has to clearly look
@@ -48,11 +60,9 @@ ENGAGE_EMA_ALPHA = 0.35  # higher = less smoothing, more responsive
 DISENGAGE_GRACE_S = 2.5          # brief hold before giving up on someone
 ATTENTION_SEEK_DELAY_S = 4.0     # how long disengaged before trying to re-engage
 ATTENTION_SEEK_MAX_ATTEMPTS = 3  # stop after this many tries
-ATTENTION_SEEK_COOLDOWN_S = 3.0  # spacing between attempts -- each attempt's own nudge/hold/
-                                  # nudge/settle sequence already takes ~2.5s, so this is really
-                                  # just a short "did that work?" beat afterward, not a long
-                                  # scheduled wait -- a dog nudging for attention keeps trying
-                                  # every few seconds, it doesn't pace itself on a strict timer
+ATTENTION_SEEK_COOLDOWN_S = 6.0  # spacing between attempts -- doubled back up from an earlier
+                                  # 3.0s pass at making this read as more persistent/dog-like,
+                                  # which ended up feeling too naggy in practice
 
 # --- Memory formation -------------------------------------------------------
 # yolo11s over yolo11n: ~47 vs ~39.5 mAP on COCO, for +8ms/scan on this
@@ -85,17 +95,19 @@ SCENE_CHANGE_MAX_SKIPS = 6
 # Tracked classes (see below) get their own, more lenient confidence bar
 # instead of lowering YOLO_CONF_THRESHOLD globally -- a global drop would
 # also let weaker, more ambiguous detections across all 80 COCO classes
-# into scene memory. A phone is large and visually distinctive enough
-# that a lower bar is low-risk specifically for it, and this is what
-# actually helps the "doesn't detect at an angle" case: an off-angle
+# into scene memory. A phone or bottle is large and visually distinctive
+# enough that a lower bar is low-risk specifically for them, and this is
+# what actually helps the "doesn't detect at an angle" case: an off-angle
 # phone is exactly the kind of detection that scores just under 0.45 but
 # is still almost certainly a real phone.
 TRACKED_CLASS_CONF_THRESHOLD = 0.30
 
 # --- Object watching ("follow my phone when I put it down") ---------------
 # Object classes that trigger the watch-and-remember behavior. COCO class
-# names -- "cell phone" is what YOLO actually calls a phone.
-TRACKED_CLASSES = ["cell phone"]
+# names -- "cell phone" is what YOLO actually calls a phone; "bottle" is
+# the closest COCO class to a water bottle (no separate "water bottle"
+# class in the 80).
+TRACKED_CLASSES = ["cell phone", "bottle"]
 WATCH_REAIM_DEG = 4.0     # only issue a new pose command once it's moved at least
                            # this much since the last one -- avoids the arm jittering
                            # on frame-to-frame bbox noise while it's just sitting there
@@ -118,6 +130,19 @@ WATCH_REACQUIRE_MARGIN = 2.5  # after giving up on a stationary object, require 
 WATCH_WAVE_MIN_REVERSALS = 3   # this many back-and-forth direction changes within the window
                                  # below counts as a wave, not just ordinary repositioning
 WATCH_WAVE_WINDOW_S = 2.0       # how recent those direction changes need to be
+
+# --- Hand-wave detection (perception/hand_wave.py) -------------------------
+# A real hand, not the tracked object's own bearing -- MediaPipe's
+# HandLandmarker, run at a modest gated interval and only while ENGAGED
+# (waving hello is a thing you do when it's already paying attention to
+# you), not every frame -- a third full model pass on top of the
+# always-on FaceLandmarker and interval-scanned YOLO is real added CPU
+# cost on top of what's already a tight budget (see vision_memory.py's own
+# docstring on thread oversubscription).
+HAND_SCAN_INTERVAL_S = 0.12       # ~8Hz -- fast enough to catch a few back-and-forth
+                                    # reversals inside WATCH_WAVE_WINDOW_S
+HAND_WAVE_MIN_DELTA = 0.02         # normalized-x wrist movement (0..1 frame width) between
+                                    # scans small enough to ignore as noise, not a real swing
 
 # --- Conversational recall -------------------------------------------------
 # "anthropic" or "openai" -- whichever key you actually have credit on.

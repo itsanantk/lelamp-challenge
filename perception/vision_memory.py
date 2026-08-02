@@ -28,6 +28,7 @@ torch.set_num_threads(4)
 from ultralytics import YOLO
 
 import config
+import viz
 from memory.store import MemoryStore
 from perception.scene_change import SceneChangeDetector
 
@@ -72,12 +73,32 @@ class VisionMemory:
         it ever took effect."""
         self._force_scan = True
 
-    def maybe_scan(self, frame: np.ndarray, now: float | None = None) -> list[Detection] | None:
+    def maybe_scan(self, frame: np.ndarray, now: float | None = None,
+                    pan_bearing_deg: float = 0.0, pan_zoom: float | None = None) -> list[Detection] | None:
         """Call every loop tick. Only actually runs YOLO once the scan
         interval has elapsed; returns None on ticks where it didn't run.
         Interval shortens to YOLO_FAST_SCAN_INTERVAL_S while self.fast_mode
         is set (see ObjectWatcher), so a tracked object gets checked more
-        often while it's actually being moved around."""
+        often while it's actually being moved around.
+
+        pan_zoom, if given, restricts YOLO's input to a crop of `frame`
+        centered on pan_bearing_deg (see viz.pan_crop_frame) instead of
+        the full frame -- simulating a camera mounted on the lamp's own
+        head that genuinely can't see what it isn't currently pointed at,
+        not main.py just happening to also show a cropped viewport. An
+        object near the crop's edge still gets detected (it's not cut out
+        entirely at this zoom) and pulls the lamp to re-aim toward it via
+        the normal tracking path, which re-centers it -- that's what
+        actually lets the lamp "notice something on the right and turn
+        to bring it into view" the way a single-camera device would, and
+        is also why a wide-open zoom matters: too tight a crop and
+        nothing off to the side ever gets seen in the first place to
+        react to. Detected boxes are converted back to full-frame pixel
+        coordinates before being stored/returned, so every caller and the
+        stored bearing are identical either way -- the crop is purely an
+        inference-time input restriction, not a new coordinate system
+        leaking out. None (the default) scans the full frame, unchanged
+        from before this existed."""
         now = now if now is not None else time.monotonic()
         interval = config.YOLO_FAST_SCAN_INTERVAL_S if self.fast_mode else config.YOLO_SCAN_INTERVAL_S
         if not self._force_scan and now - self._last_scan_t < interval:
@@ -111,6 +132,13 @@ class VisionMemory:
         # isn't discarded by YOLO itself before the per-class check below
         # ever gets a chance to see it.
         scan_conf = min(config.YOLO_CONF_THRESHOLD, config.TRACKED_CLASS_CONF_THRESHOLD)
+
+        scan_frame = frame
+        crop_x0, crop_scale = 0, 1.0
+        if pan_zoom is not None:
+            scan_frame, crop_x0, crop_scale = viz.pan_crop_frame(
+                frame, pan_bearing_deg, config.CAMERA_HFOV_DEG, zoom=pan_zoom, mirrored=False)
+
         # agnostic_nms=True: ultralytics' NMS suppression is per-class by
         # default, so one physical object can legitimately produce two
         # overlapping boxes with different labels (e.g. a phone scored as
@@ -118,11 +146,12 @@ class VisionMemory:
         # never compared against each other. Cross-class suppression keeps
         # only the higher-confidence label for a given region.
         results = self.model.predict(
-            frame, imgsz=config.YOLO_IMG_SIZE, conf=scan_conf, agnostic_nms=True, verbose=False,
+            scan_frame, imgsz=config.YOLO_IMG_SIZE, conf=scan_conf, agnostic_nms=True, verbose=False,
         )[0]
         self.last_scan_latency_ms = (time.perf_counter() - t0) * 1000
 
-        h, w = frame.shape[:2]
+        h, w = frame.shape[:2]  # full raw frame dims -- bearing/normalization math is
+                                  # unaffected by cropping, see the box-coordinate conversion below
         self._group_counter += 1
         group_id = self._group_counter
         detections: list[Detection] = []
@@ -135,6 +164,18 @@ class VisionMemory:
             if conf < threshold:
                 continue
             x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
+            if pan_zoom is not None:
+                # scan_frame is a zoomed-in crop resized back up to the
+                # same (w, h) as the full frame -- box coordinates come
+                # back in that same resized space, so converting to true
+                # full-frame pixels is just undoing the crop's own scale
+                # and offset (y is untouched -- the pan crop is
+                # horizontal-only). Once converted, everything below is
+                # identical to the uncropped path: same bearing formula,
+                # same stored coordinates, nothing downstream needs to
+                # know cropping happened at all.
+                x1 = crop_x0 + x1 / crop_scale
+                x2 = crop_x0 + x2 / crop_scale
             cx = (x1 + x2) / 2
             cy = (y1 + y2) / 2
             # negated for the same reason as _face_bearing_deg in
@@ -146,6 +187,14 @@ class VisionMemory:
                 object_class=cls_name, confidence=conf, bearing_deg=bearing,
                 bbox_cx=cx / w, bbox_cy=cy / h, frame_group_id=group_id,
             )
+        if detections:
+            # One commit per scan, not one per detected box -- a busy
+            # scene can easily produce a dozen-plus boxes in a single
+            # scan, and committing each individually forces a real disk
+            # fsync per box (measured as the dominant per-frame cost once
+            # the db had enough classes for a typical scan to hit several
+            # at once -- see MemoryStore.add_observation's docstring).
+            self.store.commit()
 
         self.last_detections = detections
         return detections

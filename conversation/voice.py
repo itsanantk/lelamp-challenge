@@ -257,14 +257,38 @@ def listen() -> str:
     return transcribe(record_until_silence())
 
 
+_PREFERRED_VOICE_NAME_PARTS = ("zira", "hazel", "susan", "female")
+
+
+def _select_warmer_voice(engine) -> None:
+    """SAPI5's default installed voice on Windows is usually "David" --
+    flat, low, and exactly what read as "a robotic man in his 30s."
+    Zira (also a stock Windows voice, no extra install) reads noticeably
+    warmer/softer. Picked by name substring, not a `gender` property --
+    that field isn't reliably populated across every SAPI5 voice driver,
+    while every voice at least has a name. Silently keeps whatever's
+    already default if nothing matching is installed."""
+    try:
+        for v in engine.getProperty("voices"):
+            name = (v.name or "").lower()
+            if any(part in name for part in _PREFERRED_VOICE_NAME_PARTS):
+                engine.setProperty("voice", v.id)
+                return
+    except Exception:
+        pass  # missing/misbehaving voice driver -- fall back to the engine's own default
+
+
 def speak(text: str) -> None:
     if not text:
         return
     import pyttsx3
     engine = pyttsx3.init()
+    _select_warmer_voice(engine)
     # SAPI5's default ~200wpm reads as rushed/choppy, especially over
     # Bluetooth output where short audio segments are prone to the same
     # stream-continuity glitches observed with the lamp's own sound cues.
-    engine.setProperty("rate", 175)
+    # A touch slower than the original 175 too -- reads softer/warmer,
+    # less clipped.
+    engine.setProperty("rate", 165)
     engine.say(text)
     engine.runAndWait()

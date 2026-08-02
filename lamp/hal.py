@@ -47,6 +47,20 @@ class LampActuator(ABC):
     def get_current_pose(self) -> np.ndarray:
         """Current 6 joint angles (degrees), reflecting in-flight motion."""
 
+    def set_mood(self, warmth: float, brightness: float) -> None:
+        """Sets the persistent baseline (warmth, brightness) dial values
+        (see lamp/color.py) -- the only two lighting parameters exposed to
+        explicit user control. Behavioral states read get_mood() and nudge
+        a small delta off it rather than jumping to an unrelated color.
+        Non-abstract default no-op, like close()/set_breathing()."""
+        pass
+
+    def get_mood(self) -> tuple[float, float]:
+        """Current (warmth, brightness) baseline. Default matches
+        SimulatedLamp's own starting mood so a backend that never
+        implements set_mood still returns something sane."""
+        return (0.6, 0.55)
+
     def set_breathing(self, enabled: bool) -> None:
         """Enable/disable the idle 'breathing' wobble (SimulatedLamp only
         -- purely a rendering detail, not a real actuation). Non-abstract

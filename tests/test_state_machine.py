@@ -33,6 +33,12 @@ class FakeLamp:
     def get_current_pose(self):
         return self.pose
 
+    def set_mood(self, warmth, brightness):
+        self.mood = (warmth, brightness)
+
+    def get_mood(self):
+        return getattr(self, "mood", (0.6, 0.55))
+
 
 def test_idle_to_engaged():
     fsm = BehaviorFSM(lamp=FakeLamp())

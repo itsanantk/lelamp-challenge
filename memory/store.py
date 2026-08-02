@@ -23,6 +23,7 @@ CLASS_ALIASES = {
     "mug": "cup", "computer": "laptop", "monitor": "tv", "screen": "tv",
     "controller": "remote", "control": "remote", "glasses": "glasses",
     "bag": "backpack", "purse": "handbag", "couch": "sofa",
+    "water bottle": "bottle", "waterbottle": "bottle",
 }
 
 
@@ -79,14 +80,23 @@ class MemoryStore:
     def add_observation(self, object_class: str, confidence: float, bearing_deg: float,
                          bbox_cx: float, bbox_cy: float, frame_group_id: int,
                          timestamp: float | None = None) -> int:
+        """Does NOT commit -- a single YOLO scan can call this once per
+        detected box (a busy scene easily hits a dozen+), and committing
+        each one individually forces a real disk fsync per call, which
+        measured as the dominant per-frame cost in main.py's loop once the
+        db had accumulated enough classes for a typical scan to detect
+        several at once. Callers batch-commit once per scan instead (see
+        VisionMemory.maybe_scan)."""
         ts = timestamp if timestamp is not None else time.time()
         cur = self.conn.execute(
             "INSERT INTO observations (timestamp, object_class, confidence, bearing_deg, "
             "bbox_cx, bbox_cy, frame_group_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (ts, object_class.lower(), confidence, bearing_deg, bbox_cx, bbox_cy, frame_group_id),
         )
-        self.conn.commit()
         return cur.lastrowid
+
+    def commit(self) -> None:
+        self.conn.commit()
 
     def get_latest_by_class(self, object_class: str) -> Observation | None:
         target = normalize_class(object_class)
@@ -145,4 +155,5 @@ class MemoryStore:
         return [Observation(*r) for r in rows]
 
     def close(self) -> None:
+        self.conn.commit()  # flush anything a caller added but hasn't explicitly committed yet
         self.conn.close()
