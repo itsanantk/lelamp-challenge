@@ -51,14 +51,56 @@ FOUND_COLOR = (210, 235, 255)  # BGR, bright warm spotlight -- distinct from
                                  # green object-watch tint
 IDLE_COLOR = (40, 110, 200)
 
+# Voice-controlled lighting (control_light tool in conversation/agent.py).
+# "dim"/"on" act relative to whatever's currently showing; the rest are
+# absolute mood presets.
+LIGHT_PRESETS = {
+    "cozy": (40, 120, 230),    # BGR, warm amber-orange
+    "focus": (230, 225, 210),  # BGR, crisp bright white, slightly cool
+    "calm": (200, 150, 90),    # BGR, soft cool blue
+    "off": (0, 0, 0),
+    "on": (180, 180, 180),
+}
+_DIM_STEP = 0.55  # each "dim" scales current brightness down by this factor
+_DIM_FLOOR = 4    # per-channel floor so repeated "dim" settles near-off without hitting literal (0,0,0) -- that's what "off" is for
 
-def _look_attentive(lamp: SimulatedLamp, bearing_deg: float | None) -> None:
+
+def _apply_light_command(lamp: SimulatedLamp, action: str, show_gui: bool, seconds: float = 1.0) -> None:
+    # set_light() only sets a transition target -- nothing advances that
+    # transition or draws it without a render loop, so without one the
+    # light silently changes internally while the window (if any is even
+    # open) never shows it and update() never ticks it forward either.
+    if action == "dim":
+        current = lamp.get_current_light()
+        dimmed = tuple(max(int(c * _DIM_STEP), _DIM_FLOOR) for c in current)
+        lamp.set_light(dimmed, transition_s=0.4)
+    else:
+        lamp.set_light(LIGHT_PRESETS[action], transition_s=0.5)
+
+    t0 = time.perf_counter()
+    last = t0
+    while time.perf_counter() - t0 < seconds:
+        now = time.perf_counter()
+        lamp.update(now - last)
+        last = now
+        if show_gui:
+            cv2.imshow("LeLamp recalls...", lamp.render())
+            if cv2.waitKey(16) & 0xFF == ord("q"):
+                break
+    if show_gui:
+        cv2.destroyWindow("LeLamp recalls...")
+
+
+def _look_attentive(lamp: SimulatedLamp, bearing_deg: float | None, set_light: bool = True) -> None:
     """Held during the post-wake conversation window so the lamp visibly
     looks like it's still listening, not just idling until you say the
-    wake word again."""
+    wake word again. set_light=False when an explicit control_light
+    command just fired that turn -- otherwise "make it cozy" would flicker
+    straight back to the plain listening color within a second."""
     pose = kinematics.pose_for_look_at(bearing_deg if bearing_deg is not None else 0.0, -10.0, alertness=0.75)
     lamp.set_target_pose(pose, duration=0.4, anticipation=False, overshoot=False)
-    lamp.set_light(ENGAGED_COLOR, transition_s=0.3)
+    if set_light:
+        lamp.set_light(ENGAGED_COLOR, transition_s=0.3)
 
 
 def _relax_to_idle(lamp: SimulatedLamp) -> None:
@@ -90,7 +132,8 @@ def _point_and_render(lamp: SimulatedLamp, bearing_deg: float, show_gui: bool, s
 
 
 def _flash_tone(lamp: SimulatedLamp, label: str, show_gui: bool, seconds: float = 0.6) -> None:
-    lamp.set_light(emotion.BGR_BY_LABEL.get(label, (180, 220, 180)), transition_s=0.2)
+    tone_color = emotion.BGR_BY_LABEL.get(label, (180, 220, 180))
+    lamp.set_light(tone_color, transition_s=0.2)
     t0 = time.perf_counter()
     last = t0
     while time.perf_counter() - t0 < seconds:
@@ -103,7 +146,11 @@ def _flash_tone(lamp: SimulatedLamp, label: str, show_gui: bool, seconds: float 
                 break
     if show_gui:
         cv2.destroyWindow("LeLamp recalls...")
-    lamp.set_light((40, 110, 200), transition_s=0.4)
+    # Settle into a dimmed version of the same tone color instead of a
+    # fixed neutral amber -- this is what makes the warmth actually track
+    # how you sounded rather than just flashing and reverting.
+    settled = tuple(max(int(c * 0.5), 20) for c in tone_color)
+    lamp.set_light(settled, transition_s=0.6)
 
 
 def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None,
@@ -203,6 +250,8 @@ def run(args: argparse.Namespace) -> None:
         print(f"LAMP: {reply}\n")
         if args.voice:
             voice.speak(reply)
+        if agent.last_light_action is not None:
+            _apply_light_command(lamp, agent.last_light_action, show_gui=not args.no_gui)
         obs = agent.last_recall.observation
         if obs is not None:
             _point_and_render(lamp, obs.bearing_deg, show_gui=not args.no_gui)
@@ -250,7 +299,9 @@ def run(args: argparse.Namespace) -> None:
                     continue
                 tone = emotion.analyze(audio)
                 tone_label = tone.label
-                print(f"[voice] tone: {tone.label}")
+                pitch_var_str = f"{tone.pitch_variability_hz:.1f}" if tone.pitch_variability_hz is not None else "n/a"
+                print(f"[voice] tone: {tone.label} (rms={tone.rms:.4f} rate={tone.speaking_rate_hz:.2f}Hz "
+                      f"pitch_var={pitch_var_str})")
                 print(f"YOU (voice): {question}")
             else:
                 try:
@@ -265,7 +316,7 @@ def run(args: argparse.Namespace) -> None:
             handle(question, speaker_bearing, tone_label)
             if args.voice:
                 in_conversation = True
-                _look_attentive(lamp, speaker_bearing)
+                _look_attentive(lamp, speaker_bearing, set_light=agent.last_light_action is None)
     finally:
         lamp.close()
         store.close()

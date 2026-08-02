@@ -48,7 +48,15 @@ being in the same wide shot is not the same as being close together. Only mentio
 for a co-occurring object if its confidence is below 0.55 (worth a quick "though I'm not \
 fully sure that one's right"); otherwise don't bring confidence up at all. Never say you're \
 unsure about something confidence actually shows you're sure about, and never invent a doubt \
-you weren't given data for."""
+you weren't given data for.
+
+If the user asks you to change the light itself (not a question about an object), call \
+control_light instead of just replying in text -- a spoken "sure, dimming it" with no actual \
+tool call would leave the light unchanged."""
+
+# "dim" and "on" are relative to whatever's currently showing (dim steps
+# down, on restores to a plain default); the rest are absolute presets.
+LIGHT_ACTIONS = ("dim", "off", "on", "cozy", "focus", "calm")
 
 TOOL_SPECS = [
     {
@@ -71,6 +79,18 @@ TOOL_SPECS = [
                         "lookup comes back empty and you want to suggest alternatives.",
         "params": {},
         "required": [],
+    },
+    {
+        "name": "control_light",
+        "description": "Change the lamp's own light. Use for direct requests like 'dim the "
+                        "light', 'turn it off', 'turn it back on', or a mood ('make it cozy', "
+                        "'I need focus lighting', 'something calm'). Not for questions about "
+                        "objects -- only for controlling the lamp's light itself.",
+        "params": {
+            "action": {"type": "string", "enum": list(LIGHT_ACTIONS),
+                       "description": "one of: " + ", ".join(LIGHT_ACTIONS)},
+        },
+        "required": ["action"],
     },
 ]
 
@@ -115,6 +135,7 @@ class MemoryAgent:
         self.provider = (provider or config.LLM_PROVIDER).lower()
         self.messages: list[dict] = []
         self.last_recall = RecallResult()
+        self.last_light_action: str | None = None  # set by the last control_light call, so chat.py can apply it
 
         if self.provider == "openai":
             import openai
@@ -148,9 +169,22 @@ class MemoryAgent:
             }
         if name == "list_seen_objects":
             return {"objects": self.store.list_known_classes()}
+        if name == "control_light":
+            action = str(tool_input.get("action", "")).strip().lower()
+            if action not in LIGHT_ACTIONS:
+                return {"applied": False, "error": f"'{action}' isn't a valid action"}
+            self.last_light_action = action
+            return {"applied": True, "action": action}
         return {"error": f"unknown tool {name}"}
 
     def ask(self, user_text: str) -> str:
+        # Reset per-turn side state up front, not just inside the tool
+        # branches that set it -- otherwise a turn that doesn't call
+        # recall_object_location (a light command, small talk) would leave
+        # last_recall holding an old turn's observation, and chat.py would
+        # re-point at a stale object that had nothing to do with this turn.
+        self.last_recall = RecallResult()
+        self.last_light_action = None
         if self.provider == "openai":
             return self._ask_openai(user_text)
         return self._ask_anthropic(user_text)
