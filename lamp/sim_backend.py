@@ -53,9 +53,18 @@ _VIBRATO_DEPTH_HZ = 22.0  # pitch reads as a clean synth tone, not a living voic
 EVENT_SOUNDS: dict[str, list[tuple[int, int, int]]] = {
     "engage": [(600, 950, 160), (950, 1350, 190)],
     "disengage": [(750, 520, 160), (520, 340, 190)],
-    "attention_seek": [(700, 1000, 130), (1000, 700, 90), (700, 1000, 130), (1000, 1300, 170)],
+    # A quick 4-segment up-down-up-up alarm sweep read as insistent
+    # beeping, not the "did you notice me?" curiosity the motion itself
+    # is going for -- two gentle rising "hm?" inflections instead, lower
+    # and slower, like a soft questioning whimper.
+    "attention_seek": [(520, 680, 220), (600, 520, 70), (520, 700, 260)],
     "recall_point": [(900, 1350, 150), (1350, 1750, 180)],
     "wake": [(1000, 1400, 160)],  # single quick upward sweep -- "heard you, go ahead"
+    # Slow, quiet, downward -- every nudge failed. A small sigh, not a
+    # sad trombone.
+    "give_up": [(480, 340, 320), (340, 260, 380)],
+    # Quick, bright, playful double-blip -- a cheerful little "hi!" back.
+    "wave_back": [(700, 950, 90), (950, 750, 80), (750, 1050, 110)],
 }
 
 
@@ -133,6 +142,14 @@ class _SoundWorker(threading.Thread):
 
 class SimulatedLamp(LampActuator):
     def __init__(self, mute: bool = False):
+        # Reentrant because set_target_pose() calls get_current_pose() on
+        # itself while held. Only guards against a genuine cross-thread
+        # write/write race (main render loop's update() vs. a command
+        # arriving from the voice conversation thread once both share one
+        # lamp instance) -- pure reads (get_current_pose/get_current_light/
+        # render) stay unlocked, since a stale-by-one-frame read here is a
+        # cosmetic non-issue, not a correctness one.
+        self._lock = threading.RLock()
         self._pose = kinematics.NEUTRAL_POSE.copy()
         self._trajectory: Trajectory | None = None
         self._light_from = (40, 110, 200)  # BGR, dim warm amber (idle)
@@ -143,50 +160,69 @@ class SimulatedLamp(LampActuator):
         self._sound = None if mute else _SoundWorker()
         self._t = 0.0  # running clock, for idle breathing
         # Two incommensurate frequencies summed beats a single sine for
-        # idle breathing -- a lone fixed frequency has an obvious, short
-        # loop period; summing two slightly different ones (randomized
-        # per lamp instance) makes the drift read as organic instead of
-        # a metronome.
+        # idle restlessness -- a lone fixed frequency has an obvious,
+        # short loop period; summing two slightly different ones
+        # (randomized per lamp instance) makes the drift read as organic
+        # instead of a metronome. This is the fast attentive micro-wobble
+        # (small glances/sway), separate from the actual breathing cycle
+        # below, which is deliberately much slower.
         self._breathe_freqs = [random.uniform(0.55, 0.85) for _ in range(2)]
         self._breathe_phases = [random.uniform(0.0, 2 * np.pi) for _ in range(2)]
+        # A real breath is slow (~3.5-4.5s per cycle, not the ~1-2s of the
+        # micro-wobble above) and shows up as the shoulder/chest rising
+        # and falling, not a jitter -- shoulder_pitch carries most of it,
+        # elbow_pitch a touch, so it reads as one coherent rise/fall.
+        self._breath_freq_hz = random.uniform(0.22, 0.29)
+        self._breath_phase = random.uniform(0.0, 2 * np.pi)
+        self._breathing_enabled = True
 
     # -- LampActuator interface -------------------------------------------------
 
+    def set_breathing(self, enabled: bool) -> None:
+        with self._lock:
+            self._breathing_enabled = enabled
+
     def set_target_pose(self, angles, duration=0.6, anticipation=True, overshoot=True) -> None:
-        target = kinematics.clamp_pose(np.array(angles, dtype=float))
-        current = self.get_current_pose()
-        self._trajectory = Trajectory(current, target, duration, anticipation, overshoot)
+        with self._lock:
+            target = kinematics.clamp_pose(np.array(angles, dtype=float))
+            current = self.get_current_pose()
+            self._trajectory = Trajectory(current, target, duration, anticipation, overshoot)
 
     def set_light(self, rgb_bgr, transition_s=0.4) -> None:
-        self._light_from = self.get_current_light()
-        self._light_to = rgb_bgr
-        self._light_duration = max(transition_s, 1e-3)
-        self._light_elapsed = 0.0
+        with self._lock:
+            self._light_from = self.get_current_light()
+            self._light_to = rgb_bgr
+            self._light_duration = max(transition_s, 1e-3)
+            self._light_elapsed = 0.0
 
     def play_sound(self, event: str) -> None:
         if self._sound is not None:
             self._sound.enqueue(event)
 
     def update(self, dt: float) -> None:
-        self._t += dt
-        if self._trajectory is not None:
-            self._pose = self._trajectory.step(dt)
-        self._light_elapsed = min(self._light_elapsed + dt, self._light_duration)
+        with self._lock:
+            self._t += dt
+            if self._trajectory is not None:
+                self._pose = self._trajectory.step(dt)
+            self._light_elapsed = min(self._light_elapsed + dt, self._light_duration)
 
     def get_current_pose(self) -> np.ndarray:
         idle_still = self._trajectory is None or self._trajectory.done
-        if idle_still:
-            # Subtle breathing so the lamp never looks "dead" at rest.
-            # Two summed incommensurate frequencies instead of one --
-            # a single sine has a short, obvious loop period; this drifts
-            # instead of visibly repeating.
+        if idle_still and self._breathing_enabled:
+            # Never look "dead" at rest -- a fast restless micro-wobble
+            # (small sway/glance) plus a genuinely slow breathing cycle,
+            # not one wobble doing both jobs at once.
             f1, f2 = self._breathe_freqs
             p1, p2 = self._breathe_phases
             wobble_a = (np.sin(self._t * f1 + p1) + np.sin(self._t * f2 + p2)) / 2
             wobble_b = (np.sin(self._t * f1 + p1 + 1.0) + np.sin(self._t * f2 + p2 + 1.0)) / 2
+            breath = np.sin(2 * np.pi * self._breath_freq_hz * self._t + self._breath_phase)
+
             breathe = np.zeros(kinematics.NUM_JOINTS)
-            breathe[0] = 0.8 * wobble_a
-            breathe[5] = 1.2 * wobble_b
+            breathe[0] = 1.0 * wobble_a   # base_yaw -- gentle attentive sway
+            breathe[1] = 1.6 * breath     # shoulder_pitch -- the actual breathing rise/fall
+            breathe[2] = 1.0 * breath     # elbow_pitch -- follows the chest, smaller
+            breathe[5] = 1.4 * wobble_b   # head_twist -- restless micro-glance
             return self._pose + breathe
         return self._pose
 

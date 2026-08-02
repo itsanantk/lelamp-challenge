@@ -47,5 +47,14 @@ class LampActuator(ABC):
     def get_current_pose(self) -> np.ndarray:
         """Current 6 joint angles (degrees), reflecting in-flight motion."""
 
+    def set_breathing(self, enabled: bool) -> None:
+        """Enable/disable the idle 'breathing' wobble (SimulatedLamp only
+        -- purely a rendering detail, not a real actuation). Non-abstract
+        default no-op, like close(), so backends without this concept
+        don't need to implement it. ObjectWatcher disables it while
+        actively tracking a moving object -- the wobble stacking on top
+        of frequent short re-aims is what read as jitter, not liveliness."""
+        pass
+
     def close(self) -> None:
         pass

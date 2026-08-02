@@ -48,7 +48,11 @@ ENGAGE_EMA_ALPHA = 0.35  # higher = less smoothing, more responsive
 DISENGAGE_GRACE_S = 2.5          # brief hold before giving up on someone
 ATTENTION_SEEK_DELAY_S = 4.0     # how long disengaged before trying to re-engage
 ATTENTION_SEEK_MAX_ATTEMPTS = 3  # stop after this many tries
-ATTENTION_SEEK_COOLDOWN_S = 6.0  # spacing between attempts
+ATTENTION_SEEK_COOLDOWN_S = 3.0  # spacing between attempts -- each attempt's own nudge/hold/
+                                  # nudge/settle sequence already takes ~2.5s, so this is really
+                                  # just a short "did that work?" beat afterward, not a long
+                                  # scheduled wait -- a dog nudging for attention keeps trying
+                                  # every few seconds, it doesn't pace itself on a strict timer
 
 # --- Memory formation -------------------------------------------------------
 # yolo11s over yolo11n: ~47 vs ~39.5 mAP on COCO, for +8ms/scan on this
@@ -103,6 +107,17 @@ WATCH_FAST_SCAN_SETTLE_S = 1.5  # drop out of fast-scan mode once it's been this
                                   # since the object last actually moved (not just been
                                   # visible) -- a stationary phone shouldn't pin the loop
                                   # at the fast interval forever
+WATCH_STATIONARY_TIMEOUT_S = 3.0  # give up watching a still-visible-but-not-moving object
+                                    # and return to a normal resting look after this long --
+                                    # continuing to stare at something that stopped moving
+                                    # reads as fixation, not attentiveness
+WATCH_REACQUIRE_MARGIN = 2.5  # after giving up on a stationary object, require this many
+                                # times WATCH_REAIM_DEG of movement to re-acquire -- otherwise
+                                # a tiny bump on an otherwise-still phone would restart the
+                                # whole acquire flourish, which reads as twitchy
+WATCH_WAVE_MIN_REVERSALS = 3   # this many back-and-forth direction changes within the window
+                                 # below counts as a wave, not just ordinary repositioning
+WATCH_WAVE_WINDOW_S = 2.0       # how recent those direction changes need to be
 
 # --- Conversational recall -------------------------------------------------
 # "anthropic" or "openai" -- whichever key you actually have credit on.

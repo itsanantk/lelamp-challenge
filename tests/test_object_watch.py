@@ -13,6 +13,7 @@ from perception.vision_memory import Detection
 class _FakeLamp:
     def __init__(self):
         self.calls = []
+        self.breathing = True
 
     def set_target_pose(self, angles, duration=0.6, anticipation=True, overshoot=True):
         self.calls.append(("pose", tuple(angles)))
@@ -22,6 +23,9 @@ class _FakeLamp:
 
     def play_sound(self, event):
         self.calls.append(("sound", event))
+
+    def set_breathing(self, enabled):
+        self.breathing = enabled
 
     def update(self, dt):
         pass
@@ -241,6 +245,126 @@ def test_returns_to_engaged_look_when_lost_while_still_engaged():
     assert not any(c[0] == "light" and c[1] == IDLE_COLOR for c in lamp.calls), \
         "must not fall back to the idle color while the person is still engaged"
     assert any(c[0] == "pose" for c in lamp.calls)
+
+
+def test_breathing_suppressed_while_tracking_then_restored_on_settle():
+    """The idle breathing wobble stacking on top of frequent short
+    re-aims is what read as jitter tracking a moving phone -- breathing
+    should be off for as long as tracking is active, and back on once it
+    stops (however it stops)."""
+    lamp = _FakeLamp()
+    watcher = ObjectWatcher(lamp)
+    watcher.update(_phone(20.0), State.IDLE, dt=0.05)
+    assert lamp.breathing is False
+
+    t = 0.0
+    while t < config.WATCH_LOST_GRACE_S + 0.5 and watcher.active:
+        watcher.update([], State.IDLE, dt=0.05)
+        t += 0.05
+    assert not watcher.active
+    assert lamp.breathing is True
+
+
+def test_gives_up_watching_once_a_visible_object_stops_moving():
+    """Still visible, but hasn't moved in a while -- continuing to fixate
+    on it reads as staring, not attentiveness. Should settle back to a
+    normal resting look on its own, without ever losing detection."""
+    lamp = _FakeLamp()
+    watcher = ObjectWatcher(lamp)
+    watcher.update(_phone(20.0), State.IDLE, dt=0.05)
+    assert watcher.active
+    lamp.calls.clear()
+
+    t = 0.0
+    while t < config.WATCH_STATIONARY_TIMEOUT_S + 0.5 and watcher.active:
+        watcher.update(_phone(20.0), State.IDLE, dt=0.05)  # same bearing every tick -- never lost, never moves
+        t += 0.05
+
+    assert not watcher.active, "should give up watching a stationary-but-still-visible object"
+    assert any(c[0] == "light" and c[1] == IDLE_COLOR for c in lamp.calls)
+
+
+def test_small_bump_after_stationary_give_up_does_not_restart_the_acquire_flourish():
+    """A tiny nudge on an otherwise-still phone shouldn't replay the full
+    acquire sound/flourish every few seconds -- that reads as twitchy,
+    not attentive. Only a real, deliberate move should."""
+    lamp = _FakeLamp()
+    watcher = ObjectWatcher(lamp)
+    watcher.update(_phone(20.0), State.IDLE, dt=0.05)
+
+    t = 0.0
+    while t < config.WATCH_STATIONARY_TIMEOUT_S + 0.5 and watcher.active:
+        watcher.update(_phone(20.0), State.IDLE, dt=0.05)
+        t += 0.05
+    assert not watcher.active
+    lamp.calls.clear()
+
+    # a small bump, comfortably under the reacquire margin
+    small_bump = config.WATCH_REAIM_DEG * config.WATCH_REACQUIRE_MARGIN - 1.0
+    watcher.update(_phone(20.0 + small_bump), State.IDLE, dt=0.05)
+    assert not watcher.active, "a small bump shouldn't restart tracking"
+    assert lamp.calls == []
+
+    # a real, deliberate move past the margin should still re-acquire
+    real_move = config.WATCH_REAIM_DEG * config.WATCH_REACQUIRE_MARGIN + 5.0
+    watcher.update(_phone(20.0 + real_move), State.IDLE, dt=0.05)
+    assert watcher.active, "a real move past the reacquire margin should restart tracking"
+
+
+def test_waving_the_object_back_and_forth_triggers_a_wave_back():
+    """Several quick direction reversals in a short window -- the phone
+    waved side to side -- should get a distinct one-shot response, not
+    just treated as ordinary repositioning."""
+    lamp = _FakeLamp()
+    watcher = ObjectWatcher(lamp)
+    watcher.update(_phone(0.0), State.IDLE, dt=0.05)
+    lamp.calls.clear()
+
+    bearing = 0.0
+    step = config.WATCH_REAIM_DEG + 2.0
+    for i in range(6):  # left, right, left, right, left, right
+        bearing += step if i % 2 == 0 else -step
+        watcher.update(_phone(bearing), State.IDLE, dt=0.05)
+
+    assert any(c[0] == "sound" and c[1] == "wave_back" for c in lamp.calls), \
+        "expected a wave-back after several direction reversals"
+
+
+def test_wave_back_only_fires_once_per_acquisition():
+    lamp = _FakeLamp()
+    watcher = ObjectWatcher(lamp)
+    watcher.update(_phone(0.0), State.IDLE, dt=0.05)
+
+    bearing = 0.0
+    step = config.WATCH_REAIM_DEG + 2.0
+    for i in range(6):
+        bearing += step if i % 2 == 0 else -step
+        watcher.update(_phone(bearing), State.IDLE, dt=0.05)
+    lamp.calls.clear()
+
+    # keep waving -- shouldn't fire again until it's lost and reacquired
+    for i in range(6):
+        bearing += step if i % 2 == 0 else -step
+        watcher.update(_phone(bearing), State.IDLE, dt=0.05)
+
+    assert not any(c[0] == "sound" and c[1] == "wave_back" for c in lamp.calls), \
+        "wave-back should be debounced to once per acquisition"
+
+
+def test_ordinary_one_directional_movement_does_not_trigger_a_wave_back():
+    """Just moving the phone steadily in one direction -- not waving it --
+    must not false-trigger the wave-back."""
+    lamp = _FakeLamp()
+    watcher = ObjectWatcher(lamp)
+    watcher.update(_phone(0.0), State.IDLE, dt=0.05)
+    lamp.calls.clear()
+
+    bearing = 0.0
+    for _ in range(6):
+        bearing += config.WATCH_REAIM_DEG + 2.0
+        watcher.update(_phone(bearing), State.IDLE, dt=0.05)
+
+    assert not any(c[0] == "sound" and c[1] == "wave_back" for c in lamp.calls)
 
 
 if __name__ == "__main__":
