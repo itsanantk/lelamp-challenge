@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 
 import config
-from behavior.state_machine import BehaviorFSM, State, IDLE_COLOR
+from behavior.state_machine import BehaviorFSM, IDLE_COLOR, State
 
 
 class FakeLamp:
@@ -162,14 +162,19 @@ def test_attention_seek_escalates_across_attempts():
     assert light_colors[0] != light_colors[-1]
 
 
-def test_give_up_settles_the_real_lamp_not_just_fsm_state():
+def test_give_up_dips_briefly_then_recovers_to_a_normal_resting_look():
     """The final attention-seek attempt used to cut off mid-animation (state
     flipped to IDLE while _attention_phase was still nonzero), leaving the
     lamp stuck holding the curious pose and orange light forever. Runs
-    against the real SimulatedLamp, not FakeLamp, so it checks actual
-    eased pose/light state instead of just which calls got made."""
-    from lamp import SimulatedLamp
-    from lamp import kinematics
+    against the real SimulatedLamp, not FakeLamp, so it checks actual eased
+    pose/light state instead of just which calls got made.
+
+    Giving up now dips briefly (GIVEN_UP_DIP_POSE/GIVEN_UP_COLOR) so being
+    ignored reads as a little dejected, then recovers to the normal
+    NEUTRAL_POSE/IDLE_COLOR resting look -- not a pose it stays slumped in
+    forever, which read as broken rather than sad."""
+    from behavior.state_machine import GIVE_UP_DIP_S, GIVE_UP_RECOVER_S, GIVEN_UP_COLOR, GIVEN_UP_DIP_POSE
+    from lamp import SimulatedLamp, kinematics
 
     lamp = SimulatedLamp(mute=True)
     fsm = BehaviorFSM(lamp=lamp)
@@ -183,10 +188,28 @@ def test_give_up_settles_the_real_lamp_not_just_fsm_state():
         t += dt
 
     assert fsm.state == State.IDLE
+
+    # _give_up()'s dip starts on this exact tick, so the loop above
+    # stopping the instant state flips to IDLE cuts it off before it's
+    # actually played out -- keep ticking, same as a real running app
+    # would (main.py never stops calling lamp.update() just because the
+    # FSM state changed). Check partway through the dip...
+    for _ in range(int(GIVE_UP_DIP_S / dt) - 1):
+        fsm.update(engaged=False, user_bearing_deg=0.0, dt=dt)
+        lamp.update(dt)
+    assert np.allclose(lamp.get_current_pose(), GIVEN_UP_DIP_POSE, atol=2.0), \
+        f"lamp pose did not dip on giving up: {lamp.get_current_pose()}"
+    assert all(abs(a - b) <= 2 for a, b in zip(lamp.get_current_light(), GIVEN_UP_COLOR)), \
+        f"lamp light did not dip on giving up: {lamp.get_current_light()}"
+
+    # ...then confirm it actually recovers, rather than staying dipped.
+    for _ in range(int(GIVE_UP_RECOVER_S / dt) + 5):
+        fsm.update(engaged=False, user_bearing_deg=0.0, dt=dt)
+        lamp.update(dt)
     assert np.allclose(lamp.get_current_pose(), kinematics.NEUTRAL_POSE, atol=2.0), \
-        f"lamp pose did not settle to neutral: {lamp.get_current_pose()}"
+        f"lamp pose did not recover to neutral after the give-up dip: {lamp.get_current_pose()}"
     assert all(abs(a - b) <= 2 for a, b in zip(lamp.get_current_light(), IDLE_COLOR)), \
-        f"lamp light did not settle to idle color: {lamp.get_current_light()}"
+        f"lamp light did not recover to idle after the give-up dip: {lamp.get_current_light()}"
     lamp.close()
 
 

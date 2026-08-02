@@ -63,6 +63,33 @@ class Trajectory:
         anticipation_scale = random.uniform(0.75, 1.25)
         self.anticipation_pose = self.start - np.clip(delta * 0.08 * anticipation_scale, -6.0, 6.0)
 
+        # 'Wavey' organic ripple layered on top of the eased path during
+        # the main move -- a pure eased interpolation, even with
+        # anticipation/overshoot, still moves every joint through the
+        # exact same normalized time, which reads as one rigid rod, not a
+        # limb with a bit of give in it. A per-joint phase offset makes
+        # the ripple travel down the chain (base leads, head trails) like
+        # a whip/tail instead of the whole arm shaking in unison. The
+        # envelope (see step()) is exactly 0 at both ends of the main
+        # phase, so it never disturbs the wind-up entry or the exact
+        # final landing on target.
+        #
+        # Deliberately only for flourish moves (anticipation or overshoot
+        # already True), never a calm/continuous one -- ObjectWatcher's
+        # _reaim already sets both False specifically because repeated
+        # short retargets read as a startle, not tracking (see its
+        # docstring); layering an *independent* random wobble onto each
+        # of those short back-to-back trajectories was exactly what read
+        # as jitter tracking a moving phone, not liveliness. Slower and
+        # gentler than the first pass too -- reads as a wavey undulation
+        # now, not a shake.
+        n = len(self.start)
+        self._wave_freq = random.uniform(0.8, 1.3)
+        self._wave_amp_deg = random.uniform(0.8, 1.6) if (anticipation or overshoot) else 0.0
+        wave_base_phase = random.uniform(0.0, 2 * np.pi)
+        wave_lag_per_joint = random.uniform(0.35, 0.65)
+        self._wave_phase = wave_base_phase + np.arange(n) * wave_lag_per_joint
+
     @property
     def done(self) -> bool:
         return self.elapsed >= self.duration
@@ -82,7 +109,15 @@ class Trajectory:
         eased = ease_out_back(main_t, self._overshoot_strength) if self.overshoot else ease_in_out_cubic(main_t)
 
         origin = self.anticipation_pose if self.anticipation else self.start
-        return origin + (self.target - origin) * eased
+        pose = origin + (self.target - origin) * eased
+
+        # Envelope peaks mid-move and is exactly 0 at main_t=0 and
+        # main_t=1 -- ease_out_back(1, ...) == 1 exactly too, so the final
+        # landing on self.target is untouched regardless of amplitude.
+        wave_envelope = np.sin(np.pi * main_t)
+        wave = self._wave_amp_deg * wave_envelope * np.sin(
+            2 * np.pi * self._wave_freq * self.elapsed + self._wave_phase)
+        return pose + wave
 
     def retarget(self, new_target: np.ndarray, current: np.ndarray, duration: float | None = None):
         """Replace the target mid-flight without a visible snap, starting a

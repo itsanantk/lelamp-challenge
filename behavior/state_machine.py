@@ -4,7 +4,7 @@
     ENGAGED  --looks away-->  DISENGAGED (grace hold, then cools down)
     DISENGAGED  --stays away long enough-->  ATTENTION_SEEKING (fires once)
                 --re-engages any time-->  ENGAGED
-    ATTENTION_SEEKING  --exhausts attempts-->  IDLE (stops nagging)
+    ATTENTION_SEEKING  --exhausts attempts-->  IDLE (gives up, a little dejected)
 
 Only calls the LampActuator interface (lamp/hal.py), so this works
 unchanged against the simulator or a real-hardware backend later. No
@@ -28,8 +28,27 @@ IDLE_COLOR = (40, 110, 200)       # BGR, dim warm amber
 ENGAGED_COLOR = (255, 220, 140)    # BGR, bright cool alert
 ATTENTION_PULSE_COLOR = (0, 165, 255)     # BGR, warm orange pulse -- first attempt
 ATTENTION_PULSE_URGENT_COLOR = (0, 80, 255)  # BGR, more saturated red-orange -- last attempt
+GIVEN_UP_COLOR = (75, 85, 95)  # BGR, flat desaturated blue-gray -- deliberately cooler and
+                                 # duller than the warm IDLE_COLOR, so the brief dip on giving
+                                 # up reads as a little deflated. Only held for the dip itself
+                                 # (see _tick_give_up) -- it then fades back to IDLE_COLOR, not
+                                 # a permanent mood.
 
 LOOK_UP_PITCH_DEG = -15.0  # desk-level lamp looking slightly up at a seated person
+ATTENTION_TILT_DEG = 20.0  # wrist_roll head-cock angle -- kinematics.py calls this joint
+                            # out by name as the "expressive cock the head" DOF, but nothing
+                            # used it before this -- it's the single clearest way to read as
+                            # a curious, confused puppy instead of a robotic alert-pulse
+WATCH_HOPEFUL_ALERTNESS = 0.2  # low-alertness lean used *between* nudges within one attempt --
+                                 # still oriented toward the person, not a full reset to neutral;
+                                 # it hasn't given up yet, just catching its breath
+# A small, brief dip -- shoulder/elbow settle a little lower and the head tilts down a
+# touch, like a short sigh -- NOT a collapse. Held only for GIVE_UP_DIP_S before recovering
+# to kinematics.NEUTRAL_POSE (see _tick_give_up): the reaction should read as "aww, ok" and
+# then a normal resting lamp, not a lamp that fell over and stayed down.
+GIVEN_UP_DIP_POSE = np.array([0.0, -38.0, 50.0, -22.0, 0.0, 0.0])
+GIVE_UP_DIP_S = 0.6      # how long the dip itself is held before recovering
+GIVE_UP_RECOVER_S = 1.1  # how long the recovery-to-neutral transition takes
 
 
 class State(Enum):
@@ -56,7 +75,15 @@ class BehaviorFSM:
     _attempts: int = 0
     _last_user_bearing: float = 0.0
     _attention_phase_timer: float = 0.0
-    _attention_phase: int = 0  # 0 = not seeking, 1 = perk up, 2 = settle back
+    # 0 = not seeking, 1 = first nudge, 2 = puppy-eyes hold, 3 = second nudge, 4 = settle to a
+    # hopeful watch (not yet given up -- see attention_seek_cooldown_s for why the gap to the
+    # next attempt is now short instead of a long scheduled wait)
+    _attention_phase: int = 0
+    _seek_bearing_offset: float = 0.0  # set by _start_attention_seek, reused by later phases in _tick_attention_seek
+    _seek_alertness: float = 0.5
+    _seek_tilt_sign: float = 1.0  # alternates per attempt -- a puppy doesn't cock its head the same way either
+    _give_up_phase: int = 0  # 0 = not giving up, 1 = brief dip, 2 = recovering to a normal resting look
+    _give_up_timer: float = 0.0
 
     def update(self, engaged: bool, user_bearing_deg: float | None, dt: float,
                user_busy: bool = False) -> State:
@@ -77,6 +104,8 @@ class BehaviorFSM:
 
         if self.state == State.ATTENTION_SEEKING:
             self._tick_attention_seek(dt)
+        elif self._give_up_phase != 0:
+            self._tick_give_up(dt)
 
         return self.state
 
@@ -96,6 +125,8 @@ class BehaviorFSM:
         # permanently kills the behavior for the rest of the session.
         self._attention_phase = 0
         self._attention_phase_timer = 0.0
+        self._give_up_phase = 0  # same reasoning -- don't leave a stale give-up dip/recover
+        # pending to fire later after an unrelated future disengage
         target = kinematics.pose_for_look_at(self._last_user_bearing, LOOK_UP_PITCH_DEG, alertness=1.0)
         self.lamp.set_target_pose(target, duration=0.5, anticipation=True, overshoot=True)
         self.lamp.set_light(ENGAGED_COLOR, transition_s=0.3)
@@ -119,11 +150,11 @@ class BehaviorFSM:
             return  # still in the brief "hopeful" hold
 
         if self._attention_phase != 0:
-            return  # perk-up/settle-back animation still playing -- let it
+            return  # nudge/hold/settle animation still playing -- let it
             # finish and hand control back before deciding anything else
 
         if self._attempts >= self.attention_seek_max_attempts:
-            self.state = State.IDLE  # stop nagging
+            self._give_up()
             return
 
         if user_busy:
@@ -139,31 +170,92 @@ class BehaviorFSM:
         self._time_since_last_attempt = 0.0
         self._attention_phase = 1
         self._attention_phase_timer = 0.0
+        self._seek_tilt_sign = -self._seek_tilt_sign
 
         # The exact same gesture on every attempt reads as a broken loop,
-        # not persistence -- lean in further and pulse brighter each try,
-        # capped at max_attempts so the last one is the most noticeable.
+        # not persistence -- lean in a little further and pulse a touch
+        # more saturated each try, capped at max_attempts so the last one
+        # is the most noticeable. Kept modest on purpose (a small lean,
+        # not a lunge) -- this should read as "did you notice me?"
+        # curiosity, not an alarm demanding attention.
         intensity = min(self._attempts / self.attention_seek_max_attempts, 1.0)
-        bearing_offset = 14.0 + 10.0 * intensity
-        alertness = 0.5 + 0.3 * intensity
+        self._seek_bearing_offset = 8.0 + 5.0 * intensity
+        self._seek_alertness = 0.4 + 0.2 * intensity
         color = lerp_color(ATTENTION_PULSE_COLOR, ATTENTION_PULSE_URGENT_COLOR, intensity)
 
-        curious = kinematics.pose_for_look_at(self._last_user_bearing + bearing_offset, -5.0, alertness=alertness)
-        self.lamp.set_target_pose(curious, duration=0.35, anticipation=True, overshoot=True)
-        self.lamp.set_light(color, transition_s=0.25)
+        # Phase 1: the first nudge -- a small lean-in toward the person,
+        # with the sound. A head-tilt is already starting here rather than
+        # snapping in fully, so the whole gesture reads as one continuous
+        # motion into the hold instead of two disconnected poses.
+        nudge = kinematics.pose_for_look_at(self._last_user_bearing + self._seek_bearing_offset, -5.0,
+                                             alertness=self._seek_alertness)
+        nudge[4] = self._seek_tilt_sign * ATTENTION_TILT_DEG * 0.5  # wrist_roll: cock the head, partway
+        self.lamp.set_target_pose(nudge, duration=0.35, anticipation=True, overshoot=True)
+        self.lamp.set_light(color, transition_s=0.3)
         self.lamp.play_sound("attention_seek")
 
     def _tick_attention_seek(self, dt: float) -> None:
         self._attention_phase_timer += dt
-        if self._attention_phase == 1 and self._attention_phase_timer >= 0.6:
-            # Settle back down; still "waiting," not yet given up.
+        if self._attention_phase == 1 and self._attention_phase_timer >= 0.45:
+            # Phase 2: tilt the head the rest of the way and just look --
+            # the "puppy eyes" hold, the longest beat in the sequence on
+            # purpose. No anticipation/overshoot here -- a flourish on a
+            # hold would read as a twitch, not a wistful stare.
             self._attention_phase = 2
             self._attention_phase_timer = 0.0
-            self.lamp.set_target_pose(kinematics.NEUTRAL_POSE, duration=0.5, overshoot=False)
-            self.lamp.set_light(IDLE_COLOR, transition_s=0.5)
-        elif self._attention_phase == 2 and self._attention_phase_timer >= 0.5:
+            look = kinematics.pose_for_look_at(self._last_user_bearing + self._seek_bearing_offset, -5.0,
+                                                alertness=self._seek_alertness)
+            look[4] = self._seek_tilt_sign * ATTENTION_TILT_DEG
+            self.lamp.set_target_pose(look, duration=0.4, anticipation=False, overshoot=False)
+        elif self._attention_phase == 2 and self._attention_phase_timer >= 1.1:
+            # Phase 3: the second nudge -- tries again, tilting back the
+            # other way, like repositioning for another look rather than
+            # repeating the exact same pose.
+            self._attention_phase = 3
+            self._attention_phase_timer = 0.0
+            nudge2 = kinematics.pose_for_look_at(self._last_user_bearing + self._seek_bearing_offset * 0.7, -5.0,
+                                                  alertness=self._seek_alertness * 0.9)
+            nudge2[4] = -self._seek_tilt_sign * ATTENTION_TILT_DEG * 0.7
+            self.lamp.set_target_pose(nudge2, duration=0.35, anticipation=True, overshoot=True)
+        elif self._attention_phase == 3 and self._attention_phase_timer >= 0.5:
+            # Phase 4: settle, but only to a quiet hopeful watch, not
+            # fully neutral -- it hasn't given up between nudges, just
+            # resting a beat.
+            self._attention_phase = 4
+            self._attention_phase_timer = 0.0
+            watching = kinematics.pose_for_look_at(self._last_user_bearing, -5.0, alertness=WATCH_HOPEFUL_ALERTNESS)
+            self.lamp.set_target_pose(watching, duration=0.6, anticipation=False, overshoot=False)
+            self.lamp.set_light(IDLE_COLOR, transition_s=0.6)
+        elif self._attention_phase == 4 and self._attention_phase_timer >= 0.4:
             self.state = State.DISENGAGED
             self._attention_phase = 0
+
+    def _give_up(self) -> None:
+        # Every attempt failed -- dip briefly and play a small sigh so
+        # being ignored actually reads as a little dejected, then recover
+        # to a normal resting lamp (_tick_give_up) rather than staying
+        # slumped forever. No lingering mood beyond that either way:
+        # re-engaging any time goes straight back to _enter_engaged's
+        # normal energetic look, since that always fires unconditionally
+        # on the ENGAGED transition regardless of what state came before.
+        self.state = State.IDLE
+        self._give_up_phase = 1
+        self._give_up_timer = 0.0
+        self.lamp.set_target_pose(GIVEN_UP_DIP_POSE, duration=0.5, overshoot=False)
+        self.lamp.set_light(GIVEN_UP_COLOR, transition_s=0.5)
+        self.lamp.play_sound("give_up")
+
+    def _tick_give_up(self, dt: float) -> None:
+        self._give_up_timer += dt
+        if self._give_up_phase == 1 and self._give_up_timer >= GIVE_UP_DIP_S:
+            # Recover to a normal resting look -- a brief dip reads as
+            # "aww, ok"; staying slumped forever reads as broken, not sad.
+            self._give_up_phase = 2
+            self._give_up_timer = 0.0
+            self.lamp.set_target_pose(kinematics.NEUTRAL_POSE, duration=GIVE_UP_RECOVER_S, overshoot=False)
+            self.lamp.set_light(IDLE_COLOR, transition_s=GIVE_UP_RECOVER_S)
+        elif self._give_up_phase == 2 and self._give_up_timer >= GIVE_UP_RECOVER_S:
+            self._give_up_phase = 0
 
     def debug_info(self) -> dict:
         return {

@@ -30,7 +30,9 @@ STATE_PATH = config.LOGS_DIR / "adaptation_state.json"
 # Bounds: learning nudges within these, never past them.
 MIN_DELAY_S, MAX_DELAY_S = 2.0, 8.0
 MIN_ATTEMPTS, MAX_ATTEMPTS = 1, 5
-MIN_COOLDOWN_S, MAX_COOLDOWN_S = 3.0, 10.0
+MIN_COOLDOWN_S, MAX_COOLDOWN_S = 1.5, 10.0  # config.ATTENTION_SEEK_COOLDOWN_S's default sits at 3.0 --
+                                              # this needs headroom below that or a consistently
+                                              # responsive user has nowhere left to shrink toward
 
 RESPONSE_WINDOW_S = 20.0  # re-engaging within this long after an attempt counts as "it worked"
 ROLLING_WINDOW = 10        # how many recent attempts the response rate is computed over
