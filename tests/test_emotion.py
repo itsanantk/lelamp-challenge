@@ -12,7 +12,7 @@ from conversation import emotion
 
 
 def test_loud_fast_variable_pitch_classifies_as_energetic():
-    assert emotion._classify(rms=0.017, pitch_var=20.0, rate=4.0) == "energetic"
+    assert emotion._classify(rms=0.017, pitch_var=25.0, rate=4.0) == "energetic"
 
 
 def test_loud_fast_flat_pitch_classifies_as_tense():
@@ -20,11 +20,24 @@ def test_loud_fast_flat_pitch_classifies_as_tense():
 
 
 def test_quiet_overrides_everything_else():
-    assert emotion._classify(rms=0.001, pitch_var=20.0, rate=4.0) == "quiet"
+    assert emotion._classify(rms=0.001, pitch_var=25.0, rate=4.0) == "quiet"
 
 
 def test_moderate_speech_classifies_as_calm():
     assert emotion._classify(rms=0.01, pitch_var=5.0, rate=2.0) == "calm"
+
+
+def test_loud_but_not_fast_still_registers_as_tense():
+    # A short, clipped, frustrated sentence doesn't reliably hit "fast" the
+    # way a longer excited one does -- the old AND-gate required loud AND
+    # fast simultaneously, so a clearly raised voice at a normal pace
+    # silently fell through to "calm". Scored as an average instead: a
+    # strong signal in just one dimension is now enough to tip out of calm.
+    assert emotion._classify(rms=0.02, pitch_var=5.0, rate=1.5) == "tense"
+
+
+def test_fast_but_not_loud_still_registers_as_energetic():
+    assert emotion._classify(rms=0.008, pitch_var=25.0, rate=5.0) == "energetic"
 
 
 def test_analyze_uses_peak_rms_not_a_flat_whole_clip_average():
@@ -46,5 +59,7 @@ if __name__ == "__main__":
     test_loud_fast_flat_pitch_classifies_as_tense()
     test_quiet_overrides_everything_else()
     test_moderate_speech_classifies_as_calm()
+    test_loud_but_not_fast_still_registers_as_tense()
+    test_fast_but_not_loud_still_registers_as_energetic()
     test_analyze_uses_peak_rms_not_a_flat_whole_clip_average()
     print("ALL EMOTION TESTS PASSED")

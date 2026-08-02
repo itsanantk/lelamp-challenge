@@ -31,8 +31,15 @@ from conversation import voice
 # louder than a flat average for the same clip.
 _QUIET_RMS = 0.005
 _LOUD_RMS = 0.016
-_FAST_RATE_HZ = 3.5
-_VARIABLE_PITCH_HZ = 15.0
+_CALM_RATE_HZ = 1.0   # rate floor for scoring -- a short, clipped, tense
+_FAST_RATE_HZ = 3.5   # sentence doesn't reliably hit "fast" the way a long excited one does
+# 15.0 was calibrated against std-dev; IQR runs larger for the same
+# underlying spread (~1.35x for roughly bell-shaped data), so the switch
+# to IQR alone would silently make "variable pitch" fire more often than
+# before. Scaled proportionally as a starting estimate, not re-derived
+# from real data -- same caveat as every other threshold in this file.
+_VARIABLE_PITCH_HZ = 20.0
+_AROUSAL_THRESHOLD = 0.5  # scored average of loud/fast needed to leave "calm"
 
 BGR_BY_LABEL = {
     "energetic": (60, 200, 255),    # bright warm gold
@@ -81,7 +88,11 @@ def analyze(audio: np.ndarray, sample_rate: int = config.VOICE_SAMPLE_RATE) -> V
         if (p := _estimate_pitch_hz(audio[start:start + frame_len], sample_rate)) is not None
     ]
     pitch_hz = float(np.mean(pitches)) if pitches else None
-    pitch_var = float(np.std(pitches)) if len(pitches) > 2 else None
+    # Interquartile range instead of std-dev -- autocorrelation pitch
+    # estimation occasionally jumps to half/double the true pitch on a
+    # single frame (an octave error), which badly skews a plain std-dev;
+    # IQR barely notices a handful of outlier frames.
+    pitch_var = float(np.percentile(pitches, 75) - np.percentile(pitches, 25)) if len(pitches) > 2 else None
 
     # Rough speaking-rate proxy: how often the smoothed amplitude envelope
     # crosses above/below its own mean -- choppier/faster speech crosses
@@ -98,12 +109,24 @@ def analyze(audio: np.ndarray, sample_rate: int = config.VOICE_SAMPLE_RATE) -> V
     return VoiceTone(label, rms, pitch_hz, pitch_var, speaking_rate)
 
 
+def _normalize(value: float, lo: float, hi: float) -> float:
+    return min(max((value - lo) / (hi - lo), 0.0), 1.0)
+
+
 def _classify(rms: float, pitch_var: float | None, rate: float) -> str:
     if rms < _QUIET_RMS:
         return "quiet"
+
+    # Scored as an average instead of requiring loud AND fast at once --
+    # real tension doesn't reliably max out both dimensions simultaneously.
+    # A short, clipped, moderately raised sentence ("why can't you help
+    # me") can carry real frustration while only strongly tripping one of
+    # the two signals; the old AND-gate silently called that "calm".
+    loud_score = _normalize(rms, _QUIET_RMS, _LOUD_RMS)
+    fast_score = _normalize(rate, _CALM_RATE_HZ, _FAST_RATE_HZ)
+    arousal = (loud_score + fast_score) / 2
+    if arousal < _AROUSAL_THRESHOLD:
+        return "calm"
+
     variable_pitch = pitch_var is not None and pitch_var > _VARIABLE_PITCH_HZ
-    if rms > _LOUD_RMS and rate > _FAST_RATE_HZ and variable_pitch:
-        return "energetic"
-    if rms > _LOUD_RMS and rate > _FAST_RATE_HZ and not variable_pitch:
-        return "tense"  # loud and fast but flat/monotone
-    return "calm"
+    return "energetic" if variable_pitch else "tense"
