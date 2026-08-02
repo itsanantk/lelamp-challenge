@@ -40,11 +40,15 @@ When you do report a real sighting (found=true), use the plain-language directio
 given (e.g. "off to the left") and roughly how long ago you saw it, not raw degrees or \
 timestamps. Keep answers to 1-3 sentences.
 
-seen_alongside lists other objects from that same camera scan, each with its own direction. \
-Only call one of them "near" the main object if its direction actually matches (or is one \
-step away, e.g. both "slightly left" and "center"); if a direction differs, describe it \
-separately with its own direction instead of lumping it in as nearby -- being in the same \
-wide shot is not the same as being close together."""
+seen_alongside lists other objects from that same camera scan, each with its own direction \
+and confidence (0-1). Only call one of them "near" the main object if its direction actually \
+matches (or is one step away, e.g. both "slightly left" and "center"); if a direction \
+differs, describe it separately with its own direction instead of lumping it in as nearby -- \
+being in the same wide shot is not the same as being close together. Only mention confidence \
+for a co-occurring object if its confidence is below 0.55 (worth a quick "though I'm not \
+fully sure that one's right"); otherwise don't bring confidence up at all. Never say you're \
+unsure about something confidence actually shows you're sure about, and never invent a doubt \
+you weren't given data for."""
 
 TOOL_SPECS = [
     {
@@ -138,8 +142,8 @@ class MemoryAgent:
                 "direction": direction,
                 "confidence": round(obs.confidence, 2),
                 "seen_alongside": [
-                    {"object_class": cls, "direction": bearing_to_direction(bearing)}
-                    for cls, bearing in cooccurring
+                    {"object_class": cls, "direction": bearing_to_direction(bearing), "confidence": round(conf, 2)}
+                    for cls, bearing, conf in cooccurring
                 ],
             }
         if name == "list_seen_objects":

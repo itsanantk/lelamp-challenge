@@ -96,24 +96,38 @@ class MemoryStore:
             (target,),
         ).fetchone()
         if row is None:
-            # fall back to a loose substring match (e.g. "bottle" query vs "water bottle")
+            # Loose substring match, both directions -- COCO class names are
+            # mostly single words ("bottle", "cup"), but people ask about
+            # things more specifically ("water bottle", "coffee mug"). The
+            # old version only matched a short query against a longer stored
+            # class (e.g. query "bottle" vs stored "sports bottle"); it never
+            # matched the far more common opposite case, a longer query
+            # against a shorter stored class ("water bottle" query vs stored
+            # "bottle" never matched, since "bottle" doesn't contain "water
+            # bottle" as a substring).
             row = self.conn.execute(
                 "SELECT id, timestamp, object_class, confidence, bearing_deg, frame_group_id "
-                "FROM observations WHERE object_class LIKE ? ORDER BY timestamp DESC LIMIT 1",
-                (f"%{target}%",),
+                "FROM observations WHERE object_class LIKE ? OR ? LIKE '%' || object_class || '%' "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (f"%{target}%", target),
             ).fetchone()
         return Observation(*row) if row else None
 
-    def get_cooccurring(self, frame_group_id: int, exclude_class: str | None = None) -> list[tuple[str, float]]:
-        """Other classes seen in the same scan, each with its own bearing --
-        the caller needs this to avoid implying two objects are physically
-        close just because one scan (up to CAMERA_HFOV_DEG wide) caught both."""
+    def get_cooccurring(self, frame_group_id: int,
+                         exclude_class: str | None = None) -> list[tuple[str, float, float]]:
+        """Other classes seen in the same scan, each with its own bearing and
+        confidence -- the caller needs bearing to avoid implying two objects
+        are physically close just because one scan (up to CAMERA_HFOV_DEG
+        wide) caught both, and confidence so a low-confidence detection
+        (plausibly a misclassification) can be flagged as such instead of
+        reported as a plain fact, or invented by the LLM without real data
+        to back it."""
         rows = self.conn.execute(
-            "SELECT object_class, AVG(bearing_deg) FROM observations "
+            "SELECT object_class, AVG(bearing_deg), AVG(confidence) FROM observations "
             "WHERE frame_group_id = ? GROUP BY object_class",
             (frame_group_id,),
         ).fetchall()
-        results = [(r[0], r[1]) for r in rows]
+        results = [(r[0], r[1], r[2]) for r in rows]
         if exclude_class:
             results = [r for r in results if r[0] != exclude_class.lower()]
         return results
