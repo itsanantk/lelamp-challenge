@@ -57,6 +57,20 @@ class VisionMemory:
         self.fast_mode = False
         self._scene_change = SceneChangeDetector(threshold=config.SCENE_CHANGE_THRESHOLD)
         self._skipped_since_scan = 0
+        self.scan_count = 0  # bumped once per *actual* YOLO call -- lets another thread
+                               # (chat.py's recall) detect when a requested scan has landed
+        self._force_scan = False
+
+    def request_immediate_scan(self) -> None:
+        """Bypasses both the interval and scene-change-skip gating for the
+        very next maybe_scan() call. Used by recall (chat.py, possibly on
+        a different thread) when it needs a guaranteed-current answer to
+        "is this visible right now" rather than whatever the last
+        opportunistic scan happened to catch -- main.py's own loop
+        overwrites fast_mode from ObjectWatcher every tick, so setting
+        that directly from another thread would just get clobbered before
+        it ever took effect."""
+        self._force_scan = True
 
     def maybe_scan(self, frame: np.ndarray, now: float | None = None) -> list[Detection] | None:
         """Call every loop tick. Only actually runs YOLO once the scan
@@ -66,17 +80,21 @@ class VisionMemory:
         often while it's actually being moved around."""
         now = now if now is not None else time.monotonic()
         interval = config.YOLO_FAST_SCAN_INTERVAL_S if self.fast_mode else config.YOLO_SCAN_INTERVAL_S
-        if now - self._last_scan_t < interval:
+        if not self._force_scan and now - self._last_scan_t < interval:
             return None
         self._last_scan_t = now
+        forced = self._force_scan
+        self._force_scan = False
 
-        if self.fast_mode:
-            # Actively tracking something -- keep the change detector's
+        if self.fast_mode or forced:
+            # Actively tracking something (or a caller needs a guaranteed
+            # fresh read right now) -- keep the change detector's
             # reference frame fresh so it doesn't misread a big jump once
             # fast_mode ends, but don't gate on it here: a moving object
             # usually does register as change, but a phone held very
-            # still is exactly the case fast_mode exists to stay
-            # responsive for, so this cadence always scans regardless.
+            # still is exactly the case fast_mode/request_immediate_scan
+            # exist to stay responsive for, so this cadence always scans
+            # regardless.
             self._scene_change.changed(frame)
         else:
             changed = self._scene_change.changed(frame)
@@ -86,6 +104,7 @@ class VisionMemory:
                     return None
             self._skipped_since_scan = 0
 
+        self.scan_count += 1
         t0 = time.perf_counter()
         # Run inference at the lower of the two confidence bars so a
         # tracked-class detection that scores between the two thresholds

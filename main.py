@@ -1,8 +1,15 @@
 """Main demo loop: camera -> engagement -> behavior FSM -> lamp actuation,
 composited into one window / one recorded video.
 
+--chat runs the conversational recall agent (chat.py) on a background
+thread against this SAME lamp instance and window, instead of it being a
+separate process with its own lamp/window that only shared state through
+the memory db file -- see docs/ARCHITECTURE.md for why that used to be
+the design and what changed.
+
 Usage:
     python main.py                       interactive demo window
+    python main.py --chat --voice        also talk to it -- mic in, TTS out, same window
     python main.py --record out.mp4      also write the composite feed to a video file
     python main.py --label               enable ground-truth labeling for eval (press SPACE)
     python main.py --mute                disable sound cues
@@ -18,10 +25,12 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import threading
 import time
 
 import cv2
 
+import chat
 import config
 import viz
 from behavior.adaptation import AdaptationEngine
@@ -74,6 +83,21 @@ def run(args: argparse.Namespace) -> None:
     if not args.no_audio_gate:
         audio_monitor = AudioActivityMonitor()
         audio_monitor.start()
+
+    chat_thread = None
+    chat_shutdown = None
+    if args.chat:
+        chat_shutdown = threading.Event()
+        chat_args = argparse.Namespace(no_gui=True, voice=args.voice, mute=args.mute, ask=None,
+                                        multi_user=args.multi_user, wake_word=args.wake_word)
+        # store=None here on purpose -- MemoryAgent's own sqlite3 connection
+        # has to be created on the thread that'll actually use it (see
+        # chat.run's docstring), not handed in from this one.
+        chat_thread = threading.Thread(
+            target=chat.run, args=(chat_args,),
+            kwargs={"lamp": lamp, "fsm": fsm, "vision_memory": vision_memory, "shutdown_event": chat_shutdown},
+            daemon=True)
+        chat_thread.start()
 
     log_file, log_writer = _open_log_writer(args.label or args.test_frames > 0)
     ground_truth_label = 0
@@ -221,6 +245,15 @@ def run(args: argparse.Namespace) -> None:
                 break
 
     finally:
+        if chat_thread is not None:
+            # Signal + join before lamp.close() tears down the sound
+            # worker -- letting the thread get killed mid sd.play()/TTS
+            # call instead is exactly the bug class that used to segfault
+            # this process (see lamp/sim_backend.py's _SoundWorker.stop()).
+            chat_shutdown.set()
+            chat_thread.join(timeout=20.0)
+            if chat_thread.is_alive():
+                print("[main] chat thread didn't stop in time (mid-LLM-call/TTS?), exiting anyway")
         pipeline.close()
         lamp.close()
         if audio_monitor is not None:
@@ -255,7 +288,23 @@ def parse_args() -> argparse.Namespace:
                     help="wipe learned attention-seek timing at startup")
     p.add_argument("--auto-quit-after", type=float, default=None,
                     help="interactive mode only: auto-quit after N seconds (for scripted smoke tests)")
-    return p.parse_args()
+    p.add_argument("--chat", action="store_true",
+                    help="run the conversational recall agent on a background thread, sharing this lamp/window")
+    p.add_argument("--voice", action="store_true", help="with --chat: talk instead of typing -- mic input + TTS output")
+    p.add_argument("--multi-user", action="store_true",
+                    help="with --chat --voice: identify which face was talking when more than one is in frame")
+    p.add_argument("--wake-word", type=str, default=config.WAKE_WORD,
+                    help=f'with --chat --voice: phrase that wakes it up to listen (default: "{config.WAKE_WORD}")')
+    args = p.parse_args()
+    if args.chat and not args.voice:
+        # Typed chat blocks on input(), which no shutdown_event can reach
+        # -- quitting the camera window would hang for the full join
+        # timeout waiting on a thread stuck reading stdin. Voice mode's
+        # own blocking calls all check shutdown_event already (see
+        # conversation/voice.py). Text-only recall still works fine on
+        # its own: `python chat.py`.
+        p.error("--chat requires --voice here -- for typed-only recall, run chat.py standalone instead")
+    return args
 
 
 if __name__ == "__main__":

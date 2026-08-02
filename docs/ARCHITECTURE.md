@@ -41,7 +41,7 @@ flowchart LR
     MAIN --- FSM
     MAIN --- VM
     MAIN --- OW
-    CHAT["chat.py"] --- AGENT
+    MAIN -. "--chat: background thread,\nsame lamp + window" .-> AGENT
 ```
 
 A few boundaries I drew on purpose:
@@ -87,7 +87,7 @@ sequenceDiagram
     Eng-->>Log: yaw, pitch, latency_ms
 ```
 
-**Recall (`chat.py`, a separate process):**
+**Recall (`chat.py`, run via `main.py --chat` on a background thread):**
 
 ```mermaid
 sequenceDiagram
@@ -256,13 +256,24 @@ the camera feed. `main.py` computes the exact row-1 width before
 building the info panel, so `compose_panels`'s width-matching resize is
 normally a no-op rather than a stretch that would distort the text.
 
-**Recall is a separate process from the live loop.** `chat.py` and
-`main.py` only share state through the SQLite file. This matches the
-actual scenario — the user asks about something *later* — and sidesteps
-a worse option: putting a network-bound LLM call inside the same tight
-loop that engagement detection depends on for feeling responsive. The
-cost is that a demo video needs a cut between the two windows instead of
-one continuous shot, a tradeoff I'm fine with.
+**Recall runs on a background thread, sharing one lamp.** `chat.py`
+started life as a fully separate process, only sharing state with
+`main.py` through the SQLite file — that sidestepped putting a
+network-bound LLM call inside the same tight loop engagement detection
+depends on for feeling responsive, at the cost of two independent
+`SimulatedLamp` instances and windows. `main.py --chat` now spawns the
+conversation loop (`chat.run`) as a background thread against the same
+lamp and the same window instead: the LLM call still can't block the
+render loop, since it's on its own thread, but now both drive one
+physical lamp instead of two that only agreed via a database file. The
+one new thing that needed handling: `ATTENTION_SEEKING` is a short,
+timed animation that owns pose/light for its duration (same as it
+already did for `ObjectWatcher`), so a voice command briefly waits it
+out (`chat._wait_out_attention_seek`) instead of fighting it. A shared
+`threading.Lock` in `SimulatedLamp` guards the actual state writes; a
+`shutdown_event` lets `main.py` stop the thread cleanly on exit instead
+of killing it mid-`sd.play()`/TTS call — the same class of bug that
+segfaulted the sound worker (see below) if done abruptly.
 
 **Anticipation + overshoot instead of linear interpolation.** `lamp/motion.py`
 gives every move a brief wind-up opposite its direction of travel, then

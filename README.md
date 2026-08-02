@@ -33,7 +33,7 @@ better hit rate for a small latency cost, see the tradeoffs section in
 the architecture doc for the actual numbers and why the scan cadence
 isn't higher than it is.
 
-For `chat.py` (step 4) you need either `ANTHROPIC_API_KEY` or
+For step 4 (recall) you need either `ANTHROPIC_API_KEY` or
 `OPENAI_API_KEY` set, with actual credit on the account. Set
 `LELAMP_LLM_PROVIDER=openai` to use OpenAI instead of Anthropic if that's
 the one that's funded.
@@ -42,17 +42,19 @@ the one that's funded.
 
 ```
 python main.py                        # steps 1-3, live window
+python main.py --chat --voice         # + step 4, same window -- talk to it, mic in/spoken reply out
+python main.py --chat                 # + step 4 as typed chat instead of voice
+python main.py --chat --voice --multi-user   # + figure out who's talking if more than one face is in frame
 python main.py --record demo.mp4      # also saves the composite feed to recordings/
 python main.py --label                # SPACE toggles ground truth, for eval later
 ```
 
-Then, once there's something in memory, in a second terminal:
-
-```
-python chat.py                        # step 4 — ask what the lamp remembers
-python chat.py --voice                # talk to it instead — mic in, spoken reply out
-python chat.py --voice --multi-user   # + figure out who's talking if more than one face is in frame
-```
+`--chat` runs the conversational agent (`chat.py`) on a background thread
+against the same lamp and window the live loop is already rendering —
+one process, one lamp, everything (engagement, object tracking, voice
+commands) actuating the same instance. `chat.py` still runs standalone
+(`python chat.py`, `python chat.py --voice`) if you just want to query
+whatever's already in memory without the camera loop running.
 
 The window is two rows: webcam feed + simulated arm side by side on top
 (engagement state + YOLO boxes drawn right on the feed), and a full-width
@@ -61,9 +63,9 @@ webcam's max), not upscaled from something smaller, so it stays sharp at
 the larger window size. The webcam panel is mirrored for display (like
 any normal selfie camera) so it doesn't read as backwards — all the
 actual bearing/pointing math still runs on the original, un-mirrored
-frame underneath, so where the lamp turns to point is unaffected.
-`chat.py` pops a short second window where the lamp turns to point at
-whatever it recalled, with a bright spotlight-white light on it.
+frame underneath, so where the lamp turns to point is unaffected. Asking
+about a recalled object turns the same on-screen lamp to point at it,
+with a bright spotlight-white light — no second window.
 
 Sound cues (the lamp's own chirps, `lamp/sim_backend.py`) are confirmed
 audible on this machine's built-in speakers. **They were not reliably
@@ -146,7 +148,10 @@ before judging responsiveness. Separately, at 1920x1080 the per-frame HUD
 compositing (mirror + overlays + lamp render + debug panel) got real
 enough to matter — the debug text panel now redraws every 4th frame
 instead of every frame, and a couple of redundant full-frame copies were
-cut, dropping p95 loop latency roughly 30%.
+cut, dropping p95 loop latency roughly 30%. With `--chat --voice`,
+expect a stutter in the first ~15s specifically — that's Whisper loading
+on the conversation thread, competing for CPU with MediaPipe/YOLO on the
+main one; it clears once the "[voice] ready" line prints.
 
 ### Bonus behavior
 
@@ -159,7 +164,7 @@ scope of each — what they actually do versus a "real" version.
   (`perception/audio_monitor.py`) holds off attention-seeking while the
   room's making noise (you talking, TV on). `python main.py --no-audio-gate`
   turns it off.
-- **Multi-user speaker ID** — `chat.py --voice --multi-user` tracks up to
+- **Multi-user speaker ID** — `--chat --voice --multi-user` tracks up to
   4 faces and picks whoever's mouth was actually moving during the
   question, so it glances at and reasons about the right person when more
   than one face is in frame (`perception/multi_face.py`).
@@ -179,10 +184,9 @@ scope of each — what they actually do versus a "real" version.
 
 `main.py --record` writes an annotated composite video automatically as a
 backup, but it has no audio. For the real submission I used Win+G to
-screen-record instead, since that picks up the sound cues — ran `main.py`
-for steps 1-3, then `chat.py` for step 4 in the same take (there's a cut
-between the two windows, see the "why recall is a separate session" bit
-in the architecture doc).
+screen-record instead, since that picks up the sound cues — `main.py
+--chat --voice` runs all four steps in one continuous take now, no cut
+between windows (see `docs/demo_script.md`).
 
 ## Evaluation
 
@@ -217,7 +221,7 @@ peak-RMS measurement fix.
 ```
 config.py                 tuning constants + paths
 main.py                   camera -> engagement -> FSM -> lamp -> recording
-chat.py                   conversational recall, separate session
+chat.py                   conversational recall -- standalone, or embedded via main.py --chat
 viz.py                    HUD overlay + display-only mirroring
 
 perception/engagement.py       MediaPipe head pose -> hysteresis

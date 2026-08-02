@@ -61,7 +61,8 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
                           silence_s: float = config.VOICE_SILENCE_TIMEOUT_S,
                           no_speech_timeout_s: float = config.VOICE_NO_SPEECH_TIMEOUT_S,
                           samplerate: int = config.VOICE_SAMPLE_RATE,
-                          stop_event: threading.Event | None = None) -> np.ndarray:
+                          stop_event: threading.Event | None = None,
+                          shutdown_event: threading.Event | None = None) -> np.ndarray:
     """Records from the mic until speech has clearly started and then
     stopped (silence_s of continuous quiet after some sound was heard), or
     max_s is hit as a safety cap. If nothing is said at all -- e.g. a
@@ -71,7 +72,9 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
     stop_event is given, it's set the moment recording actually stops, so
     a caller sampling something else (e.g. video, for speaker ID) over the
     same window knows to stop too instead of running to its own separate
-    timeout."""
+    timeout. shutdown_event, if given, aborts the wait early (process is
+    shutting down) instead of blocking a caller trying to join this thread
+    until max_s naturally elapses."""
     threshold = config.VOICE_GATE_RMS_THRESHOLD
     chunks: list[np.ndarray] = []
     lock = threading.Lock()
@@ -98,6 +101,8 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
     with sd.InputStream(samplerate=samplerate, channels=1, dtype="float32", callback=_callback):
         t0 = time.monotonic()
         while not done.is_set() and (time.monotonic() - t0) < max_s:
+            if shutdown_event is not None and shutdown_event.is_set():
+                break
             sd.sleep(30)
 
     if stop_event is not None:
@@ -151,7 +156,8 @@ def _print_input_device_once() -> None:
 
 
 def wait_for_wake_word(wake_word: str = config.WAKE_WORD, chunk_s: float = config.WAKE_CHUNK_S,
-                        samplerate: int = config.VOICE_SAMPLE_RATE) -> str:
+                        samplerate: int = config.VOICE_SAMPLE_RATE,
+                        shutdown_event: threading.Event | None = None) -> str:
     """Blocks until wake_word or a quit word is heard, and returns which
     ("wake" or "quit"). Recognizing quit here too -- not just as an answer
     to "what's your question" -- matters because without it there'd be no
@@ -193,7 +199,9 @@ def wait_for_wake_word(wake_word: str = config.WAKE_WORD, chunk_s: float = confi
     mean the gate itself is the problem (fix: lower
     config.VOICE_GATE_RMS_THRESHOLD); numbers that cross it but a
     transcript that's never the right word means it's a Whisper accuracy
-    or matching problem instead."""
+    or matching problem instead. shutdown_event, if given, returns "quit"
+    on the next poll instead of blocking forever waiting for a wake word
+    that'll never come (process is shutting down)."""
     preload()
     _print_input_device_once()
     print(f'[voice] say "{wake_word}" to talk to it, or "quit" to exit... '
@@ -211,6 +219,8 @@ def wait_for_wake_word(wake_word: str = config.WAKE_WORD, chunk_s: float = confi
     with sd.InputStream(samplerate=samplerate, channels=1, dtype="float32", callback=_callback):
         while True:
             sd.sleep(int(chunk_s * 1000))
+            if shutdown_event is not None and shutdown_event.is_set():
+                return "quit"
             with buffer_lock:
                 if not buffer:
                     continue
