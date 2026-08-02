@@ -104,15 +104,19 @@ class MemoryStore:
             ).fetchone()
         return Observation(*row) if row else None
 
-    def get_cooccurring(self, frame_group_id: int, exclude_class: str | None = None) -> list[str]:
+    def get_cooccurring(self, frame_group_id: int, exclude_class: str | None = None) -> list[tuple[str, float]]:
+        """Other classes seen in the same scan, each with its own bearing --
+        the caller needs this to avoid implying two objects are physically
+        close just because one scan (up to CAMERA_HFOV_DEG wide) caught both."""
         rows = self.conn.execute(
-            "SELECT DISTINCT object_class FROM observations WHERE frame_group_id = ?",
+            "SELECT object_class, AVG(bearing_deg) FROM observations "
+            "WHERE frame_group_id = ? GROUP BY object_class",
             (frame_group_id,),
         ).fetchall()
-        classes = [r[0] for r in rows]
+        results = [(r[0], r[1]) for r in rows]
         if exclude_class:
-            classes = [c for c in classes if c != exclude_class.lower()]
-        return classes
+            results = [r for r in results if r[0] != exclude_class.lower()]
+        return results
 
     def list_known_classes(self) -> list[str]:
         rows = self.conn.execute("SELECT DISTINCT object_class FROM observations").fetchall()

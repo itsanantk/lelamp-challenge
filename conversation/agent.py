@@ -38,14 +38,23 @@ list_seen_objects, in case it's useful.
 
 When you do report a real sighting (found=true), use the plain-language direction you're \
 given (e.g. "off to the left") and roughly how long ago you saw it, not raw degrees or \
-timestamps. Keep answers to 1-3 sentences."""
+timestamps. Keep answers to 1-3 sentences.
+
+seen_alongside lists other objects from that same camera scan, each with its own direction. \
+Only call one of them "near" the main object if its direction actually matches (or is one \
+step away, e.g. both "slightly left" and "center"); if a direction differs, describe it \
+separately with its own direction instead of lumping it in as nearby -- being in the same \
+wide shot is not the same as being close together."""
 
 TOOL_SPECS = [
     {
         "name": "recall_object_location",
         "description": "Look up the most recent sighting of a named object in the lamp's "
                         "observation memory. Returns whether it was found, how long ago, "
-                        "its rough direction, and what else was seen alongside it.",
+                        "its rough direction, and what else was in the same camera scan -- "
+                        "each of those with its own separate direction, since the camera's "
+                        "field of view is wide enough that two objects in the same scan can "
+                        "still be on opposite sides of it.",
         "params": {
             "object_name": {"type": "string", "description": "e.g. 'phone', 'cup', 'keys'"},
         },
@@ -128,7 +137,10 @@ class MemoryAgent:
                 "seen_ago_seconds": round(seen_ago_s, 1),
                 "direction": direction,
                 "confidence": round(obs.confidence, 2),
-                "seen_alongside": cooccurring,
+                "seen_alongside": [
+                    {"object_class": cls, "direction": bearing_to_direction(bearing)}
+                    for cls, bearing in cooccurring
+                ],
             }
         if name == "list_seen_objects":
             return {"objects": self.store.list_known_classes()}
