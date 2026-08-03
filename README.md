@@ -224,10 +224,24 @@ created via conversation). Three kinds:
   actively tracking it (it briefly joins `ObjectWatcher.tracked_classes`
   while awaiting placement, purely for the visible "the lamp noticed too"
   reaction) and just waits. At the deadline it points back at the
-  remembered spot, requests a fresh scan, and announces itself -- one-shot,
-  not repeating. Can't yet judge what it sees (a full vs. empty bottle);
-  that's the next addition, on top of the same placement-tracking this
-  stage built.
+  remembered spot and checks in -- one-shot, not repeating.
+
+  If the request implies judging the object's *state*, not just
+  confirming it's there ("make sure I drink all my water" implies "is it
+  empty yet"), the model attaches a `check_question` at creation time
+  ("is this water bottle full or empty"). `behavior/reminders.py` has no
+  LLM/API-key access on purpose (same perception-doesn't-know-an-LLM-
+  exists separation as the rest of this codebase) -- it can't answer that
+  itself, so at the deadline it just flags the reminder as due and leaves
+  it alone. A background thread in `chat.py` (independent of the voice
+  loop, which can be blocked inside a single mic listen for up to a
+  minute) polls for exactly that, claims it, points the lamp, takes a
+  fresh look, and asks the model a single one-shot vision question --
+  deliberately not routed through the actual conversation history, since
+  a background check the user didn't just ask about shouldn't show up as
+  something the model "remembers" saying later. An object check with no
+  `check_question` (just "check on my keys") skips all of that and fires
+  directly, no LLM round trip needed.
 
 Any kind can also be scoped to a limited window -- "only check for the
 next 20 seconds," "just for the next hour" -- after which it deactivates

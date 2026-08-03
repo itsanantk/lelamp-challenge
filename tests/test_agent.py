@@ -57,7 +57,7 @@ def test_create_reminder_recurring_records_the_intended_action():
     assert image is None
     assert agent.last_reminder_action == {
         "action": "create", "kind": "recurring", "message": "stand up", "interval_s": 1800.0,
-        "duration_s": None, "object_class": None, "due_in_s": None,
+        "duration_s": None, "object_class": None, "due_in_s": None, "check_question": None,
     }
 
 
@@ -99,6 +99,18 @@ def test_create_reminder_object_check_normalizes_the_object_name():
     assert result == {"created": True, "kind": "object_check"}
     assert agent.last_reminder_action["object_class"] == "bottle"
     assert agent.last_reminder_action["due_in_s"] == 3600.0
+    assert agent.last_reminder_action["check_question"] is None  # not given -- omitted, not an error
+
+
+def test_create_reminder_object_check_records_a_check_question_when_given():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "object_check", "object_name": "water bottle",
+        "deadline_minutes": 60, "message": "did you finish your water?",
+        "check_question": "is this water bottle full or empty",
+    })
+    assert result == {"created": True, "kind": "object_check"}
+    assert agent.last_reminder_action["check_question"] == "is this water bottle full or empty"
 
 
 def test_create_reminder_object_check_requires_an_object_name():
@@ -238,6 +250,56 @@ def test_describe_current_view_returns_jpeg_bytes_for_a_real_frame():
     assert result == {"available": True}
     assert isinstance(image, bytes) and len(image) > 0
     assert image[:2] == b"\xff\xd8"  # JPEG magic bytes
+
+
+def test_judge_view_returns_none_with_no_frame_provider():
+    agent = _agent()  # get_frame=None -- standalone chat.py, no live camera loop
+    assert agent.judge_view("is this bottle full or empty") is None
+
+
+def test_judge_view_returns_none_when_no_frame_captured_yet():
+    agent = _agent()
+    agent.get_frame = lambda: None
+    assert agent.judge_view("is this bottle full or empty") is None
+
+
+def test_judge_view_returns_the_models_answer():
+    agent = _agent()
+    agent.get_frame = lambda: np.zeros((48, 64, 3), dtype=np.uint8)
+    agent.provider = "anthropic"
+    agent.client = _FakeClient()  # _FakeMessages.create always answers "just a plain reply, no tools needed"
+
+    answer = agent.judge_view("is this bottle full or empty")
+
+    assert answer == "just a plain reply, no tools needed"
+
+
+def test_judge_view_does_not_touch_the_conversation_history():
+    # Deliberately not routed through ask()/self.messages -- a background
+    # check the user didn't just ask about shouldn't show up as something
+    # the model "remembers" saying in a later, unrelated question.
+    agent = _agent()
+    agent.get_frame = lambda: np.zeros((48, 64, 3), dtype=np.uint8)
+    agent.provider = "anthropic"
+    agent.client = _FakeClient()
+    agent.messages = []
+
+    agent.judge_view("is this bottle full or empty")
+
+    assert agent.messages == []
+
+
+def test_judge_view_returns_none_and_does_not_raise_if_the_api_call_fails():
+    class _BoomMessages:
+        def create(self, **kwargs):
+            raise RuntimeError("network blip")
+
+    agent = _agent()
+    agent.get_frame = lambda: np.zeros((48, 64, 3), dtype=np.uint8)
+    agent.provider = "anthropic"
+    agent.client = type("C", (), {"messages": _BoomMessages()})()
+
+    assert agent.judge_view("is this bottle full or empty") is None
 
 
 class _FakeStore:

@@ -123,10 +123,11 @@ class _FakeReminderEngine:
         self.added = []
         self.cancelled = []
 
-    def add(self, kind, message, interval_s=None, duration_s=None, object_class=None, due_in_s=None):
-        self.added.append((kind, message, interval_s, duration_s, object_class, due_in_s))
+    def add(self, kind, message, interval_s=None, duration_s=None, object_class=None, due_in_s=None,
+            check_question=None):
+        self.added.append((kind, message, interval_s, duration_s, object_class, due_in_s, check_question))
         return type("R", (), {"id": 1, "kind": kind, "message": message, "interval_s": interval_s,
-                               "object_class": object_class,
+                               "object_class": object_class, "check_question": check_question,
                                "due_at": (time.time() + due_in_s) if due_in_s else None,
                                "expires_at": (time.time() + duration_s) if duration_s else None})()
 
@@ -139,7 +140,7 @@ def test_apply_reminder_action_create_adds_to_the_engine():
     engine = _FakeReminderEngine()
     chat._apply_reminder_action(
         {"action": "create", "kind": "recurring", "message": "stand up", "interval_s": 1800.0}, engine)
-    assert engine.added == [("recurring", "stand up", 1800.0, None, None, None)]
+    assert engine.added == [("recurring", "stand up", 1800.0, None, None, None, None)]
 
 
 def test_apply_reminder_action_create_passes_a_duration_through():
@@ -147,15 +148,17 @@ def test_apply_reminder_action_create_passes_a_duration_through():
     chat._apply_reminder_action(
         {"action": "create", "kind": "presence", "message": "come back", "interval_s": None,
          "duration_s": 20.0}, engine)
-    assert engine.added == [("presence", "come back", None, 20.0, None, None)]
+    assert engine.added == [("presence", "come back", None, 20.0, None, None, None)]
 
 
 def test_apply_reminder_action_create_passes_object_check_fields_through():
     engine = _FakeReminderEngine()
     chat._apply_reminder_action(
         {"action": "create", "kind": "object_check", "message": "did you finish your water?",
-         "interval_s": None, "object_class": "bottle", "due_in_s": 3600.0}, engine)
-    assert engine.added == [("object_check", "did you finish your water?", None, None, "bottle", 3600.0)]
+         "interval_s": None, "object_class": "bottle", "due_in_s": 3600.0,
+         "check_question": "is this bottle full or empty"}, engine)
+    assert engine.added == [("object_check", "did you finish your water?", None, None, "bottle", 3600.0,
+                              "is this bottle full or empty")]
 
 
 def test_apply_reminder_action_cancel_targets_the_engine():
@@ -236,6 +239,144 @@ def test_on_loud_during_listen_jerks_back_and_plays_startled():
     chat._on_loud_during_listen(lamp, rms=0.05)
     assert lamp.sounds == ["startled"]
     assert len(lamp.pose_calls) == 1
+
+
+class _FakeReminder:
+    def __init__(self, tracked_bearing=15.0, check_question="is this bottle full or empty", message="check it"):
+        self.kind = "object_check"
+        self.tracked_bearing = tracked_bearing
+        self.check_question = check_question
+        self.message = message
+        self.due_for_check = True
+        self.active = True
+
+
+class _FakeReminderEngineWithList:
+    def __init__(self, reminders):
+        self.reminders = reminders
+        self.saved = 0
+
+    def save(self):
+        self.saved += 1
+
+
+class _FakeAgentForJudgment:
+    def __init__(self, answer="looks about half full"):
+        self.answer = answer
+        self.questions_asked = []
+
+    def judge_view(self, question):
+        self.questions_asked.append(question)
+        return self.answer
+
+
+def test_resolve_object_check_judgment_points_at_the_bearing_and_speaks(monkeypatch):
+    monkeypatch.setattr(chat.time, "sleep", lambda s: None)
+    spoken = []
+    monkeypatch.setattr(chat.voice, "speak", lambda text: spoken.append(text))
+
+    lamp = _FakeLamp()
+    reminder = _FakeReminder()
+    engine = _FakeReminderEngineWithList([reminder])
+    agent = _FakeAgentForJudgment(answer="looks about half full")
+
+    chat._resolve_object_check_judgment(reminder, engine, lamp, vision_memory=None, agent=agent)
+
+    assert len(lamp.pose_calls) == 1  # pointed toward tracked_bearing
+    assert lamp.sounds == ["recall_point"]
+    assert agent.questions_asked == ["is this bottle full or empty"]
+    assert spoken == ["check it looks about half full"]
+    assert not reminder.active  # resolved -- one-shot
+    assert engine.saved == 1
+
+
+def test_resolve_object_check_judgment_falls_back_to_the_plain_message_if_judgment_fails(monkeypatch):
+    monkeypatch.setattr(chat.time, "sleep", lambda s: None)
+    spoken = []
+    monkeypatch.setattr(chat.voice, "speak", lambda text: spoken.append(text))
+
+    lamp = _FakeLamp()
+    reminder = _FakeReminder(message="did you finish your water?")
+    engine = _FakeReminderEngineWithList([reminder])
+    agent = _FakeAgentForJudgment(answer=None)  # no camera / API failure
+
+    chat._resolve_object_check_judgment(reminder, engine, lamp, vision_memory=None, agent=agent)
+
+    assert spoken == ["did you finish your water?"]  # no dangling "None" appended
+    assert not reminder.active
+
+
+def test_resolve_object_check_judgment_claims_the_reminder_before_resolving(monkeypatch):
+    # due_for_check must be cleared immediately (before the slow judge_view
+    # call), not after -- see the function's own docstring on why a second
+    # poll tick mid-resolution must not double-handle it.
+    monkeypatch.setattr(chat.time, "sleep", lambda s: None)
+    monkeypatch.setattr(chat.voice, "speak", lambda text: None)
+
+    lamp = _FakeLamp()
+    reminder = _FakeReminder()
+    engine = _FakeReminderEngineWithList([reminder])
+
+    seen_due_for_check_during_judgment = []
+
+    class _WatchingAgent:
+        def judge_view(self, question):
+            seen_due_for_check_during_judgment.append(reminder.due_for_check)
+            return "answer"
+
+    chat._resolve_object_check_judgment(reminder, engine, lamp, vision_memory=None, agent=_WatchingAgent())
+
+    assert seen_due_for_check_during_judgment == [False]
+
+
+def test_resolve_object_check_judgment_skips_pointing_with_no_tracked_bearing(monkeypatch):
+    monkeypatch.setattr(chat.time, "sleep", lambda s: None)
+    monkeypatch.setattr(chat.voice, "speak", lambda text: None)
+
+    lamp = _FakeLamp()
+    reminder = _FakeReminder(tracked_bearing=None)
+    engine = _FakeReminderEngineWithList([reminder])
+
+    chat._resolve_object_check_judgment(reminder, engine, lamp, vision_memory=None,
+                                         agent=_FakeAgentForJudgment("answer"))
+
+    assert lamp.pose_calls == []
+
+
+def test_reminder_judgment_loop_resolves_a_due_reminder_and_then_stops(monkeypatch):
+    monkeypatch.setattr(chat.time, "sleep", lambda s: None)
+    monkeypatch.setattr(chat.voice, "speak", lambda text: None)
+
+    shutdown_event = threading.Event()
+    lamp = _FakeLamp()
+    reminder = _FakeReminder()
+    engine = _FakeReminderEngineWithList([reminder])
+    agent = _FakeAgentForJudgment("answer")
+
+    # The loop's own shutdown_event.wait() is the poll-interval sleep --
+    # stopping it after one pass (rather than mocking time) is what keeps
+    # this test from actually blocking for _REMINDER_JUDGMENT_POLL_S.
+    monkeypatch.setattr(shutdown_event, "wait", lambda timeout: shutdown_event.set())
+
+    chat._reminder_judgment_loop(engine, lamp, vision_memory=None, agent=agent, shutdown_event=shutdown_event)
+
+    assert not reminder.active
+    assert agent.questions_asked == ["is this bottle full or empty"]
+
+
+def test_reminder_judgment_loop_ignores_reminders_not_due_for_check():
+    shutdown_event = threading.Event()
+    shutdown_event.set()  # stop after the first (only) pass
+    lamp = _FakeLamp()
+    reminder = _FakeReminder()
+    reminder.due_for_check = False
+    engine = _FakeReminderEngineWithList([reminder])
+    agent = _FakeAgentForJudgment("answer")
+
+    chat._reminder_judgment_loop(engine, lamp, vision_memory=None, agent=agent, shutdown_event=shutdown_event)
+
+    assert reminder.active  # untouched
+    assert agent.questions_asked == []
 
 
 def test_render_loop_runs_even_without_a_gui_window():

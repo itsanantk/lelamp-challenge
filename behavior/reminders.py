@@ -16,16 +16,27 @@ Three kinds:
     "currently away" (which would fire every single tick you're gone).
   - "object_check": watches for object_class to settle in place (a
     placement, e.g. setting down a water bottle), remembers where, then
-    points back at it and announces the deadline once due_at hits. One-
-    shot -- deactivates itself once fired, unlike the other two. Placement
-    detection here is deliberately independent of behavior/object_watch.py's
-    own tracking (which can only actively watch one object at a time and
-    might be busy with something else) -- this keeps its own minimal
-    bookkeeping off the same detections main.py already has, reusing
-    ObjectWatcher's stillness thresholds for consistency, not its state.
-    Can't yet judge the object's *contents* (e.g. whether a bottle is full
-    or empty) -- that needs a vision-LLM look, a deliberately separate
-    later addition.
+    checks in once due_at hits. One-shot -- deactivates itself once fired,
+    unlike the other two. Placement detection here is deliberately
+    independent of behavior/object_watch.py's own tracking (which can
+    only actively watch one object at a time and might be busy with
+    something else) -- this keeps its own minimal bookkeeping off the
+    same detections main.py already has, reusing ObjectWatcher's
+    stillness thresholds for consistency, not its state.
+
+    Firing an object_check with no check_question is simple enough that
+    this module handles it directly (see _fire): point at the remembered
+    bearing, speak the reminder's own message. One *with* a
+    check_question ("is this bottle full or empty") needs an actual
+    vision-LLM call, which this module has no LLM/API-key access to make
+    -- this module has no dependency on conversation/agent.py at all, on
+    purpose, the same separation-of-concerns split as everywhere else in
+    this codebase (perception/ produces readings, doesn't know an LLM
+    exists). tick() only flips due_for_check True once the deadline hits
+    for that case, then leaves the reminder alone; chat.py's own
+    background poller thread (it has agent/lamp/vision_memory) claims it,
+    resolves the judgment, and deactivates it. See chat.py's
+    _resolve_object_check_judgment.
 """
 from __future__ import annotations
 
@@ -79,6 +90,32 @@ class Reminder:
     due_at: float | None = None          # object_check only -- when to check on it
     tracked_bearing: float | None = None  # object_check only -- where it settled, once known
     placement_confirmed: bool = False     # object_check only -- has it been seen to settle yet
+    check_question: str | None = None    # object_check only -- e.g. "is this bottle full or
+                                           # empty," answered via a vision-LLM look at the
+                                           # deadline. None means "just confirm it's there,"
+                                           # handled directly (see _fire) without needing chat.py's
+                                           # LLM access at all.
+    due_for_check: bool = False          # object_check only -- deadline hit AND check_question is
+                                           # set, so firing needs a vision-LLM call this module
+                                           # can't make itself (no LLM/API-key access here -- see
+                                           # module docstring). tick() sets this once, then leaves
+                                           # the reminder alone; chat.py's own background poller
+                                           # (its thread has agent/lamp/vision_memory access) claims
+                                           # it (clearing this flag immediately, well before it's
+                                           # actually finished resolving -- see _check_dispatched
+                                           # below for why that alone isn't enough to prevent a
+                                           # second dispatch), resolves the judgment, and
+                                           # deactivates it.
+    _check_dispatched: bool = False      # object_check only -- separate from due_for_check on
+                                           # purpose: chat.py's poller clears due_for_check the
+                                           # instant it claims a reminder, well before it actually
+                                           # finishes (judge_view()/voice.speak() can take several
+                                           # seconds) -- a later tick() that only checked
+                                           # due_for_check would see it False again, still >=
+                                           # due_at, and re-arm it mid-resolution. This flag is set
+                                           # alongside due_for_check but never cleared by the
+                                           # poller, so a dispatch can only ever happen once per
+                                           # reminder.
     active: bool = True
     _was_present: bool = True  # presence only -- edge-detection state, see module docstring
     _absent_since: float | None = None  # presence only -- debounce state, see PRESENCE_ABSENCE_DEBOUNCE_S
@@ -142,12 +179,13 @@ class ReminderEngine:
 
     def add(self, kind: str, message: str, interval_s: float | None = None,
             duration_s: float | None = None, object_class: str | None = None,
-            due_in_s: float | None = None) -> Reminder:
+            due_in_s: float | None = None, check_question: str | None = None) -> Reminder:
         created_at = time.time()
         expires_at = created_at + duration_s if duration_s is not None else None
         due_at = created_at + due_in_s if due_in_s is not None else None
         r = Reminder(id=self._next_id, kind=kind, message=message, created_at=created_at,
-                      interval_s=interval_s, expires_at=expires_at, object_class=object_class, due_at=due_at)
+                      interval_s=interval_s, expires_at=expires_at, object_class=object_class,
+                      due_at=due_at, check_question=check_question)
         self._next_id += 1
         self.reminders.append(r)
         self.save()
@@ -197,7 +235,12 @@ class ReminderEngine:
             if r.kind == "recurring":
                 line = f"#{r.id} every {r.interval_s / 60:.0f}min: {label}"
             elif r.kind == "object_check":
-                status = "watching for placement" if not r.placement_confirmed else "waiting for deadline"
+                if not r.placement_confirmed:
+                    status = "watching for placement"
+                elif r.due_for_check:
+                    status = "checking now"
+                else:
+                    status = "waiting for deadline"
                 line = f"#{r.id} {r.object_class} ({status}): {label}"
             else:
                 line = f"#{r.id} on leaving desk: {label}"
@@ -266,11 +309,25 @@ class ReminderEngine:
                     self._update_placement(r, now, vision_memory)
                     if r.placement_confirmed:
                         fired_any = True  # not a fire, but placement_confirmed/tracked_bearing changed -- persist it
-                elif r.due_at is not None and now >= r.due_at:
-                    if vision_memory is not None:
-                        vision_memory.request_immediate_scan()  # best-effort -- doesn't block this fire
-                    _fire(r, lamp)
-                    r.active = False  # one-shot: deadline reached and reported, nothing left to watch for
-                    fired_any = True
+                elif r.due_at is not None and now >= r.due_at and not r._check_dispatched:
+                    if r.check_question is not None:
+                        # Can't resolve this here -- needs a vision-LLM
+                        # call this module has no access to make (see
+                        # module docstring). Flip the flag once and leave
+                        # it; chat.py's background poller claims and
+                        # resolves it on its own thread. _check_dispatched
+                        # (not cleared by the poller, unlike due_for_check
+                        # itself) is what actually guarantees this branch
+                        # never runs twice for the same reminder -- see
+                        # its own field comment.
+                        r.due_for_check = True
+                        r._check_dispatched = True
+                        fired_any = True
+                    else:
+                        if vision_memory is not None:
+                            vision_memory.request_immediate_scan()  # best-effort -- doesn't block this fire
+                        _fire(r, lamp)
+                        r.active = False  # one-shot: deadline reached and reported, nothing left to watch for
+                        fired_any = True
         if fired_any or expired_any:
             self.save()

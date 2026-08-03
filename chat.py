@@ -187,15 +187,69 @@ def _apply_reminder_action(reminder_action: dict, reminder_engine) -> None:
                                  interval_s=reminder_action.get("interval_s"),
                                  duration_s=reminder_action.get("duration_s"),
                                  object_class=reminder_action.get("object_class"),
-                                 due_in_s=reminder_action.get("due_in_s"))
+                                 due_in_s=reminder_action.get("due_in_s"),
+                                 check_question=reminder_action.get("check_question"))
         detail = f" every {r.interval_s / 60:.0f} min" if r.interval_s else ""
         if r.kind == "object_check":
             detail = f" watching for {r.object_class}, due in {(r.due_at - time.time()) / 60:.0f} min"
+            if r.check_question:
+                detail += f" ({r.check_question!r})"
         expiry = f", expires in {r.expires_at - time.time():.0f}s" if r.expires_at else ""
         print(f"[chat] reminder #{r.id} set ({r.kind}{detail}{expiry}): {r.message}")
     elif reminder_action["action"] == "cancel":
         n = reminder_engine.cancel_all(kind=reminder_action.get("kind"))
         print(f"[chat] cancelled {n} reminder(s)")
+
+
+# How often the poller below checks for a due_for_check object_check
+# reminder -- doesn't need to be tighter than this; the deadline itself
+# already did the time-sensitive part (see behavior/reminders.py's tick).
+_REMINDER_JUDGMENT_POLL_S = 1.0
+
+
+def _resolve_object_check_judgment(reminder, reminder_engine, lamp: SimulatedLamp, vision_memory,
+                                    agent: MemoryAgent) -> None:
+    """Finishes firing an object_check reminder that needs a vision-LLM
+    judgment (reminder.check_question is set) -- behavior/reminders.py's
+    own tick() can't do this part itself (no LLM/API-key access there by
+    design, see that module's docstring), so it just flips due_for_check
+    and leaves the reminder alone; this is what actually claims and
+    resolves it, called from _reminder_judgment_loop's poller thread."""
+    reminder.due_for_check = False  # claim immediately -- a second poll tick must not double-handle this
+    if reminder.tracked_bearing is not None:
+        _point_toward(lamp, reminder.tracked_bearing)
+        if vision_memory is not None:
+            vision_memory.request_immediate_scan()
+        time.sleep(1.2)  # let the pose/pan-crop settle and a fresh scan land before capturing the frame
+    answer = agent.judge_view(reminder.check_question)
+    # Falls back to just the reminder's own message if the judgment came
+    # back empty (no camera, no frame yet, or the API call itself failed)
+    # -- same honest-degradation idea as every other imperfect vision read
+    # in this project, rather than silently saying nothing at all.
+    reply = f"{reminder.message} {answer}" if answer else reminder.message
+    print(f"[reminder] {reply}")
+    lamp.play_sound("recall_point")  # the existing "found it" chime -- this is a recall confirmation too
+    voice.speak(reply)
+    reminder.active = False
+    reminder_engine.save()
+
+
+def _reminder_judgment_loop(reminder_engine, lamp: SimulatedLamp, vision_memory, agent: MemoryAgent,
+                             shutdown_event: threading.Event) -> None:
+    """Runs on its own daemon thread, independent of the voice loop's own
+    blocking listen/reply cycle below (which can be stuck inside a single
+    wait_for_wake_word()/_listen() call for up to a minute) -- an
+    object_check reminder's deadline shouldn't have to wait for the next
+    time the voice loop happens to come up for air. Polls rather than
+    reacting to an event since main.py's own tick() (a different thread)
+    is what actually flips due_for_check; a short poll interval is cheap
+    and simple compared to wiring a cross-thread condition variable for
+    something that only needs to notice within a second or two."""
+    while not shutdown_event.is_set():
+        for r in list(reminder_engine.reminders):
+            if r.active and r.kind == "object_check" and r.due_for_check:
+                _resolve_object_check_judgment(r, reminder_engine, lamp, vision_memory, agent)
+        shutdown_event.wait(_REMINDER_JUDGMENT_POLL_S)  # wakes immediately on shutdown, unlike time.sleep
 
 
 def _look_attentive(lamp: SimulatedLamp, bearing_deg: float | None, set_light: bool = True, fsm=None,
@@ -521,6 +575,15 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
             print("[chat] couldn't set up multi-user speaker detection (camera/model unavailable), "
                   "continuing without it")
 
+    judgment_thread = None
+    if reminder_engine is not None and shutdown_event is not None:
+        # See _reminder_judgment_loop's own docstring for why this needs
+        # its own thread rather than piggybacking on the voice loop below.
+        judgment_thread = threading.Thread(
+            target=_reminder_judgment_loop, args=(reminder_engine, lamp, vision_memory, agent, shutdown_event),
+            daemon=True)
+        judgment_thread.start()
+
     known = store.list_known_classes()
     print(f"[chat] LeLamp remembers {len(known)} object type(s): {', '.join(known) or '(nothing yet -- run main.py first)'}")
     if args.voice:
@@ -714,6 +777,16 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
                 in_conversation = True
                 _look_attentive(lamp, speaker_bearing, set_light=agent.last_light_action is None, fsm=fsm)
     finally:
+        if judgment_thread is not None:
+            # Same reasoning as main.py's own chat_thread shutdown --
+            # killing it mid sd.play()/TTS call instead of letting it wind
+            # down is the segfault class described in
+            # lamp/sim_backend.py's _SoundWorker.stop(). shutdown_event is
+            # already set by the time this function is even unwinding
+            # (either this loop's own break, or main.py's shutdown), so
+            # this is just waiting for an in-flight judgment to finish,
+            # not blocking on a fresh one starting.
+            judgment_thread.join(timeout=5.0)
         if owns_lamp:
             lamp.close()
         if owns_store:

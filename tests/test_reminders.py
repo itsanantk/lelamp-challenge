@@ -400,6 +400,49 @@ def test_object_check_fires_by_pointing_at_the_bearing_once_the_deadline_hits():
     assert vm.immediate_scans_requested == 1  # best-effort rescan nudge
 
 
+def test_object_check_with_a_check_question_defers_instead_of_firing_directly():
+    # reminders.py has no LLM/API-key access (see module docstring) --
+    # it can't itself answer "is this bottle full or empty," so it must
+    # NOT point/speak/deactivate here, just flip due_for_check and leave
+    # the reminder alone for chat.py's own poller to claim.
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="did you finish your water?",
+                    object_class="bottle", due_in_s=3600.0, check_question="is this bottle full or empty")
+    r.tracked_bearing = 22.0
+    r.placement_confirmed = True
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at + 3600.0 + 1.0, face_found=True, lamp=lamp, vision_memory=_FakeVisionMemory())
+
+    assert r.due_for_check
+    assert r.active  # not deactivated -- still pending until chat.py resolves it
+    assert lamp.sounds == []
+    assert lamp.pose_calls == []
+
+
+def test_object_check_with_a_check_question_only_flips_due_for_check_once():
+    # chat.py's poller clears due_for_check the instant it claims a
+    # reminder (see _resolve_object_check_judgment), *before* it finishes
+    # resolving it (still active while judge_view()/voice.speak() run).
+    # A later tick(), still seeing now >= due_at, must not re-arm
+    # due_for_check while that resolution is still in flight.
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check", object_class="bottle", due_in_s=1.0,
+                    check_question="is this bottle full or empty")
+    r.tracked_bearing = 10.0
+    r.placement_confirmed = True
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at + 2.0, face_found=True, lamp=lamp, vision_memory=_FakeVisionMemory())
+    assert r.due_for_check  # sanity: the first tick did cross the deadline
+    r.due_for_check = False  # simulate chat.py's poller having claimed it (still r.active -- in progress)
+    engine.tick(now=r.created_at + 3.0, face_found=True, lamp=lamp, vision_memory=_FakeVisionMemory())
+
+    # Must not flip back to True just because now is still >= due_at --
+    # only the very first crossing should ever set it.
+    assert not r.due_for_check
+
+
 def test_object_check_deactivates_itself_after_firing_one_shot():
     engine = ReminderEngine()
     r = engine.add(kind="object_check", message="check", object_class="bottle", due_in_s=10.0)

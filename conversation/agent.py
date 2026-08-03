@@ -181,6 +181,16 @@ TOOL_SPECS = [
                                                   "reminder -- minutes from now until the check, "
                                                   "computed from the current time given above "
                                                   "(e.g. 'by 6pm' when it's 3:45pm now is 135)"},
+            "check_question": {"type": "string",
+                                "description": "optional, 'object_check' only -- if the request "
+                                                "implies judging something about the object's "
+                                                "state, not just confirming it's still there, "
+                                                "phrase that as a short question you'd want "
+                                                "answered from a live look at it (e.g. 'make sure "
+                                                "I drink all my water' -> 'is this water bottle "
+                                                "full or empty'). Omit when there's nothing to "
+                                                "visually judge (e.g. 'check on my keys' just "
+                                                "needs to confirm where they are)."},
             "duration_minutes": {"type": "number",
                                   "description": "optional, for 'recurring'/'presence' only -- if "
                                                   "the user only wants this active for a limited "
@@ -331,6 +341,7 @@ class MemoryAgent:
                     interval_s = float(minutes) * 60.0
                 object_class = None
                 due_in_s = None
+                check_question = None
                 if kind == "object_check":
                     object_name = str(tool_input.get("object_name") or "").strip()
                     if not object_name:
@@ -342,6 +353,7 @@ class MemoryAgent:
                                          "for an object_check reminder"}, None
                     object_class = normalize_class(object_name)
                     due_in_s = float(deadline_minutes) * 60.0
+                    check_question = str(tool_input.get("check_question") or "").strip() or None
                 duration_s = None
                 duration_minutes = tool_input.get("duration_minutes")
                 if duration_minutes:
@@ -350,7 +362,8 @@ class MemoryAgent:
                     duration_s = float(duration_minutes) * 60.0
                 self.last_reminder_action = {"action": "create", "kind": kind, "message": message,
                                               "interval_s": interval_s, "duration_s": duration_s,
-                                              "object_class": object_class, "due_in_s": due_in_s}
+                                              "object_class": object_class, "due_in_s": due_in_s,
+                                              "check_question": check_question}
                 return {"created": True, "kind": kind}, None
             if action == "cancel":
                 kind = tool_input.get("kind")
@@ -490,3 +503,60 @@ class MemoryAgent:
 
         self.messages.append({"role": "assistant", "content": message.content})
         return message.content or ""
+
+    # -- One-shot vision judgment (stage 3 of behavior/reminders.py's
+    # object_check) ------------------------------------------------------
+
+    def judge_view(self, question: str) -> str | None:
+        """A single vision-LLM call answering `question` against the
+        current camera frame -- e.g. "is this water bottle full or
+        empty," fired when an object_check reminder's deadline hits (see
+        chat.py's _resolve_object_check_judgment). Deliberately NOT routed
+        through ask()/self.messages: this runs on reminders.py's own
+        background poller thread, not in response to anything the user
+        just said, and folding a background check into the actual
+        conversation history would have the model referencing "the
+        bottle I checked a minute ago" in an unrelated later question.
+        One-shot, no tools, no memory of its own past answers -- exactly
+        the same image-capture path as describe_current_view, just
+        returning a direct answer instead of tool-result image bytes for
+        the main conversation loop to react to.
+
+        Returns None if there's no live camera in this session, no frame
+        captured yet, or the API call itself fails -- callers already
+        have a fallback message (the reminder's own) for when this comes
+        back empty, same as any other imperfect vision read in this
+        project."""
+        if self.get_frame is None:
+            return None
+        frame = self.get_frame()
+        if frame is None:
+            return None
+        ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if not ok:
+            return None
+        b64 = base64.b64encode(jpeg.tobytes()).decode("ascii")
+        prompt = (f"Looking only at what's visible in this image, answer in one short, "
+                  f"spoken-out-loud-friendly sentence: {question}")
+        try:
+            if self.provider == "openai":
+                response = self.client.chat.completions.create(
+                    model=config.OPENAI_MODEL,
+                    messages=[{"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    ]}],
+                )
+                return (response.choices[0].message.content or "").strip() or None
+            response = self.client.messages.create(
+                model=config.ANTHROPIC_MODEL, max_tokens=200,
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                ]}],
+            )
+            text = "".join(b.text for b in response.content if b.type == "text").strip()
+            return text or None
+        except Exception as e:
+            print(f"[agent] judge_view failed: {e}")
+            return None
