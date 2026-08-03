@@ -1,6 +1,7 @@
 """Unit + integration tests for behavior/adaptation.py (bonus: self-learning
 attention-seek timing). Run with: python -m pytest tests/ -v
 """
+import json
 import sys
 from pathlib import Path
 
@@ -135,6 +136,52 @@ def test_load_with_no_state_file_falls_back_to_defaults():
     engine = AdaptationEngine.load()
     assert engine.delay_s == config.ATTENTION_SEEK_DELAY_S
     assert engine.history == []
+
+
+def test_reset_restores_defaults_and_persists_them():
+    # main.py's 'c' key pairs this with MemoryStore.clear() -- a partial
+    # reset that left old learned values in place until the next restart
+    # would be a confusing half-measure, so reset() must both zero out the
+    # in-memory state and overwrite the on-disk file immediately.
+    engine = AdaptationEngine()
+    for i in range(6):
+        engine.on_attention_seek_started(now=i * 30.0)
+        engine.on_engaged(now=i * 30.0 + 1.0)
+    assert engine.delay_s != config.ATTENTION_SEEK_DELAY_S  # sanity: it actually learned something
+
+    engine.reset()
+
+    assert engine.delay_s == config.ATTENTION_SEEK_DELAY_S
+    assert engine.max_attempts == config.ATTENTION_SEEK_MAX_ATTEMPTS
+    assert engine.cooldown_s == config.ATTENTION_SEEK_COOLDOWN_S
+    assert engine.history == []
+
+    reloaded = AdaptationEngine.load()
+    assert reloaded.delay_s == config.ATTENTION_SEEK_DELAY_S
+    assert reloaded.history == []
+
+
+def test_load_clamps_a_stale_out_of_bounds_value_to_the_current_bounds(tmp_path):
+    # A file saved under an older, looser bound (e.g. MIN_DELAY_S used to
+    # be 2.0) shouldn't keep an engine below today's floor just because it
+    # predates the tightened bound -- load() must re-clamp, not trust
+    # whatever was on disk.
+    adaptation_mod.STATE_PATH.write_text(json.dumps({
+        "delay_s": 2.0, "max_attempts": 5, "cooldown_s": 1.0, "history": [],
+    }))
+
+    engine = AdaptationEngine.load()
+
+    assert engine.delay_s == MIN_DELAY_S
+    assert engine.cooldown_s == MIN_COOLDOWN_S
+
+
+def test_min_delay_leaves_headroom_below_the_default_delay():
+    # If MIN_DELAY_S ever crept up to equal (or exceed)
+    # config.ATTENTION_SEEK_DELAY_S, a consistently responsive user would
+    # have nowhere left to shrink toward and the "try sooner" branch of
+    # _adapt() would silently become a no-op for delay_s.
+    assert MIN_DELAY_S < config.ATTENTION_SEEK_DELAY_S
 
 
 # -- integration with the real FSM ---------------------------------------

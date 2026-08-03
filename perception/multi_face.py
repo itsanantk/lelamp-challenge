@@ -1,5 +1,5 @@
 """Bonus: multi-user interaction -- when more than one face is in frame,
-figure out which one is actually talking.
+figure out which one is actually talking, and point at them.
 
 No audio-based speaker diarization here (that needs per-person
 voiceprints and a much bigger build, and this system doesn't have a mic
@@ -11,12 +11,22 @@ variance over the window is the one that was talking. Cheap, purely
 visual, and matches what a lamp with one camera (not a mic array) can
 actually do -- which is itself a reasonable thing to point at when asked
 why this approach over real diarization.
+
+get_frame, if given, hands this whatever main.py's own loop most recently
+read (see perception/vision_memory.py's last_frame) instead of opening a
+second cv2.VideoCapture on the same camera index -- many webcam drivers
+only allow one open handle at a time, so the standalone (own-camera)
+fallback below would silently degrade to unavailable the moment main.py's
+EngagementPipeline already had the camera open, which is exactly the
+--chat --voice case this is built for. Only chat.py run standalone (no
+live camera loop of its own to ask) still needs the fallback.
 """
 from __future__ import annotations
 
 import threading
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 import cv2
 import mediapipe as mp
@@ -39,14 +49,16 @@ class _FaceSample:
 
 
 class SpeakerDetector:
-    """Owns its own camera handle -- separate from EngagementPipeline's --
-    since this runs from chat.py, a different process than main.py's live
-    loop. Degrades to unavailable (rather than raising) if the camera
-    can't be opened, e.g. because main.py already has it."""
-
-    def __init__(self, camera_index: int = config.CAMERA_INDEX):
-        self.cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-        self.available = self.cap.isOpened()
+    def __init__(self, camera_index: int = config.CAMERA_INDEX,
+                 get_frame: Callable[[], np.ndarray | None] | None = None):
+        self._get_frame = get_frame
+        self.cap = None
+        if get_frame is None:
+            # Standalone fallback -- owns its own camera handle. See the
+            # module docstring for why the embedded (--chat) path avoids
+            # this entirely instead.
+            self.cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        self.available = get_frame is not None or self.cap.isOpened()
         self.landmarker = None
         if self.available:
             try:
@@ -59,14 +71,32 @@ class SpeakerDetector:
             except Exception:
                 self.available = False
         self._t0 = time.monotonic()
+        self._last_frame_seen: np.ndarray | None = None
 
     def _timestamp_ms(self) -> int:
         return int((time.monotonic() - self._t0) * 1000)
 
-    def _sample_frame(self) -> list[_FaceSample]:
+    def _read_frame(self) -> np.ndarray | None:
+        if self._get_frame is not None:
+            return self._get_frame()
         ok, frame = self.cap.read()
-        if not ok:
+        return frame if ok else None
+
+    def _sample_frame(self) -> list[_FaceSample]:
+        frame = self._read_frame()
+        if frame is None:
             return []
+        if self._get_frame is not None:
+            # main.py's loop only refreshes its shared frame once per
+            # tick, slower than this method's own polling rate -- reusing
+            # the exact same array object for detect_for_video() twice in
+            # a row is harmless (MediaPipe VIDEO mode wants a
+            # non-decreasing timestamp, not a genuinely new frame every
+            # call), so just skip the redundant inference instead of
+            # re-running it on identical pixels.
+            if frame is self._last_frame_seen:
+                return []
+            self._last_frame_seen = frame
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         result = self.landmarker.detect_for_video(mp_image, self._timestamp_ms())
         samples = []
@@ -121,7 +151,7 @@ class SpeakerDetector:
         return float(np.mean([s.bearing_deg for s in speaker_track])), len(tracks)
 
     def close(self) -> None:
-        if self.available:
+        if self.cap is not None:
             self.cap.release()
         if self.landmarker is not None:
             self.landmarker.close()

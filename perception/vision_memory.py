@@ -141,9 +141,9 @@ class VisionMemory:
         scan_conf = min(config.YOLO_CONF_THRESHOLD, config.TRACKED_CLASS_CONF_THRESHOLD)
 
         scan_frame = frame
-        crop_x0, crop_scale = 0, 1.0
+        crop_x0, crop_y0, crop_scale = 0, 0, 1.0
         if pan_zoom is not None:
-            scan_frame, crop_x0, crop_scale = viz.pan_crop_frame(
+            scan_frame, crop_x0, crop_y0, crop_scale = viz.pan_crop_frame(
                 frame, pan_bearing_deg, config.CAMERA_HFOV_DEG, zoom=pan_zoom, mirrored=False)
 
         # agnostic_nms=True: ultralytics' NMS suppression is per-class by
@@ -176,13 +176,16 @@ class VisionMemory:
                 # same (w, h) as the full frame -- box coordinates come
                 # back in that same resized space, so converting to true
                 # full-frame pixels is just undoing the crop's own scale
-                # and offset (y is untouched -- the pan crop is
-                # horizontal-only). Once converted, everything below is
-                # identical to the uncropped path: same bearing formula,
-                # same stored coordinates, nothing downstream needs to
-                # know cropping happened at all.
+                # and offset on both axes (pan_crop_frame crops width and
+                # height by the same zoom factor, so one scale covers
+                # both). Once converted, everything below is identical to
+                # the uncropped path: same bearing formula, same stored
+                # coordinates, nothing downstream needs to know cropping
+                # happened at all.
                 x1 = crop_x0 + x1 / crop_scale
                 x2 = crop_x0 + x2 / crop_scale
+                y1 = crop_y0 + y1 / crop_scale
+                y2 = crop_y0 + y2 / crop_scale
             cx = (x1 + x2) / 2
             cy = (y1 + y2) / 2
             # negated for the same reason as _face_bearing_deg in

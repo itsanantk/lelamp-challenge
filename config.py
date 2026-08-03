@@ -16,7 +16,6 @@ YOLO_MODEL = MODELS_DIR / "yolo11s.pt"
 PIPER_MODEL = MODELS_DIR / "en_US-amy-medium.onnx"
 PIPER_MODEL_CONFIG = MODELS_DIR / "en_US-amy-medium.onnx.json"
 MEMORY_DB = LOGS_DIR / "memory.sqlite3"
-SPEAKER_DB = LOGS_DIR / "speakers.json"
 
 for _d in (MODELS_DIR, LOGS_DIR, RECORDINGS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
@@ -182,15 +181,6 @@ HAND_WAVE_MIN_DELTA = 0.02         # normalized-x wrist movement (0..1 frame wid
 LLM_PROVIDER = os.environ.get("LELAMP_LLM_PROVIDER", "anthropic").lower()
 ANTHROPIC_MODEL = "claude-sonnet-5"
 OPENAI_MODEL = "gpt-4o-mini"
-
-# --- Per-speaker voice ID (perception/speaker_id.py) -----------------------
-# Cosine similarity on resemblyzer embeddings -- tuned against a quick
-# local check with two different synthesized voices reading the same and
-# different sentences: same-speaker landed ~0.87, different-speaker ~0.50,
-# so 0.72 sits with real margin on both sides rather than splitting the
-# difference exactly.
-SPEAKER_MATCH_THRESHOLD = 0.72
-SPEAKER_MIN_AUDIO_S = 1.0  # shorter clips don't carry enough signal for a reliable embedding
 
 # --- Voice I/O ---------------------------------------------------------
 # Both directions run locally so voice mode doesn't depend on which LLM

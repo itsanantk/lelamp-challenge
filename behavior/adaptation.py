@@ -28,7 +28,11 @@ import config
 STATE_PATH = config.LOGS_DIR / "adaptation_state.json"
 
 # Bounds: learning nudges within these, never past them.
-MIN_DELAY_S, MAX_DELAY_S = 2.0, 8.0
+MIN_DELAY_S, MAX_DELAY_S = 3.0, 8.0  # config.ATTENTION_SEEK_DELAY_S's default sits at 4.0 --
+                                       # same headroom reasoning as MIN_COOLDOWN_S below: leave
+                                       # room under the default or a responsive user has nowhere
+                                       # left to shrink toward. 3.0 is still a firm floor -- a
+                                       # sub-3s attention-seek reads as pestering, not attentive.
 MIN_ATTEMPTS, MAX_ATTEMPTS = 1, 5
 MIN_COOLDOWN_S, MAX_COOLDOWN_S = 1.5, 10.0  # config.ATTENTION_SEEK_COOLDOWN_S's default sits at 6.0 --
                                               # this needs headroom below that or a consistently
@@ -54,10 +58,18 @@ class AdaptationEngine:
         if STATE_PATH.exists():
             try:
                 data = json.loads(STATE_PATH.read_text())
+                # Re-clamp against the *current* bounds, not just whatever
+                # bounds were in effect when this file was saved -- a bound
+                # tightened after the fact (e.g. raising MIN_DELAY_S)
+                # should apply immediately on the next load, not only to
+                # values the engine adapts from here on.
+                delay_s = min(MAX_DELAY_S, max(MIN_DELAY_S, data.get("delay_s", config.ATTENTION_SEEK_DELAY_S)))
+                max_attempts = min(MAX_ATTEMPTS, max(MIN_ATTEMPTS, data.get("max_attempts", config.ATTENTION_SEEK_MAX_ATTEMPTS)))
+                cooldown_s = min(MAX_COOLDOWN_S, max(MIN_COOLDOWN_S, data.get("cooldown_s", config.ATTENTION_SEEK_COOLDOWN_S)))
                 return cls(
-                    delay_s=data.get("delay_s", config.ATTENTION_SEEK_DELAY_S),
-                    max_attempts=data.get("max_attempts", config.ATTENTION_SEEK_MAX_ATTEMPTS),
-                    cooldown_s=data.get("cooldown_s", config.ATTENTION_SEEK_COOLDOWN_S),
+                    delay_s=delay_s,
+                    max_attempts=max_attempts,
+                    cooldown_s=cooldown_s,
                     history=data.get("history", []),
                 )
             except (json.JSONDecodeError, OSError):
@@ -71,6 +83,18 @@ class AdaptationEngine:
             "cooldown_s": self.cooldown_s,
             "history": self.history[-HISTORY_LIMIT:],
         }))
+
+    def reset(self) -> None:
+        """Back to defaults, as if freshly started with no learning history
+        -- see main.py's 'c' key, which pairs this with MemoryStore.clear()
+        for a full "start fresh" without restarting the process. Persists
+        immediately so a restart doesn't reload the old learned values."""
+        self.delay_s = config.ATTENTION_SEEK_DELAY_S
+        self.max_attempts = config.ATTENTION_SEEK_MAX_ATTEMPTS
+        self.cooldown_s = config.ATTENTION_SEEK_COOLDOWN_S
+        self.history = []
+        self._pending_attempt_t = None
+        self.save()
 
     # -- events, called from main.py as it observes FSM state transitions --
 

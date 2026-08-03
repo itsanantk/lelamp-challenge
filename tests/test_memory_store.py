@@ -72,3 +72,17 @@ def test_get_latest_by_class_still_matches_a_short_query_against_a_longer_stored
 
     assert obs is not None
     assert obs.object_class == "sports bottle"
+
+
+def test_clear_removes_every_observation():
+    # main.py's 'c' key -- a live wipe without restarting the process,
+    # unlike --fresh-memory which only takes effect at startup.
+    store = _store()
+    store.add_observation("cup", 0.9, bearing_deg=0.0, bbox_cx=0.5, bbox_cy=0.5, frame_group_id=1)
+    store.add_observation("bottle", 0.8, bearing_deg=10.0, bbox_cx=0.6, bbox_cy=0.5, frame_group_id=1)
+    assert store.list_known_classes() == ["bottle", "cup"]
+
+    store.clear()
+
+    assert store.list_known_classes() == []
+    assert store.get_latest_by_class("cup") is None

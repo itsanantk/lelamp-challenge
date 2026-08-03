@@ -104,12 +104,17 @@ def mirror_frame(frame: np.ndarray) -> np.ndarray:
 
 
 def pan_crop_frame(frame: np.ndarray, pan_bearing_deg: float, hfov_deg: float,
-                    zoom: float = 1.35, mirrored: bool = True) -> tuple[np.ndarray, int, float]:
+                    zoom: float = 1.35, mirrored: bool = True) -> tuple[np.ndarray, int, int, float]:
     """Crops+rescales a frame to follow pan_bearing_deg -- replicates the
     lamp visually "panning" the camera toward wherever it's currently
-    aimed. Digital crop only (never real camera PTZ). Horizontal-only --
-    the lamp's own gaze is driven by base_yaw (a pan), there's no reason
-    to also zoom vertically.
+    aimed. Digital crop only (never real camera PTZ). Panning itself is
+    horizontal-only (the lamp's own gaze is driven by base_yaw), but the
+    crop still shrinks *both* dimensions by the same zoom factor -- height
+    centered, not panned -- so resizing back up to the original frame size
+    is a uniform zoom. Cropping only the width and stretching it back to
+    the full width while height stayed untouched (an earlier version did
+    exactly this) scales X and Y by different factors, which is a
+    horizontal stretch on every single frame, not a zoom.
 
     Two callers, two frame conventions: main.py's display path calls this
     on the already-mirrored frame (mirrored=True, the default) purely as
@@ -123,16 +128,18 @@ def pan_crop_frame(frame: np.ndarray, pan_bearing_deg: float, hfov_deg: float,
     the frame a positive (user's-right) bearing sits on -- see
     mirror_detections()'s own docstring for the raw-frame convention.
 
-    Returns (cropped_frame, crop_x0_px, x_scale) so a caller can remap
-    detection boxes (or bearings) through the exact same transform instead
-    of them drifting off the object as the view pans."""
+    Returns (cropped_frame, crop_x0_px, crop_y0_px, scale) so a caller can
+    remap detection boxes (or bearings) through the exact same transform
+    instead of them drifting off the object as the view pans."""
     h, w = frame.shape[:2]
     crop_w = max(1, int(round(w / zoom)))
+    crop_h = max(1, int(round(h / zoom)))
     center_frac = (0.5 + pan_bearing_deg / hfov_deg) if mirrored else (0.5 - pan_bearing_deg / hfov_deg)
     center_frac = float(np.clip(center_frac, 0.0, 1.0))
     x0 = int(round(center_frac * w - crop_w / 2))
     x0 = max(0, min(x0, w - crop_w))
-    cropped = frame[:, x0:x0 + crop_w]
+    y0 = (h - crop_h) // 2  # always centered -- no vertical panning, just matching the zoom
+    cropped = frame[y0:y0 + crop_h, x0:x0 + crop_w]
     # INTER_NEAREST, not INTER_LINEAR -- this runs on the full display
     # frame every tick (1920x1080), and the other panel resizes in this
     # file already learned that lesson (see compose_panels/make_text_panel):
@@ -140,20 +147,23 @@ def pan_crop_frame(frame: np.ndarray, pan_bearing_deg: float, hfov_deg: float,
     # up as real per-frame latency, and nobody's looking closely enough at
     # a live webcam feed for the softer edges to matter.
     resized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_NEAREST)
-    scale = w / crop_w
-    return resized, x0, scale
+    scale = w / crop_w  # == h / crop_h, since both were cropped by the same zoom factor
+    return resized, x0, y0, scale
 
 
-def remap_boxes_for_pan(detections, crop_x0: int, x_scale: float) -> list[_MirroredDetection]:
+def remap_boxes_for_pan(detections, crop_x0: int, crop_y0: int, scale: float) -> list[_MirroredDetection]:
     """Remaps already-mirrored detection boxes (mirror_detections) through
     the same crop+resize pan_crop_frame just applied, so boxes keep
-    landing on the object instead of drifting as the view pans. Vertical
-    coordinates are untouched -- the pan/zoom is horizontal-only."""
+    landing on the object instead of drifting as the view pans. Same
+    scale factor both axes -- pan_crop_frame crops width and height by
+    the same zoom, so a box that was correct before the crop stays
+    correctly proportioned after it, not stretched on one axis."""
     out = []
     for d in detections or []:
         x1, y1, x2, y2 = d.bbox_xyxy
         out.append(_MirroredDetection(d.object_class, d.confidence,
-                                       ((x1 - crop_x0) * x_scale, y1, (x2 - crop_x0) * x_scale, y2)))
+                                       ((x1 - crop_x0) * scale, (y1 - crop_y0) * scale,
+                                        (x2 - crop_x0) * scale, (y2 - crop_y0) * scale)))
     return out
 
 

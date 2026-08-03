@@ -121,6 +121,35 @@ def test_cropped_scan_converts_the_box_back_to_the_same_global_bearing():
     assert model.last_predict_frame.shape == frame.shape
 
 
+def test_cropped_scan_converts_the_box_back_to_the_correct_vertical_position():
+    # Same round-trip idea as the bearing test above, but for the
+    # vertical axis -- pan_crop_frame crops height by the same zoom
+    # factor as width (see its own docstring on why: cropping only width
+    # scales X and Y by different factors, a visible stretch). A box
+    # placed at a known position in "scanned frame" space should convert
+    # back to the matching full-frame Y, not stay unconverted (which
+    # would silently reintroduce the stretch downstream) and not drift by
+    # some other amount.
+    w, h = 200, 100
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    zoom = 1.25
+    crop_h = h / zoom
+    y0 = (h - crop_h) / 2  # centered, no vertical panning
+    scale = h / crop_h
+
+    target_y_full = 55.0
+    y_scanned = (target_y_full - y0) * scale
+
+    model = _FakeModel({0: "bottle"}, [_FakeBox(0, 0.9, (90.0, y_scanned - 3, 110.0, y_scanned + 3))])
+    vm = _make_vision_memory(model, _FakeStore())
+
+    detections = vm.maybe_scan(frame, pan_bearing_deg=0.0, pan_zoom=zoom)
+
+    assert len(detections) == 1
+    y1, y2 = detections[0].bbox_xyxy[1], detections[0].bbox_xyxy[3]
+    assert abs((y1 + y2) / 2 - target_y_full) < 0.5
+
+
 def test_cropped_scan_stores_full_frame_bbox_coordinates():
     # Downstream code (viz.mirror_detections, draw_detections) assumes
     # bbox_xyxy is in full-raw-frame pixel space regardless of whether

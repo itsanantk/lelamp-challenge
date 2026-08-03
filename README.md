@@ -54,7 +54,8 @@ the one that's funded.
 python main.py                        # steps 1-3, live window
 python main.py --chat --voice         # + step 4, same window -- talk to it, mic in/spoken reply out
 python main.py --chat                 # + step 4 as typed chat instead of voice
-python main.py --chat --voice --multi-user   # + figure out who's talking if more than one face is in frame
+python main.py --chat --voice --no-multi-user   # skip pointing at whoever's actually talking
+                                                  # (via mouth movement) when more than one face is in frame -- on by default
 python main.py --record demo.mp4      # also saves the composite feed to recordings/
 python main.py --label                # SPACE toggles ground truth, for eval later
 ```
@@ -174,10 +175,12 @@ scope of each — what they actually do versus a "real" version.
   (`perception/audio_monitor.py`) holds off attention-seeking while the
   room's making noise (you talking, TV on). `python main.py --no-audio-gate`
   turns it off.
-- **Multi-user speaker ID** — `--chat --voice --multi-user` tracks up to
-  4 faces and picks whoever's mouth was actually moving during the
-  question, so it glances at and reasons about the right person when more
-  than one face is in frame (`perception/multi_face.py`).
+- **Multi-user speaker detection** — on by default with `--chat --voice`,
+  tracks up to 4 faces and picks whoever's mouth was actually moving
+  during the question, so it glances at and points toward the right
+  person when more than one face is in frame (`perception/multi_face.py`).
+  Shares main.py's own camera frame rather than opening a second capture
+  handle. `--no-multi-user` to disable.
 - **Emotion from voice tone** — every voice turn gets a coarse read
   (energetic/tense/quiet/calm) from loudness, pitch variability, and
   speaking rate (`conversation/emotion.py`), and the lamp flashes a

@@ -18,6 +18,8 @@ Usage:
 
 Keys (interactive mode):
     q       quit
+    c       clear stored memory and reset learned attention-seek timing (live -- unlike
+            --fresh-memory, doesn't need a restart)
     SPACE   (with --label) toggle "I am currently looking at the lamp" ground truth
 """
 from __future__ import annotations
@@ -104,8 +106,7 @@ def run(args: argparse.Namespace) -> None:
     if args.chat:
         chat_shutdown = threading.Event()
         chat_args = argparse.Namespace(no_gui=True, voice=args.voice, mute=args.mute, ask=None,
-                                        multi_user=args.multi_user, wake_word=args.wake_word,
-                                        no_speaker_id=args.no_speaker_id)
+                                        no_multi_user=args.no_multi_user, wake_word=args.wake_word)
         # store=None here on purpose -- MemoryAgent's own sqlite3 connection
         # has to be created on the thread that'll actually use it (see
         # chat.run's docstring), not handed in from this one.
@@ -222,9 +223,9 @@ def run(args: argparse.Namespace) -> None:
                                     if vision_memory is not None else [])
 
             if not args.no_camera_pan:
-                display_frame, crop_x0, crop_scale = viz.pan_crop_frame(
+                display_frame, crop_x0, crop_y0, crop_scale = viz.pan_crop_frame(
                     display_frame, pan_bearing_ema, config.CAMERA_HFOV_DEG, zoom=config.CAMERA_PAN_ZOOM)
-                mirrored_detections = viz.remap_boxes_for_pan(mirrored_detections, crop_x0, crop_scale)
+                mirrored_detections = viz.remap_boxes_for_pan(mirrored_detections, crop_x0, crop_y0, crop_scale)
 
             webcam_hud = viz.draw_webcam_hud(display_frame, reading, fsm_state.name)
             if vision_memory is not None:
@@ -246,7 +247,7 @@ def run(args: argparse.Namespace) -> None:
                     side_lines.append(f"response rate: {rate} ({s['samples']} samples)")
                 if vision_memory is not None:
                     side_lines.append("")
-                    side_lines.append("seen recently:")
+                    side_lines.append("seen recently: (c to clear)")
                     for cls in store.list_known_classes()[:8]:
                         side_lines.append(f"  - {cls}")
                     if object_watcher.active:
@@ -310,6 +311,19 @@ def run(args: argparse.Namespace) -> None:
                 break
             if args.label and key == ord(" "):
                 ground_truth_label = 1 - ground_truth_label
+            if key == ord("c") and store is not None:
+                # Live wipe, not just --fresh-memory (which only takes
+                # effect at startup) -- lets a demo/testing session reset
+                # scene memory without restarting the whole process. Also
+                # resets the adaptation engine's learned timing back to
+                # defaults, so "start fresh" actually means fresh -- a
+                # partial reset that left old learned delay/attempts in
+                # place would be a confusing half-measure.
+                store.clear()
+                if adapt_engine is not None:
+                    adapt_engine.reset()
+                    adapt_engine.apply_to(fsm)
+                print("[main] cleared stored memory and reset learned attention-seek timing")
 
             interactive_elapsed += dt
             if args.auto_quit_after is not None and interactive_elapsed >= args.auto_quit_after:
@@ -365,8 +379,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chat", action="store_true",
                     help="run the conversational recall agent on a background thread, sharing this lamp/window")
     p.add_argument("--voice", action="store_true", help="with --chat: talk instead of typing -- mic input + TTS output")
-    p.add_argument("--multi-user", action="store_true",
-                    help="with --chat --voice: identify which face was talking when more than one is in frame")
+    p.add_argument("--no-multi-user", action="store_true",
+                    help="with --chat --voice: disable pointing toward whoever's actually talking "
+                         "(via mouth movement) when more than one face is in frame")
     p.add_argument("--wake-word", type=str, default=config.WAKE_WORD,
                     help=f'with --chat --voice: phrase that wakes it up to listen (default: "{config.WAKE_WORD}")')
     p.add_argument("--no-camera-pan", action="store_true",
@@ -376,8 +391,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ambient-light", action="store_true",
                     help="enable ambient-light brightness reactivity (opt-in: brightens the "
                          "idle/engaged look in a dark room, dims it in a bright one)")
-    p.add_argument("--no-speaker-id", action="store_true",
-                    help="with --chat --voice: disable persistent voice-based speaker identification")
     args = p.parse_args()
     if args.chat and not args.voice:
         # Typed chat blocks on input(), which no shutdown_event can reach

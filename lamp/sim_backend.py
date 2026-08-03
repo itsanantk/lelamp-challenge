@@ -324,11 +324,15 @@ class SimulatedLamp(LampActuator):
 
     def _draw_mood_bars(self, canvas: np.ndarray) -> None:
         """The two dials (lamp/color.py) as actual bars, not just a color
-        you have to eyeball -- this is self._mood_warmth/_mood_brightness
-        directly (the persistent baseline set_mood() controls), not the
-        currently-displayed light, which can be transiently nudged away
-        from it by tracking/tone/ambient -- the bars show the setting,
-        not every momentary reaction on top of it."""
+        you have to eyeball. Reads back from get_current_light() (the
+        live, mid-transition displayed color) via color.to_dials(), an
+        exact inverse of from_dials() -- not self._mood_warmth/
+        _mood_brightness, which is only the persistent baseline
+        set_mood() controls and stays flat through tracking/tone/ambient
+        nudges layered on top of it. The whole point of the bars is to
+        show what's actually changing right now, so they need to move
+        when a nudge does, not just when the user explicitly changes the
+        mood."""
         s = _SCALE
         bar_w, bar_h = int(150 * s), int(14 * s)
         gap = int(28 * s)
@@ -337,9 +341,10 @@ class SimulatedLamp(LampActuator):
         font_scale = 0.42 * s
         text_w = max(1, int(1 * s))
 
+        warmth, brightness = color.to_dials(self.get_current_light())
         rows = [
-            ("WARMTH", self._mood_warmth, (25, 130, 255)),     # fill = the warm endpoint's own color
-            ("BRIGHT", self._mood_brightness, (225, 225, 225)),  # fill = a plain white -- brightness has no hue of its own
+            ("WARMTH", warmth, (25, 130, 255)),     # fill = the warm endpoint's own color
+            ("BRIGHT", brightness, (225, 225, 225)),  # fill = a plain white -- brightness has no hue of its own
         ]
         for i, (label, value, fill_color) in enumerate(rows):
             y = y0 + i * (bar_h + gap)

@@ -154,6 +154,13 @@ class MemoryStore:
         ).fetchall()
         return [Observation(*r) for r in rows]
 
+    def clear(self) -> None:
+        """Wipes every stored observation -- a live "start fresh" without
+        restarting the process (see main.py's 'c' key), unlike
+        --fresh-memory, which only takes effect at startup."""
+        self.conn.execute("DELETE FROM observations")
+        self.conn.commit()
+
     def close(self) -> None:
         self.conn.commit()  # flush anything a caller added but hasn't explicitly committed yet
         self.conn.close()
