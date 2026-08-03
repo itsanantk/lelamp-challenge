@@ -469,18 +469,21 @@ the purpose of "should I chirp for attention right now," it doesn't need
 to.
 
 **Multi-user speaker ID is visual, not audio diarization.** Real speaker
-diarization needs per-person voiceprints, a much bigger build, and this
-system has one mic, not an array, so it can't localize sound direction
-from audio alone anyway. `perception/multi_face.py` runs FaceLandmarker
-with `num_faces=4` and, while the mic is recording a question, samples
-video over the same window and tracks each face's mouth-openness. The
-face with the most mouth-movement variance over that window is the one
-talking. It's a coarse signal — someone chewing gum would confuse it —
-but it's cheap, genuinely visual, and right far more often than picking
-a face at random. `--multi-user` is opt-in rather than default, since it
-means opening a second camera handle in a process that otherwise has
-none, which can fail if `main.py` already holds the camera — handled by
-degrading to "no speaker ID" instead of crashing.
+diarization needs per-person voiceprints — an earlier version of this
+project actually tried that (resemblyzer voice embeddings), but with one
+mic and no array to localize sound direction from, it couldn't reliably
+tell who was talking from audio alone. `perception/multi_face.py` runs
+FaceLandmarker with `num_faces=4` and, while the mic is recording a
+question, samples video over the same window and tracks each face's
+mouth-openness. The face with the most mouth-movement variance over that
+window is the one talking. It's a coarse signal — someone chewing gum
+would confuse it — but it's cheap, genuinely visual, and right far more
+often than picking a face at random. It's on by default (`--no-multi-user`
+to skip it); `SpeakerDetector` takes an injectable frame source so it
+shares `vision_memory`'s already-open camera handle instead of opening a
+second one — a second concurrent handle on the same device is what many
+webcam drivers silently refuse, which is what "opt-in, degrades to no
+speaker ID" used to paper over.
 
 **A tool schema stopping hallucination isn't the same as a prompt
 stopping it.** An early system prompt said "if you haven't seen

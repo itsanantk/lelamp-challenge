@@ -23,13 +23,13 @@ checkable in one pass instead of hunting through the full writeup.
 | Behavior design — expressive and natural reactions | `lamp/motion.py`: anticipation + overshoot easing, randomized per-move so nothing repeats identically. `behavior/state_machine.py`: attention-seeking escalates in intensity across attempts instead of repeating the same gesture. `lamp/sim_backend.py`: synthesized sound cues, randomized per play. |
 | Memory system — accurate store/retrieve | `memory/store.py` (SQLite) + `conversation/agent.py` tool-use: the LLM can only answer from `recall_object_location`/`list_seen_objects` results, so it can't fabricate a location not actually in the store. |
 | Tradeoff reasoning | `docs/ARCHITECTURE.md` §3 — each design decision states the alternative considered and why it lost (e.g. head pose vs. iris tracking, discrete-burst vs. continuous object tracking). |
-| Code quality | `tests/` (52 tests, no camera/mic required), type-hinted function signatures throughout, `lamp/hal.py` as the actuator boundary so `lamp/real_backend.py` is a drop-in swap. |
+| Code quality | `tests/` (146 tests, no camera/mic required), type-hinted function signatures throughout, `lamp/hal.py` as the actuator boundary so `lamp/real_backend.py` is a drop-in swap. |
 
 ## Bonus challenges
 
 | Bonus | Where |
 |---|---|
-| Multi-user interaction (who's speaking) | `perception/multi_face.py` — mouth-openness variance across tracked faces, `chat.py --voice --multi-user` |
+| Multi-user interaction (who's speaking) | `perception/multi_face.py` — mouth-openness variance across tracked faces, on by default with `chat.py --voice` (`--no-multi-user` to skip it) |
 | Emotion detection from voice tone | `conversation/emotion.py` — loudness/pitch-variability/speaking-rate heuristic |
 | Self-learning behavior | `behavior/adaptation.py` — bounded adjustment of attention-seek delay/cooldown/max-attempts based on response rate |
 | Interruption awareness | `perception/audio_monitor.py` — energy-based mic gate holds off attention-seeking while the room's active |

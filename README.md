@@ -191,7 +191,9 @@ scope of each — what they actually do versus a "real" version.
   the delay/cooldown/max-tries within fixed bounds accordingly, persisted
   to `logs/adaptation_state.json` across runs. HUD shows the currently
   learned values. `python main.py --no-adapt` disables it,
-  `--fresh-adaptation` wipes the learned state and starts over.
+  `--fresh-adaptation` wipes the learned state and starts over at
+  startup; the `c` key does the same live, mid-session, alongside
+  clearing scene memory.
 
 ### Recording the actual video
 
