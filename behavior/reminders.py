@@ -67,6 +67,14 @@ KINDS = ("recurring", "presence", "object_check")
 # away," so there's no cost to waiting a bit longer to be sure.
 PRESENCE_ABSENCE_DEBOUNCE_S = 1.5
 
+
+def _fmt_duration(seconds: float) -> str:
+    """"3s" / "12min" -- whichever reads more naturally at that
+    magnitude, for active_summaries()'s countdown/overdue display."""
+    seconds = max(0.0, seconds)
+    return f"{seconds:.0f}s" if seconds < 120 else f"{seconds / 60:.0f}min"
+
+
 # Additive off get_current_pose(), same "nudge, don't replace" convention
 # as every other reactive gesture in this codebase (chat.py's
 # _jerk_back/_droop, object_watch.py's play_wave_back) -- a single
@@ -224,9 +232,12 @@ class ReminderEngine:
         """One short line per active reminder, for main.py's HUD panel --
         not the full message (that can be a whole sentence), just enough
         to recognize which one it is at a glance. now is optional -- only
-        needed to show remaining time on a reminder that has an
-        expiration; omit it (e.g. right after add(), with nothing to tick
-        against yet) and that part is just left off."""
+        needed to show remaining/elapsed time; omit it (e.g. right after
+        add(), with nothing to tick against yet) and those parts are just
+        left off. The due-at/overdue-by countdown exists specifically as
+        the debugging aid live testing asked for -- "did this actually
+        fire near its deadline, or is it just slow?" is otherwise
+        invisible without watching timestamps in the console."""
         lines = []
         for r in self.reminders:
             if not r.active:
@@ -239,14 +250,17 @@ class ReminderEngine:
                     status = "watching for placement"
                 elif r.due_for_check:
                     status = "checking now"
+                elif r.due_at is not None and now is not None:
+                    remaining = r.due_at - now
+                    status = f"due in {_fmt_duration(remaining)}" if remaining >= 0 \
+                        else f"overdue by {_fmt_duration(-remaining)}"
                 else:
                     status = "waiting for deadline"
                 line = f"#{r.id} {r.object_class} ({status}): {label}"
             else:
                 line = f"#{r.id} on leaving desk: {label}"
             if r.expires_at is not None and now is not None:
-                remaining = max(0.0, r.expires_at - now)
-                line += f" (expires in {remaining:.0f}s)" if remaining < 120 else f" (expires in {remaining / 60:.0f}min)"
+                line += f" (expires in {_fmt_duration(r.expires_at - now)})"
             lines.append(line)
         return lines
 
@@ -323,6 +337,18 @@ class ReminderEngine:
                         r.due_for_check = True
                         r._check_dispatched = True
                         fired_any = True
+                        # Timestamped on purpose -- live testing asked for
+                        # exactly this: a way to see whether a late-feeling
+                        # reminder was actually late hitting its deadline,
+                        # or the deadline landed on time and the *judgment*
+                        # (vision-LLM round trip + TTS, in chat.py's poller)
+                        # is what took a few extra seconds. Compare this
+                        # line's clock time against _resolve_object_check_
+                        # judgment's own "[reminder] <resolved text>" print.
+                        late_by = now - r.due_at
+                        print(f"[reminder] #{r.id} deadline reached at "
+                              f"{time.strftime('%H:%M:%S', time.localtime(now))} "
+                              f"({late_by:.1f}s after due_at) -- dispatching to vision judgment")
                     else:
                         if vision_memory is not None:
                             vision_memory.request_immediate_scan()  # best-effort -- doesn't block this fire

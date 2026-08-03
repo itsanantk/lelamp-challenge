@@ -227,7 +227,11 @@ def _resolve_object_check_judgment(reminder, reminder_engine, lamp: SimulatedLam
     # -- same honest-degradation idea as every other imperfect vision read
     # in this project, rather than silently saying nothing at all.
     reply = f"{reminder.message} {answer}" if answer else reminder.message
-    print(f"[reminder] {reply}")
+    # Timestamped to match behavior/reminders.py's own "deadline reached
+    # at HH:MM:SS" print -- the gap between the two clock times is exactly
+    # how long judgment (vision-LLM round trip + settle time) added on top
+    # of the deadline itself, the debugging aid live testing asked for.
+    print(f"[reminder] resolved at {time.strftime('%H:%M:%S')}: {reply}")
     lamp.play_sound("recall_point")  # the existing "found it" chime -- this is a recall confirmation too
     voice.speak(reply)
     reminder.active = False
@@ -684,6 +688,25 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
         return
 
     last_engaged_seen_t: float | None = None
+
+    def _check_engaged() -> bool:
+        """Was fsm recently ENGAGED (within _ENGAGED_WAKE_GRACE_S), not
+        just "is it ENGAGED at this exact instant" -- see the comment
+        below on why the grace window exists. Also passed as
+        wait_for_wake_word's is_engaged callback, polled once per chunk
+        cycle *while that call is already blocking* -- without that, this
+        only ever got checked once, right before deciding whether to call
+        wait_for_wake_word at all, so someone who became engaged a moment
+        after that single check (e.g. during the process's own startup
+        lag -- Whisper's preload alone takes 10-15s) stayed stuck
+        demanding the spoken phrase for the rest of that blocking call
+        with no way to notice they were already being looked at."""
+        nonlocal last_engaged_seen_t
+        if fsm is not None and fsm.state == State.ENGAGED:
+            last_engaged_seen_t = time.monotonic()
+        return last_engaged_seen_t is not None and \
+            time.monotonic() - last_engaged_seen_t < _ENGAGED_WAKE_GRACE_S
+
     try:
         in_conversation = False  # True while listening for a follow-up without needing the wake word again
         while True:
@@ -718,12 +741,15 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
                 # short memory of "was recently engaged," independent of
                 # the FSM's own fast dwell tuning, so a normal glance away
                 # doesn't re-arm the wake-word gate.
-                if fsm is not None and fsm.state == State.ENGAGED:
-                    last_engaged_seen_t = time.monotonic()
-                engaged_now = last_engaged_seen_t is not None and \
-                    time.monotonic() - last_engaged_seen_t < _ENGAGED_WAKE_GRACE_S
+                engaged_now = _check_engaged()
                 if not in_conversation and not engaged_now:
-                    woken = voice.wait_for_wake_word(args.wake_word, shutdown_event=shutdown_event)
+                    # is_engaged=_check_engaged so a person who becomes
+                    # engaged *while this call is already blocking* still
+                    # short-circuits the wait instead of staying stuck
+                    # demanding the spoken phrase -- see _check_engaged's
+                    # own docstring.
+                    woken = voice.wait_for_wake_word(args.wake_word, shutdown_event=shutdown_event,
+                                                      is_engaged=_check_engaged)
                     if woken == "quit":
                         break
                     lamp.play_sound("wake")

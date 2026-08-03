@@ -551,6 +551,66 @@ def test_being_engaged_skips_the_wake_word_gate_entirely(monkeypatch):
     assert calls == [chat.config.CONVERSATION_FOLLOWUP_TIMEOUT_S]
 
 
+def test_wait_for_wake_word_is_given_a_working_is_engaged_callback(monkeypatch):
+    # Not engaged at the moment wait_for_wake_word is entered (DISENGAGED
+    # here), so it must be called -- but it must be handed a real
+    # is_engaged callback (not None), so that if the person becomes
+    # engaged *while that call is already blocking* it can short-circuit
+    # instead of staying stuck demanding the spoken phrase for the rest
+    # of that blocking call (see voice.wait_for_wake_word's own docstring
+    # on why this matters -- confirmed missing in live testing).
+    fsm = _FakeFSM(State.DISENGAGED)
+    seen_is_engaged = []
+
+    def _fake_wait_for_wake_word(wake_word, shutdown_event=None, is_engaged=None):
+        seen_is_engaged.append(is_engaged)
+        # Simulate the real function detecting engagement mid-call, the
+        # way it would if the caller actually looked at the lamp while
+        # this was already blocking.
+        return "engaged"
+
+    monkeypatch.setattr(chat.voice, "preload", lambda: None)
+    monkeypatch.setattr(chat.voice, "wait_for_wake_word", _fake_wait_for_wake_word)
+
+    calls = {"n": 0}
+
+    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None, **_kwargs):
+        calls["n"] += 1
+        return "quit", None, 0, np.zeros(1600, dtype="float32")
+
+    monkeypatch.setattr(chat, "_listen", _fake_listen)
+
+    class _FakeAgent:
+        def __init__(self, store, get_frame=None):
+            self.last_light_action = None
+            self.last_reminder_action = None
+            self.last_recall = type("R", (), {"observation": None})()
+
+        def ask(self, question):
+            return "reply"
+
+    monkeypatch.setattr(chat, "MemoryAgent", _FakeAgent)
+
+    class _FakeStore:
+        def list_known_classes(self):
+            return []
+
+        def close(self):
+            pass
+
+    args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
+                               no_multi_user=True, wake_word="hey lamp")
+
+    chat.run(args, lamp=_FakeLamp(), store=_FakeStore(), fsm=fsm)
+
+    assert len(seen_is_engaged) == 1
+    assert seen_is_engaged[0] is not None and callable(seen_is_engaged[0])
+    # "engaged" (not "quit") must fall through to the same wake-sound +
+    # listen path "wake" already takes -- it did reach _listen(), not
+    # crash or loop forever.
+    assert calls["n"] == 1
+
+
 def test_relax_to_idle_does_not_fight_an_active_engaged_look():
     # If the follow-up window lapses while the person is still right
     # there (still ENGAGED), BehaviorFSM's own look-at-you pose/color is

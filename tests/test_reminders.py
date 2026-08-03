@@ -509,5 +509,47 @@ def test_active_summaries_describes_object_check_status():
     assert "watching for placement" in summary
 
 
+def test_active_summaries_shows_a_countdown_once_placement_is_confirmed():
+    # The debugging aid live testing asked for -- "is this actually near
+    # its deadline, or just slow" needs to be visible without reading
+    # timestamps out of the console.
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check your water", object_class="bottle", due_in_s=120.0)
+    r.placement_confirmed = True
+
+    summary = engine.active_summaries(now=r.created_at + 60.0)[0]
+
+    assert "due in 60s" in summary
+
+
+def test_active_summaries_shows_overdue_once_the_deadline_has_passed():
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check your water", object_class="bottle", due_in_s=10.0)
+    r.placement_confirmed = True
+
+    summary = engine.active_summaries(now=r.created_at + 15.0)[0]
+
+    assert "overdue by 5s" in summary
+
+
+def test_fmt_duration_switches_to_minutes_past_two_minutes():
+    assert reminders_mod._fmt_duration(45.0) == "45s"
+    assert reminders_mod._fmt_duration(125.0) == "2min"
+
+
+def test_tick_prints_a_timestamped_deadline_reached_line_for_object_check(capsys):
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check", object_class="bottle", due_in_s=1.0,
+                    check_question="is this bottle full or empty")
+    r.tracked_bearing = 0.0
+    r.placement_confirmed = True
+
+    engine.tick(now=r.created_at + 5.0, face_found=True, lamp=_FakeLamp(), vision_memory=_FakeVisionMemory())
+
+    out = capsys.readouterr().out
+    assert "deadline reached" in out
+    assert "4.0s after due_at" in out
+
+
 if __name__ == "__main__":
     print("Run with pytest -- this file relies on monkeypatch fixtures.")

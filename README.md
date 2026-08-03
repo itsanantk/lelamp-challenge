@@ -247,6 +247,15 @@ Any kind can also be scoped to a limited window -- "only check for the
 next 20 seconds," "just for the next hour" -- after which it deactivates
 on its own instead of running until explicitly cancelled.
 
+The HUD's reminders panel shows a live countdown ("due in 8s") or
+"overdue by Xs" once an object check's placement is confirmed, and the
+console prints two timestamped lines for a judged check -- "deadline
+reached at HH:MM:SS" (from `behavior/reminders.py`'s tick) and "resolved
+at HH:MM:SS" (from `chat.py`'s judgment poller) -- specifically so a
+reminder that feels late is easy to attribute: was the deadline itself
+late, or did the vision-LLM round trip + TTS after it take a few seconds
+(the more common case)?
+
 Firing plays a physical reaction (a wiggle, or a point at the remembered
 spot for an object check), a sound cue, and speaks the message aloud on a
 background thread (so firing one doesn't stutter the render loop for the

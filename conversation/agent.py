@@ -536,8 +536,18 @@ class MemoryAgent:
         if not ok:
             return None
         b64 = base64.b64encode(jpeg.tobytes()).decode("ascii")
-        prompt = (f"Looking only at what's visible in this image, answer in one short, "
-                  f"spoken-out-loud-friendly sentence: {question}")
+        # Without this framing, a generic vision-model answer reads in
+        # third person ("he was looking at the camera") -- wrong on both
+        # counts here: this image IS your own camera view (first person,
+        # not a device you're describing from outside), and whoever's in
+        # frame is the person you're talking to (second person, not a
+        # third party being described to someone else).
+        prompt = (f"This is what you're currently looking at through your own camera -- speak "
+                  f"about it in first person as your own view ('I can see...', not describing a "
+                  f"separate device), and address whoever's in frame as \"you\" (they're the "
+                  f"person you're talking to, not someone else being described). Looking only "
+                  f"at what's actually visible, answer in one short, spoken-out-loud-friendly "
+                  f"sentence: {question}")
         try:
             if self.provider == "openai":
                 response = self.client.chat.completions.create(

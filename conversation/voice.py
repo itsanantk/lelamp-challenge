@@ -244,7 +244,8 @@ def _print_input_device_once() -> None:
 
 def wait_for_wake_word(wake_word: str = config.WAKE_WORD, chunk_s: float = config.WAKE_CHUNK_S,
                         samplerate: int = config.VOICE_SAMPLE_RATE,
-                        shutdown_event: threading.Event | None = None) -> str:
+                        shutdown_event: threading.Event | None = None,
+                        is_engaged: Callable[[], bool] | None = None) -> str:
     """Blocks until wake_word or a quit word is heard, and returns which
     ("wake" or "quit"). Recognizing quit here too -- not just as an answer
     to "what's your question" -- matters because without it there'd be no
@@ -288,7 +289,19 @@ def wait_for_wake_word(wake_word: str = config.WAKE_WORD, chunk_s: float = confi
     transcript that's never the right word means it's a Whisper accuracy
     or matching problem instead. shutdown_event, if given, returns "quit"
     on the next poll instead of blocking forever waiting for a wake word
-    that'll never come (process is shutting down)."""
+    that'll never come (process is shutting down).
+
+    is_engaged, if given, is checked once per chunk cycle -- if the
+    caller's own engagement check (chat.py's grace-windowed "was recently
+    looked at") flips true *while this call is already blocking*, this
+    returns "engaged" instead of continuing to demand the spoken phrase.
+    Without this, the caller's own engagement check only ever runs once,
+    right before deciding whether to call this at all -- committing to a
+    full wake-word wait even if the person becomes visibly engaged a
+    moment later, which is exactly what live testing showed: someone
+    already looking at it during the process's own startup lag (Whisper's
+    preload alone takes 10-15s) still got asked to say "hey lamp" the
+    whole time this was blocking with no way to notice."""
     preload()
     _print_input_device_once()
     print(f'[voice] say "{wake_word}" to talk to it, or "quit" to exit... '
@@ -308,6 +321,8 @@ def wait_for_wake_word(wake_word: str = config.WAKE_WORD, chunk_s: float = confi
             sd.sleep(int(chunk_s * 1000))
             if shutdown_event is not None and shutdown_event.is_set():
                 return "quit"
+            if is_engaged is not None and is_engaged():
+                return "engaged"
             with buffer_lock:
                 if not buffer:
                     continue
