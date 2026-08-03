@@ -57,7 +57,7 @@ def test_create_reminder_recurring_records_the_intended_action():
     assert image is None
     assert agent.last_reminder_action == {
         "action": "create", "kind": "recurring", "message": "stand up", "interval_s": 1800.0,
-        "duration_s": None,
+        "duration_s": None, "object_class": None, "due_in_s": None,
     }
 
 
@@ -84,6 +84,39 @@ def test_create_reminder_rejects_a_non_positive_duration():
         "action": "create", "kind": "presence", "message": "come back", "duration_minutes": -5,
     })
     assert result["created"] is False
+
+
+def test_create_reminder_object_check_normalizes_the_object_name():
+    # "water bottle" is a known alias for the actual tracked COCO class
+    # "bottle" (see memory/store.py's CLASS_ALIASES) -- the tool should
+    # resolve it server-side, the same normalize_class() recall_object_location
+    # already relies on, not expect the LLM to know the exact vocabulary.
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "object_check", "object_name": "water bottle",
+        "deadline_minutes": 60, "message": "did you finish your water?",
+    })
+    assert result == {"created": True, "kind": "object_check"}
+    assert agent.last_reminder_action["object_class"] == "bottle"
+    assert agent.last_reminder_action["due_in_s"] == 3600.0
+
+
+def test_create_reminder_object_check_requires_an_object_name():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "object_check", "deadline_minutes": 60, "message": "x",
+    })
+    assert result["created"] is False
+    assert agent.last_reminder_action is None
+
+
+def test_create_reminder_object_check_requires_a_deadline():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "object_check", "object_name": "bottle", "message": "x",
+    })
+    assert result["created"] is False
+    assert agent.last_reminder_action is None
 
 
 def test_create_reminder_presence_does_not_require_an_interval():

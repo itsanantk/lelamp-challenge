@@ -52,6 +52,21 @@ class _FakeLamp:
         self.sounds.append(event)
 
 
+class _FakeDetection:
+    def __init__(self, object_class, bearing_deg):
+        self.object_class = object_class
+        self.bearing_deg = bearing_deg
+
+
+class _FakeVisionMemory:
+    def __init__(self, detections=None):
+        self.last_detections = detections or []
+        self.immediate_scans_requested = 0
+
+    def request_immediate_scan(self):
+        self.immediate_scans_requested += 1
+
+
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     # Same reasoning as test_adaptation.py's _isolate_state_path -- every
@@ -309,6 +324,146 @@ def test_active_summaries_only_lists_active_reminders():
 
     assert len(summaries) == 1
     assert "stand up" in summaries[0]
+
+
+def test_object_check_does_not_confirm_placement_before_the_object_is_seen():
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check your water", object_class="bottle", due_in_s=3600.0)
+    lamp = _FakeLamp()
+    vm = _FakeVisionMemory(detections=[])
+
+    engine.tick(now=r.created_at + 5.0, face_found=True, lamp=lamp, vision_memory=vm)
+
+    assert not r.placement_confirmed
+    assert r.tracked_bearing is None
+
+
+def test_object_check_starts_the_settle_clock_on_first_sighting():
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check your water", object_class="bottle", due_in_s=3600.0)
+    lamp = _FakeLamp()
+    vm = _FakeVisionMemory(detections=[_FakeDetection("bottle", 15.0)])
+
+    engine.tick(now=r.created_at, face_found=True, lamp=lamp, vision_memory=vm)
+
+    assert r.tracked_bearing == 15.0
+    assert not r.placement_confirmed  # seen, but not yet held still long enough
+
+
+def test_object_check_confirms_placement_once_it_holds_still_long_enough():
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check your water", object_class="bottle", due_in_s=3600.0)
+    lamp = _FakeLamp()
+    vm = _FakeVisionMemory(detections=[_FakeDetection("bottle", 15.0)])
+
+    engine.tick(now=r.created_at, face_found=True, lamp=lamp, vision_memory=vm)
+    engine.tick(now=r.created_at + reminders_mod.config.WATCH_STATIONARY_TIMEOUT_S + 0.1,
+                face_found=True, lamp=lamp, vision_memory=vm)
+
+    assert r.placement_confirmed
+    assert r.tracked_bearing == 15.0
+    assert lamp.sounds == []  # confirming placement isn't firing -- just bookkeeping
+
+
+def test_object_check_a_real_move_resets_the_settle_clock():
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check your water", object_class="bottle", due_in_s=3600.0)
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at, face_found=True, lamp=lamp,
+                vision_memory=_FakeVisionMemory([_FakeDetection("bottle", 15.0)]))
+    # Nearly settled, then it moves to a clearly different spot -- should
+    # NOT confirm at the old timing, the clock restarts from the move.
+    almost_settled = r.created_at + reminders_mod.config.WATCH_STATIONARY_TIMEOUT_S - 0.1
+    engine.tick(now=almost_settled, face_found=True, lamp=lamp,
+                vision_memory=_FakeVisionMemory([_FakeDetection("bottle", 60.0)]))
+    engine.tick(now=almost_settled + 0.2, face_found=True, lamp=lamp,
+                vision_memory=_FakeVisionMemory([_FakeDetection("bottle", 60.0)]))
+
+    assert not r.placement_confirmed
+    assert r.tracked_bearing == 60.0
+
+
+def test_object_check_fires_by_pointing_at_the_bearing_once_the_deadline_hits():
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="did you finish your water?",
+                    object_class="bottle", due_in_s=3600.0)
+    r.tracked_bearing = 22.0
+    r.placement_confirmed = True
+    lamp = _FakeLamp()
+    vm = _FakeVisionMemory()
+
+    engine.tick(now=r.created_at + 3600.0 + 1.0, face_found=True, lamp=lamp, vision_memory=vm)
+
+    assert lamp.sounds == ["attention_seek"]
+    assert len(lamp.pose_calls) == 1
+    assert vm.immediate_scans_requested == 1  # best-effort rescan nudge
+
+
+def test_object_check_deactivates_itself_after_firing_one_shot():
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check", object_class="bottle", due_in_s=10.0)
+    r.tracked_bearing = 0.0
+    r.placement_confirmed = True
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at + 11.0, face_found=True, lamp=lamp, vision_memory=_FakeVisionMemory())
+
+    assert not r.active
+    # Ticking again well past the deadline must not fire it a second time.
+    engine.tick(now=r.created_at + 100.0, face_found=True, lamp=lamp, vision_memory=_FakeVisionMemory())
+    assert lamp.sounds == ["attention_seek"]
+
+
+def test_object_check_does_not_fire_before_placement_is_confirmed_even_past_the_deadline():
+    # An object never seen/settled has nothing to check on -- must not
+    # fire (and definitely must not point at bearing=None).
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check", object_class="bottle", due_in_s=1.0)
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at + 100.0, face_found=True, lamp=lamp, vision_memory=_FakeVisionMemory())
+
+    assert lamp.sounds == []
+    assert r.active  # still waiting -- not expired (no duration set) and never got to fire
+
+
+def test_object_check_without_vision_memory_never_confirms_placement():
+    # vision_memory is None in a session with no camera loop -- must
+    # degrade to a harmless no-op, not crash.
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check", object_class="bottle", due_in_s=3600.0)
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at + 5.0, face_found=True, lamp=lamp, vision_memory=None)
+
+    assert not r.placement_confirmed
+    assert lamp.sounds == []
+
+
+def test_pending_placement_classes_only_includes_unconfirmed_object_checks():
+    engine = ReminderEngine()
+    r1 = engine.add(kind="object_check", message="a", object_class="bottle", due_in_s=3600.0)
+    r2 = engine.add(kind="object_check", message="b", object_class="cell phone", due_in_s=3600.0)
+    engine.add(kind="recurring", message="c", interval_s=60.0)  # no object_class -- must not appear
+
+    assert set(engine.pending_placement_classes()) == {"bottle", "cell phone"}
+
+    r2.placement_confirmed = True
+    assert engine.pending_placement_classes() == ["bottle"]
+
+    r1.active = False
+    assert engine.pending_placement_classes() == []
+
+
+def test_active_summaries_describes_object_check_status():
+    engine = ReminderEngine()
+    engine.add(kind="object_check", message="check your water", object_class="bottle", due_in_s=3600.0)
+
+    summary = engine.active_summaries()[0]
+
+    assert "bottle" in summary
+    assert "watching for placement" in summary
 
 
 if __name__ == "__main__":

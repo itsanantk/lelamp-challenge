@@ -123,9 +123,11 @@ class _FakeReminderEngine:
         self.added = []
         self.cancelled = []
 
-    def add(self, kind, message, interval_s=None, duration_s=None):
-        self.added.append((kind, message, interval_s, duration_s))
+    def add(self, kind, message, interval_s=None, duration_s=None, object_class=None, due_in_s=None):
+        self.added.append((kind, message, interval_s, duration_s, object_class, due_in_s))
         return type("R", (), {"id": 1, "kind": kind, "message": message, "interval_s": interval_s,
+                               "object_class": object_class,
+                               "due_at": (time.time() + due_in_s) if due_in_s else None,
                                "expires_at": (time.time() + duration_s) if duration_s else None})()
 
     def cancel_all(self, kind=None):
@@ -137,7 +139,7 @@ def test_apply_reminder_action_create_adds_to_the_engine():
     engine = _FakeReminderEngine()
     chat._apply_reminder_action(
         {"action": "create", "kind": "recurring", "message": "stand up", "interval_s": 1800.0}, engine)
-    assert engine.added == [("recurring", "stand up", 1800.0, None)]
+    assert engine.added == [("recurring", "stand up", 1800.0, None, None, None)]
 
 
 def test_apply_reminder_action_create_passes_a_duration_through():
@@ -145,7 +147,15 @@ def test_apply_reminder_action_create_passes_a_duration_through():
     chat._apply_reminder_action(
         {"action": "create", "kind": "presence", "message": "come back", "interval_s": None,
          "duration_s": 20.0}, engine)
-    assert engine.added == [("presence", "come back", None, 20.0)]
+    assert engine.added == [("presence", "come back", None, 20.0, None, None)]
+
+
+def test_apply_reminder_action_create_passes_object_check_fields_through():
+    engine = _FakeReminderEngine()
+    chat._apply_reminder_action(
+        {"action": "create", "kind": "object_check", "message": "did you finish your water?",
+         "interval_s": None, "object_class": "bottle", "due_in_s": 3600.0}, engine)
+    assert engine.added == [("object_check", "did you finish your water?", None, None, "bottle", 3600.0)]
 
 
 def test_apply_reminder_action_cancel_targets_the_engine():

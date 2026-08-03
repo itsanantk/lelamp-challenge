@@ -203,7 +203,7 @@ scope of each — what they actually do versus a "real" version.
 Not one of the four challenge bonuses, but built the same way -- ask it to
 watch something and check back on its own, no further prompting needed
 (`behavior/reminders.py`, requires `--chat --voice` or `--chat` since it's
-created via conversation). Two kinds so far:
+created via conversation). Three kinds:
 
 - **Recurring** — "make sure I get up every 30 minutes." Fires on a fixed
   interval, resets, repeats.
@@ -213,23 +213,38 @@ created via conversation). Two kinds so far:
   out during the head motion of actually standing up, which fired this
   multiple times in the same second before the debounce), then re-arms
   once you're back.
+- **Object check** — "make sure I drink my water by 6" / "check on my
+  water bottle in an hour." Watches wherever the object (resolved through
+  the same class aliasing `recall_object_location` uses, so "water
+  bottle" -> the tracked `bottle` class) settles -- reusing
+  `behavior/object_watch.py`'s own stillness thresholds for a consistent
+  feel, but its own independent bookkeeping, since `ObjectWatcher` can
+  only actively watch one object at a time and might be busy with
+  something else. Once it's confirmed as set down, the lamp stops
+  actively tracking it (it briefly joins `ObjectWatcher.tracked_classes`
+  while awaiting placement, purely for the visible "the lamp noticed too"
+  reaction) and just waits. At the deadline it points back at the
+  remembered spot, requests a fresh scan, and announces itself -- one-shot,
+  not repeating. Can't yet judge what it sees (a full vs. empty bottle);
+  that's the next addition, on top of the same placement-tracking this
+  stage built.
 
-Either kind can also be scoped to a limited window -- "only check for the
+Any kind can also be scoped to a limited window -- "only check for the
 next 20 seconds," "just for the next hour" -- after which it deactivates
 on its own instead of running until explicitly cancelled.
 
-Both fire the same way: a physical wiggle, a sound cue, and the message
-spoken aloud on a background thread (so firing one doesn't stutter the
-render loop for the length of the TTS clip). "Stop reminding me"/"cancel
-that" cancels active reminders through the same tool. Persisted to
-`logs/reminders.json` across runs, same pattern as adaptation state;
-`--no-reminders` disables it, `--fresh-reminders` wipes it at startup, and
-the `c` key cancels everything active, live.
+Firing plays a physical reaction (a wiggle, or a point at the remembered
+spot for an object check), a sound cue, and speaks the message aloud on a
+background thread (so firing one doesn't stutter the render loop for the
+length of the TTS clip). "Stop reminding me"/"cancel that" cancels active
+reminders through the same tool. Persisted to `logs/reminders.json` across
+runs, same pattern as adaptation state; `--no-reminders` disables it,
+`--fresh-reminders` wipes it at startup, and the `c` key cancels
+everything active, live.
 
-A third kind — track where an object gets set down (e.g. a water bottle),
-then check on it and its contents at a deadline via a vision-LLM look —
-is a deliberate later addition; it needs placement-tracking and
-vision-judgment machinery this first pass doesn't have yet.
+The current time is included in the LLM's context specifically so it can
+resolve a deadline like "by 6pm" into minutes-from-now itself -- nothing
+else in its context otherwise tells it what time it currently is.
 
 ### Recording the actual video
 

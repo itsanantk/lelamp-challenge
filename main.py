@@ -173,15 +173,24 @@ def run(args: argparse.Namespace) -> None:
             prev_fsm_state = fsm_state
 
             if reminder_engine is not None:
+                # Ticks regardless of vision_memory -- recurring/presence
+                # reminders don't need it at all (--no-memory shouldn't
+                # silently break them too), only object_check's own
+                # placement tracking does, and that's a no-op internally
+                # when vision_memory is None (see _update_placement).
                 # time.time() (wall clock), not the perf_counter-based
-                # `now`/`dt` above -- reminders persist across restarts
-                # and compare against real elapsed time, which
-                # perf_counter's arbitrary per-process origin can't do.
-                # face_found (not fsm_state/engaged) is presence's actual
-                # signal -- "did I get up from my desk" means "is a face
-                # even in frame," not "am I currently looking at the
-                # lamp specifically."
-                reminder_engine.tick(time.time(), reading.face_found if reading else False, lamp)
+                # `now`/`dt` above -- reminders persist across restarts and
+                # compare against real elapsed time, which perf_counter's
+                # arbitrary per-process origin can't do. face_found (not
+                # fsm_state/engaged) is presence's actual signal -- "did I
+                # get up from my desk" means "is a face even in frame,"
+                # not "am I currently looking at the lamp specifically."
+                # Uses vision_memory.last_detections from *last* tick's
+                # scan here (maybe_scan() for this tick hasn't run yet
+                # below) -- harmless, detections only refresh every
+                # 0.35s/0.18s anyway, one tick's staleness is nothing.
+                reminder_engine.tick(time.time(), reading.face_found if reading else False,
+                                      lamp, vision_memory=vision_memory)
 
             if not args.no_camera_pan:
                 # base_yaw is the same degrees-of-bearing convention as
@@ -213,6 +222,17 @@ def run(args: argparse.Namespace) -> None:
                 scanned = vision_memory.maybe_scan(frame, pan_bearing_deg=pan_bearing_ema, pan_zoom=pan_zoom)
                 if scanned is not None:  # only a real sample on ticks that actually ran YOLO
                     yolo_latency_ms = vision_memory.last_scan_latency_ms
+                if reminder_engine is not None:
+                    # Recomputed fresh each tick from reminder_engine's own
+                    # source of truth, not incrementally mutated -- avoids
+                    # a ref-counting bug where two simultaneous object_check
+                    # reminders on the same class, or a race between adding
+                    # and removing, could leave the wrong classes tracked.
+                    # After maybe_scan() above (this tick's freshest
+                    # detections already landed in vision_memory), before
+                    # object_watcher.update() below, so the watcher sees
+                    # this tick's tracked_classes, not last tick's.
+                    object_watcher.tracked_classes = config.TRACKED_CLASSES + reminder_engine.pending_placement_classes()
                 # Runs before object_watcher.update() on purpose: if the
                 # sweep this tick turns an object up, object_watcher's own
                 # acquire pose (set below) needs to be the last

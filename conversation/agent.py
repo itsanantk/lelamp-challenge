@@ -16,6 +16,7 @@ actual bottleneck while building this, not architecture.
 from __future__ import annotations
 
 import base64
+import datetime
 import json
 import time
 from typing import Callable
@@ -24,12 +25,14 @@ import cv2
 import numpy as np
 
 from behavior import reminders
-from memory.store import MemoryStore, Observation, bearing_to_direction
+from memory.store import MemoryStore, Observation, bearing_to_direction, normalize_class
 import config
 
 SYSTEM_PROMPT = """You are LeLamp, a small desk lamp robot with a camera and a memory \
 of what it has recently seen on and around the desk. You're warm, brief, a little curious \
 -- talk like a helpful companion, not a search engine.
+
+{time_context}
 
 Never use emojis. Every reply gets spoken aloud through text-to-speech, and an emoji either \
 gets read out as a garbled word or silently dropped -- neither is what you'd actually want \
@@ -73,6 +76,16 @@ seconds", "just for the next hour"), pass that as duration_minutes -- without it
 stays active until explicitly cancelled. This is for ongoing self-initiated checks the lamp runs on its own, not for a \
 one-time question you can just answer directly.
 
+If the user is holding or references a specific object and wants you to check on it later \
+(e.g. "make sure I drink all my water by 6", "check on my water bottle in an hour"), that's \
+create_reminder with kind="object_check" -- pass the object as object_name (a plain noun like \
+"water bottle" or "cup", the same way you'd pass object_name to recall_object_location) and \
+the deadline as deadline_minutes, computed from the current time given above (e.g. "by 6pm" \
+when it's currently 3:45pm is 135 minutes). You'll be watching where they set the object down \
+and pointing back at it when the deadline hits -- you can't yet judge the object's contents \
+(whether a bottle is full or empty), so don't promise that in your reply, just confirm you'll \
+check on it.
+
 recall_object_location only knows a fixed list of common object types (the classes your \
 object detector recognizes) -- it has no idea what a "black water bottle" or "the blue \
 notebook" is beyond the generic class. If recall_object_location comes back found=false, or \
@@ -82,6 +95,18 @@ might be sitting in plain sight even though it isn't one of your tracked types. 
 what you can actually see in that image; if it's not visible there either, say so plainly, \
 the same as you would for a recall_object_location miss. Don't call describe_current_view \
 more than once per question -- one live look is enough."""
+
+
+def _system_prompt() -> str:
+    """SYSTEM_PROMPT with the current time filled in -- computed fresh per
+    call (not baked in at import time) since "now" obviously changes
+    across a long-running conversation. Needed for create_reminder's
+    object_check deadlines: "by 6pm" only means something if the model
+    knows what time it currently is, which nothing else in its context
+    tells it."""
+    now = datetime.datetime.now().strftime("%A, %I:%M %p").replace(" 0", " ")
+    return SYSTEM_PROMPT.format(time_context=f"The current time is {now}.")
+
 
 # "dim" and "on" are relative to whatever's currently showing (dim steps
 # down, on restores to a plain default); the rest are absolute presets.
@@ -125,9 +150,11 @@ TOOL_SPECS = [
         "name": "create_reminder",
         "description": "Create or cancel a self-initiated timed check the lamp runs on its "
                         "own, without being asked again -- 'make sure I get up every 30 "
-                        "minutes' (recurring) or 'make sure I don't get up from my desk' / "
-                        "'tell me if I leave' (presence). Also handles cancelling ('stop "
-                        "reminding me', 'cancel that', 'never mind about the check-ins').",
+                        "minutes' (recurring), 'make sure I don't get up from my desk' / "
+                        "'tell me if I leave' (presence), or 'make sure I drink my water by "
+                        "6' / 'check on my bottle in an hour' (object_check). Also handles "
+                        "cancelling ('stop reminding me', 'cancel that', 'never mind about "
+                        "the check-ins').",
         "params": {
             "action": {"type": "string", "enum": ["create", "cancel"],
                        "description": "'create' a new reminder, or 'cancel' existing one(s)"},
@@ -135,19 +162,35 @@ TOOL_SPECS = [
                      "description": "'recurring': fires repeatedly on a fixed interval (e.g. "
                                      "every 30 minutes). 'presence': fires once each time the "
                                      "user leaves the desk (a face stops being detected), then "
-                                     "re-arms once they're back. Required for a 'create' action; "
-                                     "for 'cancel', omit to cancel every active reminder instead "
-                                     "of just one kind."},
+                                     "re-arms once they're back. 'object_check': watches where a "
+                                     "named object gets set down, then points back at it and "
+                                     "checks in at a deadline -- for 'make sure I do something "
+                                     "with X by/in a certain time.' Required for a 'create' "
+                                     "action; for 'cancel', omit to cancel every active reminder "
+                                     "instead of just one kind."},
             "interval_minutes": {"type": "number",
                                   "description": "required when creating a 'recurring' reminder "
                                                   "-- how often it fires, in minutes"},
+            "object_name": {"type": "string",
+                             "description": "required when creating an 'object_check' reminder "
+                                             "-- the object to watch, as a plain noun (e.g. "
+                                             "'water bottle', 'cup'), the same way you'd pass "
+                                             "object_name to recall_object_location"},
+            "deadline_minutes": {"type": "number",
+                                  "description": "required when creating an 'object_check' "
+                                                  "reminder -- minutes from now until the check, "
+                                                  "computed from the current time given above "
+                                                  "(e.g. 'by 6pm' when it's 3:45pm now is 135)"},
             "duration_minutes": {"type": "number",
-                                  "description": "optional, either kind -- if the user only wants "
-                                                  "this active for a limited time ('only check for "
-                                                  "the next 20 seconds', 'just for the next hour'), "
-                                                  "how long from now until it should stop checking "
-                                                  "on its own, in minutes. Omit for a reminder that "
-                                                  "should stay active until explicitly cancelled."},
+                                  "description": "optional, for 'recurring'/'presence' only -- if "
+                                                  "the user only wants this active for a limited "
+                                                  "time ('only check for the next 20 seconds', "
+                                                  "'just for the next hour'), how long from now "
+                                                  "until it should stop checking on its own, in "
+                                                  "minutes. Omit for a reminder that should stay "
+                                                  "active until explicitly cancelled. Not used for "
+                                                  "'object_check' -- deadline_minutes already gives "
+                                                  "it a natural one-shot end point."},
             "message": {"type": "string",
                         "description": "required when creating a reminder -- what to say out "
                                         "loud when it fires, phrased the way you'd actually say "
@@ -286,6 +329,19 @@ class MemoryAgent:
                                 "error": "interval_minutes is required (and must be positive) "
                                          "for a recurring reminder"}, None
                     interval_s = float(minutes) * 60.0
+                object_class = None
+                due_in_s = None
+                if kind == "object_check":
+                    object_name = str(tool_input.get("object_name") or "").strip()
+                    if not object_name:
+                        return {"created": False, "error": "object_name is required for an object_check reminder"}, None
+                    deadline_minutes = tool_input.get("deadline_minutes")
+                    if not deadline_minutes or float(deadline_minutes) <= 0:
+                        return {"created": False,
+                                "error": "deadline_minutes is required (and must be positive) "
+                                         "for an object_check reminder"}, None
+                    object_class = normalize_class(object_name)
+                    due_in_s = float(deadline_minutes) * 60.0
                 duration_s = None
                 duration_minutes = tool_input.get("duration_minutes")
                 if duration_minutes:
@@ -293,7 +349,8 @@ class MemoryAgent:
                         return {"created": False, "error": "duration_minutes must be positive if given"}, None
                     duration_s = float(duration_minutes) * 60.0
                 self.last_reminder_action = {"action": "create", "kind": kind, "message": message,
-                                              "interval_s": interval_s, "duration_s": duration_s}
+                                              "interval_s": interval_s, "duration_s": duration_s,
+                                              "object_class": object_class, "due_in_s": due_in_s}
                 return {"created": True, "kind": kind}, None
             if action == "cancel":
                 kind = tool_input.get("kind")
@@ -333,9 +390,13 @@ class MemoryAgent:
     def _ask_anthropic(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
         tools = _anthropic_tools()
+        # One snapshot for the whole turn (including any tool-loop
+        # follow-ups below) -- a turn resolves in a few seconds at most,
+        # no need to re-read the clock mid-turn.
+        system_prompt = _system_prompt()
 
         response = self.client.messages.create(
-            model=config.ANTHROPIC_MODEL, max_tokens=512, system=SYSTEM_PROMPT,
+            model=config.ANTHROPIC_MODEL, max_tokens=512, system=system_prompt,
             tools=tools, messages=self.messages,
         )
         while response.stop_reason == "tool_use":
@@ -372,7 +433,7 @@ class MemoryAgent:
                     results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
             self.messages.append({"role": "user", "content": results})
             response = self.client.messages.create(
-                model=config.ANTHROPIC_MODEL, max_tokens=512, system=SYSTEM_PROMPT,
+                model=config.ANTHROPIC_MODEL, max_tokens=512, system=system_prompt,
                 tools=tools, messages=self.messages,
             )
 
@@ -382,8 +443,15 @@ class MemoryAgent:
     # -- OpenAI ----------------------------------------------------------
 
     def _ask_openai(self, user_text: str) -> str:
+        # Refreshed every turn, not just set once -- unlike Anthropic's
+        # system param (passed fresh on every messages.create() call
+        # below), OpenAI's system message lives at messages[0] and would
+        # otherwise keep whatever time was current on the *first* turn for
+        # the rest of the conversation.
         if not self.messages:
-            self.messages.append({"role": "system", "content": SYSTEM_PROMPT})
+            self.messages.append({"role": "system", "content": _system_prompt()})
+        else:
+            self.messages[0]["content"] = _system_prompt()
         self.messages.append({"role": "user", "content": user_text})
         tools = _openai_tools()
 
