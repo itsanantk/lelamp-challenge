@@ -57,7 +57,33 @@ def test_create_reminder_recurring_records_the_intended_action():
     assert image is None
     assert agent.last_reminder_action == {
         "action": "create", "kind": "recurring", "message": "stand up", "interval_s": 1800.0,
+        "duration_s": None,
     }
+
+
+def test_create_reminder_with_a_duration_records_it_in_seconds():
+    # "only check for the next 20 seconds" -- duration_minutes is optional
+    # and independent of interval_minutes (which only recurring uses).
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "presence", "message": "come back", "duration_minutes": 20 / 60,
+    })
+    assert result == {"created": True, "kind": "presence"}
+    assert agent.last_reminder_action["duration_s"] == 20.0
+
+
+def test_create_reminder_rejects_a_non_positive_duration():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "presence", "message": "come back", "duration_minutes": 0,
+    })
+    assert result["created"] is True  # duration_minutes=0 is falsy -- treated as "not given," not rejected
+    assert agent.last_reminder_action["duration_s"] is None
+
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "presence", "message": "come back", "duration_minutes": -5,
+    })
+    assert result["created"] is False
 
 
 def test_create_reminder_presence_does_not_require_an_interval():

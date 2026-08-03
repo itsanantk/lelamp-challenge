@@ -68,7 +68,9 @@ If the user asks you to set up a recurring check-in or an ongoing "make sure I..
 (e.g. "make sure I get up every 30 minutes", "make sure I don't leave my desk", "stop \
 reminding me to stand up"), call create_reminder instead of just replying in text -- same \
 reasoning as control_light, a spoken acknowledgment with no tool call wouldn't actually set \
-anything up. This is for ongoing self-initiated checks the lamp runs on its own, not for a \
+anything up. If they only want it active for a limited time ("only check for the next 20 \
+seconds", "just for the next hour"), pass that as duration_minutes -- without it, a reminder \
+stays active until explicitly cancelled. This is for ongoing self-initiated checks the lamp runs on its own, not for a \
 one-time question you can just answer directly.
 
 recall_object_location only knows a fixed list of common object types (the classes your \
@@ -139,6 +141,13 @@ TOOL_SPECS = [
             "interval_minutes": {"type": "number",
                                   "description": "required when creating a 'recurring' reminder "
                                                   "-- how often it fires, in minutes"},
+            "duration_minutes": {"type": "number",
+                                  "description": "optional, either kind -- if the user only wants "
+                                                  "this active for a limited time ('only check for "
+                                                  "the next 20 seconds', 'just for the next hour'), "
+                                                  "how long from now until it should stop checking "
+                                                  "on its own, in minutes. Omit for a reminder that "
+                                                  "should stay active until explicitly cancelled."},
             "message": {"type": "string",
                         "description": "required when creating a reminder -- what to say out "
                                         "loud when it fires, phrased the way you'd actually say "
@@ -277,8 +286,14 @@ class MemoryAgent:
                                 "error": "interval_minutes is required (and must be positive) "
                                          "for a recurring reminder"}, None
                     interval_s = float(minutes) * 60.0
+                duration_s = None
+                duration_minutes = tool_input.get("duration_minutes")
+                if duration_minutes:
+                    if float(duration_minutes) <= 0:
+                        return {"created": False, "error": "duration_minutes must be positive if given"}, None
+                    duration_s = float(duration_minutes) * 60.0
                 self.last_reminder_action = {"action": "create", "kind": kind, "message": message,
-                                              "interval_s": interval_s}
+                                              "interval_s": interval_s, "duration_s": duration_s}
                 return {"created": True, "kind": kind}, None
             if action == "cancel":
                 kind = tool_input.get("kind")

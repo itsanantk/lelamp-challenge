@@ -36,6 +36,18 @@ REMINDERS_PATH = config.LOGS_DIR / "reminders.json"
 
 KINDS = ("recurring", "presence")
 
+# face_found is a raw per-frame signal, not the hysteresis-smoothed
+# engaged/disengaged state (see perception/engagement.py) -- standing up
+# moves your head through angles that can drop out of detection for a
+# frame or two before settling on "actually gone," which fired presence
+# reminders 2-3 times in the same second on live testing. Requiring
+# face_found to have been continuously false for this long, not just
+# once, is the same dwell-time debounce idea the engagement pipeline
+# already uses for its own ENGAGE_EXIT_DWELL_FRAMES -- longer here since
+# "got up and left" is a bigger, rarer, more deliberate event than "looked
+# away," so there's no cost to waiting a bit longer to be sure.
+PRESENCE_ABSENCE_DEBOUNCE_S = 1.5
+
 # Additive off get_current_pose(), same "nudge, don't replace" convention
 # as every other reactive gesture in this codebase (chat.py's
 # _jerk_back/_droop, object_watch.py's play_wave_back) -- a single
@@ -52,8 +64,12 @@ class Reminder:
     created_at: float    # time.time() -- wall clock, so it's meaningful across a restart
     interval_s: float | None = None     # recurring only
     last_fired_at: float | None = None  # recurring only; None means "never fired yet"
+    expires_at: float | None = None     # wall-clock deadline after which this auto-deactivates,
+                                          # e.g. "only check for the next 20 seconds" -- None runs
+                                          # indefinitely until explicitly cancelled
     active: bool = True
     _was_present: bool = True  # presence only -- edge-detection state, see module docstring
+    _absent_since: float | None = None  # presence only -- debounce state, see PRESENCE_ABSENCE_DEBOUNCE_S
 
 
 def _wiggle(lamp) -> None:
@@ -99,9 +115,12 @@ class ReminderEngine:
             "next_id": self._next_id,
         }))
 
-    def add(self, kind: str, message: str, interval_s: float | None = None) -> Reminder:
-        r = Reminder(id=self._next_id, kind=kind, message=message, created_at=time.time(),
-                      interval_s=interval_s)
+    def add(self, kind: str, message: str, interval_s: float | None = None,
+            duration_s: float | None = None) -> Reminder:
+        created_at = time.time()
+        expires_at = created_at + duration_s if duration_s is not None else None
+        r = Reminder(id=self._next_id, kind=kind, message=message, created_at=created_at,
+                      interval_s=interval_s, expires_at=expires_at)
         self._next_id += 1
         self.reminders.append(r)
         self.save()
@@ -124,19 +143,26 @@ class ReminderEngine:
     def active_count(self) -> int:
         return sum(1 for r in self.reminders if r.active)
 
-    def active_summaries(self) -> list[str]:
+    def active_summaries(self, now: float | None = None) -> list[str]:
         """One short line per active reminder, for main.py's HUD panel --
         not the full message (that can be a whole sentence), just enough
-        to recognize which one it is at a glance."""
+        to recognize which one it is at a glance. now is optional -- only
+        needed to show remaining time on a reminder that has an
+        expiration; omit it (e.g. right after add(), with nothing to tick
+        against yet) and that part is just left off."""
         lines = []
         for r in self.reminders:
             if not r.active:
                 continue
             label = r.message if len(r.message) <= 40 else r.message[:37] + "..."
             if r.kind == "recurring":
-                lines.append(f"#{r.id} every {r.interval_s / 60:.0f}min: {label}")
+                line = f"#{r.id} every {r.interval_s / 60:.0f}min: {label}"
             else:
-                lines.append(f"#{r.id} on leaving desk: {label}")
+                line = f"#{r.id} on leaving desk: {label}"
+            if r.expires_at is not None and now is not None:
+                remaining = max(0.0, r.expires_at - now)
+                line += f" (expires in {remaining:.0f}s)" if remaining < 120 else f" (expires in {remaining / 60:.0f}min)"
+            lines.append(line)
         return lines
 
     def tick(self, now: float, face_found: bool, lamp) -> None:
@@ -145,8 +171,13 @@ class ReminderEngine:
         across a process restart, which perf_counter's arbitrary
         per-process origin can't do."""
         fired_any = False
+        expired_any = False
         for r in self.reminders:
             if not r.active:
+                continue
+            if r.expires_at is not None and now >= r.expires_at:
+                r.active = False
+                expired_any = True
                 continue
             if r.kind == "recurring":
                 last = r.last_fired_at if r.last_fired_at is not None else r.created_at
@@ -155,9 +186,15 @@ class ReminderEngine:
                     r.last_fired_at = now
                     fired_any = True
             elif r.kind == "presence":
-                if r._was_present and not face_found:
-                    _fire(r, lamp)
-                    fired_any = True
-                r._was_present = face_found
-        if fired_any:
+                if face_found:
+                    r._absent_since = None
+                    r._was_present = True
+                else:
+                    if r._absent_since is None:
+                        r._absent_since = now
+                    elif r._was_present and now - r._absent_since >= PRESENCE_ABSENCE_DEBOUNCE_S:
+                        _fire(r, lamp)
+                        fired_any = True
+                        r._was_present = False
+        if fired_any or expired_any:
             self.save()

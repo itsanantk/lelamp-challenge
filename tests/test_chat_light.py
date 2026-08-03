@@ -123,9 +123,10 @@ class _FakeReminderEngine:
         self.added = []
         self.cancelled = []
 
-    def add(self, kind, message, interval_s=None):
-        self.added.append((kind, message, interval_s))
-        return type("R", (), {"id": 1, "kind": kind, "message": message, "interval_s": interval_s})()
+    def add(self, kind, message, interval_s=None, duration_s=None):
+        self.added.append((kind, message, interval_s, duration_s))
+        return type("R", (), {"id": 1, "kind": kind, "message": message, "interval_s": interval_s,
+                               "expires_at": (time.time() + duration_s) if duration_s else None})()
 
     def cancel_all(self, kind=None):
         self.cancelled.append(kind)
@@ -136,7 +137,15 @@ def test_apply_reminder_action_create_adds_to_the_engine():
     engine = _FakeReminderEngine()
     chat._apply_reminder_action(
         {"action": "create", "kind": "recurring", "message": "stand up", "interval_s": 1800.0}, engine)
-    assert engine.added == [("recurring", "stand up", 1800.0)]
+    assert engine.added == [("recurring", "stand up", 1800.0, None)]
+
+
+def test_apply_reminder_action_create_passes_a_duration_through():
+    engine = _FakeReminderEngine()
+    chat._apply_reminder_action(
+        {"action": "create", "kind": "presence", "message": "come back", "interval_s": None,
+         "duration_s": 20.0}, engine)
+    assert engine.added == [("presence", "come back", None, 20.0)]
 
 
 def test_apply_reminder_action_cancel_targets_the_engine():

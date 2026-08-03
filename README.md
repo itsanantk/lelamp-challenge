@@ -208,8 +208,15 @@ created via conversation). Two kinds so far:
 - **Recurring** — "make sure I get up every 30 minutes." Fires on a fixed
   interval, resets, repeats.
 - **Presence** — "make sure I don't get up from my desk" / "tell me if I
-  leave." Fires once each time a face stops being detected, then re-arms
-  once you're back (not once per frame you're away).
+  leave." Fires once each time presence is lost for a sustained ~1.5s (not
+  a single flickered frame -- raw per-frame face detection briefly drops
+  out during the head motion of actually standing up, which fired this
+  multiple times in the same second before the debounce), then re-arms
+  once you're back.
+
+Either kind can also be scoped to a limited window -- "only check for the
+next 20 seconds," "just for the next hour" -- after which it deactivates
+on its own instead of running until explicitly cancelled.
 
 Both fire the same way: a physical wiggle, a sound cue, and the message
 spoken aloud on a background thread (so firing one doesn't stutter the

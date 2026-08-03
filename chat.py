@@ -184,9 +184,11 @@ def _apply_reminder_action(reminder_action: dict, reminder_engine) -> None:
         return
     if reminder_action["action"] == "create":
         r = reminder_engine.add(kind=reminder_action["kind"], message=reminder_action["message"],
-                                 interval_s=reminder_action.get("interval_s"))
+                                 interval_s=reminder_action.get("interval_s"),
+                                 duration_s=reminder_action.get("duration_s"))
         detail = f" every {r.interval_s / 60:.0f} min" if r.interval_s else ""
-        print(f"[chat] reminder #{r.id} set ({r.kind}{detail}): {r.message}")
+        expiry = f", expires in {r.expires_at - time.time():.0f}s" if r.expires_at else ""
+        print(f"[chat] reminder #{r.id} set ({r.kind}{detail}{expiry}): {r.message}")
     elif reminder_action["action"] == "cancel":
         n = reminder_engine.cancel_all(kind=reminder_action.get("kind"))
         print(f"[chat] cancelled {n} reminder(s)")

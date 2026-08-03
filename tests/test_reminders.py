@@ -104,14 +104,33 @@ def test_recurring_reminder_fires_again_after_resetting():
     assert len(lamp.sounds) == 2
 
 
-def test_presence_reminder_fires_once_when_the_user_leaves():
+_DEBOUNCE = reminders_mod.PRESENCE_ABSENCE_DEBOUNCE_S
+
+
+def test_presence_reminder_does_not_fire_on_a_brief_flicker():
+    # face_found is a raw per-frame signal -- a frame or two of no
+    # detection (e.g. head motion briefly confusing the face landmarker)
+    # must not count as "left," only a sustained absence should.
     engine = ReminderEngine()
     engine.add(kind="presence", message="come back")
     lamp = _FakeLamp()
 
-    engine.tick(now=0.0, face_found=True, lamp=lamp)   # still there -- no fire
+    engine.tick(now=0.0, face_found=True, lamp=lamp)
+    engine.tick(now=0.1, face_found=False, lamp=lamp)   # one flickered frame...
+    engine.tick(now=0.2, face_found=True, lamp=lamp)    # ...and back -- never a real departure
+
     assert lamp.sounds == []
-    engine.tick(now=1.0, face_found=False, lamp=lamp)  # just left -- fires
+
+
+def test_presence_reminder_fires_once_after_a_sustained_absence():
+    engine = ReminderEngine()
+    engine.add(kind="presence", message="come back")
+    lamp = _FakeLamp()
+
+    engine.tick(now=0.0, face_found=True, lamp=lamp)
+    engine.tick(now=1.0, face_found=False, lamp=lamp)                    # just left -- too soon
+    assert lamp.sounds == []
+    engine.tick(now=1.0 + _DEBOUNCE + 0.1, face_found=False, lamp=lamp)  # been gone long enough now
     assert lamp.sounds == ["attention_seek"]
 
 
@@ -122,8 +141,8 @@ def test_presence_reminder_does_not_refire_every_tick_while_still_away():
 
     engine.tick(now=0.0, face_found=True, lamp=lamp)
     engine.tick(now=1.0, face_found=False, lamp=lamp)
-    engine.tick(now=2.0, face_found=False, lamp=lamp)
-    engine.tick(now=3.0, face_found=False, lamp=lamp)
+    engine.tick(now=1.0 + _DEBOUNCE + 0.1, face_found=False, lamp=lamp)
+    engine.tick(now=1.0 + _DEBOUNCE + 5.0, face_found=False, lamp=lamp)
 
     assert len(lamp.sounds) == 1  # not one per tick spent away
 
@@ -134,9 +153,11 @@ def test_presence_reminder_rearms_after_the_user_returns():
     lamp = _FakeLamp()
 
     engine.tick(now=0.0, face_found=True, lamp=lamp)
-    engine.tick(now=1.0, face_found=False, lamp=lamp)  # leaves -- fires
-    engine.tick(now=2.0, face_found=True, lamp=lamp)   # returns
-    engine.tick(now=3.0, face_found=False, lamp=lamp)  # leaves again -- fires again
+    engine.tick(now=1.0, face_found=False, lamp=lamp)
+    engine.tick(now=1.0 + _DEBOUNCE + 0.1, face_found=False, lamp=lamp)  # leaves -- fires
+    engine.tick(now=10.0, face_found=True, lamp=lamp)                    # returns
+    engine.tick(now=11.0, face_found=False, lamp=lamp)
+    engine.tick(now=11.0 + _DEBOUNCE + 0.1, face_found=False, lamp=lamp)  # leaves again -- fires again
 
     assert len(lamp.sounds) == 2
 
@@ -149,8 +170,56 @@ def test_firing_speaks_the_reminder_message(_isolate):
 
     engine.tick(now=0.0, face_found=True, lamp=lamp)
     engine.tick(now=1.0, face_found=False, lamp=lamp)
+    engine.tick(now=1.0 + _DEBOUNCE + 0.1, face_found=False, lamp=lamp)
 
     assert spoken == ["hey, come back and sit down"]
+
+
+def test_reminder_with_a_duration_auto_deactivates_after_it_elapses():
+    # "only check for the next 20 seconds" -- without an expiration this
+    # ran forever, which is the actual bug this covers.
+    engine = ReminderEngine()
+    r = engine.add(kind="presence", message="come back", duration_s=20.0)
+    lamp = _FakeLamp()
+
+    assert engine.active_count() == 1
+    engine.tick(now=r.created_at + 21.0, face_found=True, lamp=lamp)
+
+    assert engine.active_count() == 0
+    assert not r.active
+
+
+def test_reminder_with_a_duration_still_fires_normally_before_it_expires():
+    engine = ReminderEngine()
+    r = engine.add(kind="presence", message="come back", duration_s=100.0)
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at, face_found=True, lamp=lamp)
+    engine.tick(now=r.created_at + 5.0, face_found=False, lamp=lamp)
+    engine.tick(now=r.created_at + 5.0 + reminders_mod.PRESENCE_ABSENCE_DEBOUNCE_S + 0.1,
+                face_found=False, lamp=lamp)
+
+    assert lamp.sounds == ["attention_seek"]
+
+
+def test_reminder_with_no_duration_never_expires_on_its_own():
+    engine = ReminderEngine()
+    r = engine.add(kind="recurring", message="stand up", interval_s=1.0)
+
+    engine.tick(now=r.created_at + 1_000_000.0, face_found=True, lamp=_FakeLamp())
+
+    assert r.active
+
+
+def test_expired_reminder_gets_saved_even_if_nothing_fired():
+    engine = ReminderEngine()
+    r = engine.add(kind="presence", message="come back", duration_s=10.0)
+    engine.save = lambda: saved.append(True)
+    saved = []
+
+    engine.tick(now=r.created_at + 11.0, face_found=True, lamp=_FakeLamp())
+
+    assert saved == [True]
 
 
 def test_inactive_reminders_never_fire():

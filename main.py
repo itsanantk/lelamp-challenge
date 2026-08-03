@@ -282,7 +282,7 @@ def run(args: argparse.Namespace) -> None:
                 if reminder_engine is not None and reminder_engine.active_count() > 0:
                     side_lines.append("")
                     side_lines.append("reminders: (c to cancel all)")
-                    for line in reminder_engine.active_summaries()[:5]:
+                    for line in reminder_engine.active_summaries(now=time.time())[:5]:
                         side_lines.append(f"  - {line}")
                 if args.label:
                     side_lines.append("")
