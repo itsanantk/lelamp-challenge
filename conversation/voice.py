@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Callable
 
 import numpy as np
 import sounddevice as sd
@@ -25,24 +26,50 @@ import sounddevice as sd
 import config
 
 _whisper_model = None
+_wake_whisper_model = None
+_wake_whisper_load_failed = False
 _piper_voice = None
 _piper_load_failed = False
 
 
 def preload() -> None:
-    """Loads Whisper and (if its model files are present) Piper up front,
-    so the first turn of a conversation isn't the one eating their load
-    times -- Whisper's ~10-15s, and Piper's own first inference separately
-    eats a one-time ONNX graph-optimization cost (~4s locally, same
-    reasoning as YOLO's warmup call in vision_memory.py) which the
-    explicit warmup synthesis call below absorbs here instead."""
+    """Loads Whisper (both the main model and the smaller wake-word-only
+    one) and (if its model files are present) Piper up front, so the first
+    turn of a conversation isn't the one eating their load times --
+    Whisper's ~10-15s, and Piper's own first inference separately eats a
+    one-time ONNX graph-optimization cost (~4s locally, same reasoning as
+    YOLO's warmup call in vision_memory.py) which the explicit warmup
+    synthesis call below absorbs here instead."""
     global _whisper_model
     if _whisper_model is None:
         import whisper
         print(f"[voice] loading Whisper ({config.WHISPER_MODEL})...")
         _whisper_model = whisper.load_model(config.WHISPER_MODEL)
         print("[voice] ready")
+    _load_wake_whisper()
     _load_piper()
+
+
+def _load_wake_whisper():
+    """Returns the cached wake-word-only Whisper model (see
+    config.WAKE_WHISPER_MODEL's own comment for why this is a separate,
+    smaller model rather than reusing _whisper_model). Same
+    load-once/remember-failure shape as _load_piper -- falls back to
+    returning None (permanently, via _wake_whisper_load_failed) if it
+    can't load, and callers fall back to the main model instead rather
+    than failing outright."""
+    global _wake_whisper_model, _wake_whisper_load_failed
+    if _wake_whisper_model is not None or _wake_whisper_load_failed:
+        return _wake_whisper_model
+    try:
+        import whisper
+        print(f"[voice] loading wake-word model ({config.WAKE_WHISPER_MODEL})...")
+        _wake_whisper_model = whisper.load_model(config.WAKE_WHISPER_MODEL)
+    except Exception as e:
+        print(f"[voice] couldn't load the wake-word model ({e}) -- "
+              f"wake-word chunks will use the main model instead (slower)")
+        _wake_whisper_load_failed = True
+    return _wake_whisper_model
 
 
 def _load_piper():
@@ -99,7 +126,8 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
                           no_speech_timeout_s: float = config.VOICE_NO_SPEECH_TIMEOUT_S,
                           samplerate: int = config.VOICE_SAMPLE_RATE,
                           stop_event: threading.Event | None = None,
-                          shutdown_event: threading.Event | None = None) -> np.ndarray:
+                          shutdown_event: threading.Event | None = None,
+                          on_loud: Callable[[float], None] | None = None) -> np.ndarray:
     """Records from the mic until speech has clearly started and then
     stopped (silence_s of continuous quiet after some sound was heard), or
     max_s is hit as a safety cap. If nothing is said at all -- e.g. a
@@ -111,11 +139,24 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
     same window knows to stop too instead of running to its own separate
     timeout. shutdown_event, if given, aborts the wait early (process is
     shutting down) instead of blocking a caller trying to join this thread
-    until max_s naturally elapses."""
+    until max_s naturally elapses.
+
+    on_loud, if given, fires at most once per call, synchronously from the
+    audio callback, the instant a single block's RMS crosses
+    config.VOICE_YELL_RMS_THRESHOLD -- deliberately not routed through
+    emotion.analyze()/transcribe(), which only run on the full clip after
+    recording stops. A startled flinch needs to land while the yell is
+    still happening, not a second-plus later once the whole utterance has
+    been transcribed and classified; this is intentionally a dumb,
+    immediate loudness trip-wire, not a tone judgment. Safe to call
+    lamp.play_sound()/set_target_pose() from it directly -- both just
+    enqueue/update state without blocking (see sim_backend.py's
+    _SoundWorker and Trajectory), so this doesn't need to hop off the
+    audio callback thread first."""
     threshold = config.VOICE_GATE_RMS_THRESHOLD
     chunks: list[np.ndarray] = []
     lock = threading.Lock()
-    state = {"speech_started": False, "silence_since": None}
+    state = {"speech_started": False, "silence_since": None, "loud_fired": False}
     start_t = time.monotonic()
     done = threading.Event()
 
@@ -124,6 +165,9 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
             chunks.append(indata.copy())
         rms = _rms(indata)
         now = time.monotonic()
+        if on_loud is not None and not state["loud_fired"] and rms >= config.VOICE_YELL_RMS_THRESHOLD:
+            state["loud_fired"] = True
+            on_loud(rms)
         if rms > threshold:
             state["speech_started"] = True
             state["silence_since"] = None
@@ -151,18 +195,24 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
         return np.concatenate(chunks, axis=0).flatten()
 
 
-def transcribe(audio: np.ndarray, initial_prompt: str | None = None) -> str:
+def transcribe(audio: np.ndarray, initial_prompt: str | None = None, model=None) -> str:
     """initial_prompt biases Whisper's decoding toward expected vocabulary
     -- a real lever for a short, out-of-context wake phrase specifically
     (see _check_wake_chunk), since a lone word or two with no surrounding
     sentence is a genuinely harder input for a model that leans on
     language-model context to disambiguate acoustics. Left unset for
     real conversational questions, where biasing toward the wake phrase
-    would be actively wrong."""
+    would be actively wrong.
+
+    model, if given, overrides which loaded Whisper model actually runs
+    the decode -- _check_wake_chunk passes the smaller wake-word model
+    (see config.WAKE_WHISPER_MODEL); every other caller leaves this unset
+    and gets the main, more accurate model."""
     if audio.size == 0:
         return ""
     preload()
-    result = _whisper_model.transcribe(audio, fp16=False, language="en", initial_prompt=initial_prompt)
+    m = model if model is not None else _whisper_model
+    result = m.transcribe(audio, fp16=False, language="en", initial_prompt=initial_prompt)
     return result["text"].strip()
 
 
@@ -280,7 +330,13 @@ def _check_wake_chunk(audio: np.ndarray, samplerate: int, wake_word: str, match_
     if rms < config.VOICE_GATE_RMS_THRESHOLD:
         print(f'[voice] rms={rms:.4f}')
         return None, ""  # a real silent gap -- nothing here could be one half of a split phrase
-    text = transcribe(audio, initial_prompt=wake_word).lower()
+    # tiny.en, not the main small.en model -- this only has to catch one
+    # distinctive word, and decoding it fast is what actually determines
+    # how long "did you notice I'm talking to you" takes (see
+    # config.WAKE_WHISPER_MODEL). Falls back to the main model if the
+    # smaller one failed to load rather than erroring out.
+    wake_model = _load_wake_whisper() or _whisper_model
+    text = transcribe(audio, initial_prompt=wake_word, model=wake_model).lower()
     print(f'[voice] rms={rms:.4f} heard: "{text}"')
     combined = f"{prev_text} {text}".strip()
     if match_word in combined:
@@ -315,14 +371,24 @@ def _select_warmer_voice(engine) -> None:
         pass  # missing/misbehaving voice driver -- fall back to the engine's own default
 
 
+_speak_lock = threading.Lock()
+
+
 def speak(text: str) -> None:
+    """Serialized across every caller, not just chat.py's own loop --
+    behavior/reminders.py fires reminders (and calls this) from main.py's
+    render-loop thread, which can land while chat.py's background thread
+    is mid-reply. Both write to the same audio output device; without a
+    shared lock, two concurrent sd.play()/SAPI5 calls would overlap into
+    garbled audio instead of one waiting for the other."""
     if not text:
         return
-    voice = _load_piper()
-    if voice is not None:
-        _speak_piper(voice, text)
-    else:
-        _speak_sapi5(text)
+    with _speak_lock:
+        voice = _load_piper()
+        if voice is not None:
+            _speak_piper(voice, text)
+        else:
+            _speak_sapi5(text)
 
 
 def _speak_piper(voice, text: str) -> None:

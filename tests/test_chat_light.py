@@ -18,11 +18,14 @@ from behavior.state_machine import State
 
 
 class _FakeLamp:
-    def __init__(self, current_light=(100, 100, 100), mood=(0.6, 0.55)):
+    def __init__(self, current_light=(100, 100, 100), mood=(0.6, 0.55), current_pose=None):
         self.calls = []
         self._light = current_light
         self._mood = mood
         self.closed = False
+        self._pose = current_pose if current_pose is not None else np.zeros(6)
+        self.pose_calls = []
+        self.sounds = []
 
     def set_light(self, rgb, transition_s=0.4):
         self.calls.append(rgb)
@@ -37,11 +40,15 @@ class _FakeLamp:
     def get_mood(self):
         return self._mood
 
-    def set_target_pose(self, *args, **kwargs):
-        pass
+    def set_target_pose(self, angles, *args, **kwargs):
+        self.pose_calls.append(np.array(angles))
+        self._pose = np.array(angles)
+
+    def get_current_pose(self):
+        return self._pose
 
     def play_sound(self, event):
-        pass
+        self.sounds.append(event)
 
     def update(self, dt):
         pass
@@ -111,6 +118,40 @@ def test_on_from_off_still_produces_real_brightness():
     assert brightness == chat._ON_BRIGHTNESS
 
 
+class _FakeReminderEngine:
+    def __init__(self):
+        self.added = []
+        self.cancelled = []
+
+    def add(self, kind, message, interval_s=None):
+        self.added.append((kind, message, interval_s))
+        return type("R", (), {"id": 1, "kind": kind, "message": message, "interval_s": interval_s})()
+
+    def cancel_all(self, kind=None):
+        self.cancelled.append(kind)
+        return 2
+
+
+def test_apply_reminder_action_create_adds_to_the_engine():
+    engine = _FakeReminderEngine()
+    chat._apply_reminder_action(
+        {"action": "create", "kind": "recurring", "message": "stand up", "interval_s": 1800.0}, engine)
+    assert engine.added == [("recurring", "stand up", 1800.0)]
+
+
+def test_apply_reminder_action_cancel_targets_the_engine():
+    engine = _FakeReminderEngine()
+    chat._apply_reminder_action({"action": "cancel", "kind": "presence"}, engine)
+    assert engine.cancelled == ["presence"]
+
+
+def test_apply_reminder_action_with_no_engine_does_not_raise():
+    # standalone chat.py has no reminder_engine (see run()'s docstring) --
+    # the tool call still succeeded from the LLM's point of view, this
+    # just can't act on it. Must not crash the conversation turn.
+    chat._apply_reminder_action({"action": "create", "kind": "presence", "message": "x", "interval_s": None}, None)
+
+
 def test_strip_emoji_removes_emoji_and_collapses_the_gap():
     assert chat._strip_emoji("Sure thing! \U0001F319 all set") == "Sure thing! all set"
     assert chat._strip_emoji("✨ nice ✨") == "nice"
@@ -121,10 +162,61 @@ def test_strip_emoji_leaves_plain_text_untouched():
         "Still off to the left, about 5 minutes ago."
 
 
-def test_reactive_tones_are_exactly_tense_and_quiet():
-    assert set(chat._REACTIVE_TONES) == {"tense", "quiet"}
+def test_reactive_tones_are_exactly_yelling_tense_and_quiet():
+    assert set(chat._REACTIVE_TONES) == {"yelling", "tense", "quiet"}
     assert "calm" not in chat._REACTIVE_TONES
     assert "energetic" not in chat._REACTIVE_TONES
+
+
+def test_jerk_back_pulls_the_pose_away_from_wherever_it_currently_is():
+    # Additive off get_current_pose(), not a fixed absolute target -- the
+    # resulting pose should differ from both the starting pose and from
+    # NEUTRAL_POSE by exactly the offset.
+    lamp = _FakeLamp(current_pose=np.array([10.0, -30.0, 60.0, 0.0, 0.0, 0.0]))
+    chat._jerk_back(lamp)
+    assert len(lamp.pose_calls) == 1
+    np.testing.assert_allclose(lamp.pose_calls[0], np.array([10.0, -30.0, 60.0, 0.0, 0.0, 0.0]) + chat._JERK_BACK_OFFSET)
+
+
+def test_droop_is_gentler_and_slower_than_jerk_back():
+    # Same additive-offset idea, but the droop offset should be smaller in
+    # magnitude than the jerk -- a sag reads as sad, not startled.
+    assert np.linalg.norm(chat._DROOP_OFFSET) < np.linalg.norm(chat._JERK_BACK_OFFSET)
+
+
+def test_flash_tone_on_yelling_does_not_play_a_sound_or_gesture():
+    # Yelling's sound+gesture fire immediately, live, off raw mic loudness
+    # (_on_loud_during_listen / voice.record_until_silence's on_loud) --
+    # _flash_tone only supplies the lingering color tint, so it must not
+    # also play "startled" or jerk the pose a second time after the fact.
+    lamp = _FakeLamp(mood=(0.5, 0.5))
+    chat._flash_tone(lamp, "yelling", show_gui=False, seconds=0.0)
+    assert lamp.sounds == []
+    assert lamp.pose_calls == []
+
+
+def test_flash_tone_on_quiet_plays_a_whine_and_droops():
+    lamp = _FakeLamp(mood=(0.5, 0.5))
+    chat._flash_tone(lamp, "quiet", show_gui=False, seconds=0.0)
+    assert lamp.sounds == ["whine"]
+    assert len(lamp.pose_calls) == 1
+
+
+def test_flash_tone_on_tense_plays_no_sound_or_gesture():
+    # tense only ever got a color nudge, even before yelling/whine existed
+    # -- confirms adding sound/gesture support to the other two labels
+    # didn't accidentally give tense one too.
+    lamp = _FakeLamp(mood=(0.5, 0.5))
+    chat._flash_tone(lamp, "tense", show_gui=False, seconds=0.0)
+    assert lamp.sounds == []
+    assert lamp.pose_calls == []
+
+
+def test_on_loud_during_listen_jerks_back_and_plays_startled():
+    lamp = _FakeLamp()
+    chat._on_loud_during_listen(lamp, rms=0.05)
+    assert lamp.sounds == ["startled"]
+    assert len(lamp.pose_calls) == 1
 
 
 def test_render_loop_runs_even_without_a_gui_window():
@@ -185,6 +277,7 @@ def test_run_with_a_shared_lamp_and_store_never_closes_them(monkeypatch):
     class _FakeAgent:
         def __init__(self, store, get_frame=None):
             self.last_light_action = None
+            self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": None})()
 
         def ask(self, question):
@@ -227,6 +320,7 @@ def test_shutdown_event_already_set_never_touches_real_mic_io(monkeypatch):
     class _FakeAgent:
         def __init__(self, store, get_frame=None):
             self.last_light_action = None
+            self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": None})()
 
         def ask(self, question):
@@ -265,7 +359,7 @@ def test_being_engaged_skips_the_wake_word_gate_entirely(monkeypatch):
 
     calls = []
 
-    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None):
+    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None, **_kwargs):
         calls.append(max_s)
         return "quit", None, 0, np.zeros(1600, dtype="float32")
 
@@ -274,6 +368,7 @@ def test_being_engaged_skips_the_wake_word_gate_entirely(monkeypatch):
     class _FakeAgent:
         def __init__(self, store, get_frame=None):
             self.last_light_action = None
+            self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": None})()
 
         def ask(self, question):
@@ -327,7 +422,7 @@ def test_calm_speech_never_triggers_a_tone_flash(monkeypatch):
 
     calls = {"n": 0}
 
-    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None):
+    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None, **_kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             return "talking calmly", None, 0, np.zeros(1600, dtype="float32")
@@ -342,6 +437,7 @@ def test_calm_speech_never_triggers_a_tone_flash(monkeypatch):
     class _FakeAgent:
         def __init__(self, store, get_frame=None):
             self.last_light_action = None
+            self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": None})()
 
         def ask(self, question):
@@ -386,11 +482,16 @@ def test_recall_points_at_the_object_before_speaking_and_confirms_if_live(monkey
         return real_point_toward(lamp, bearing_deg, fsm=fsm)
 
     monkeypatch.setattr(chat, "_point_toward", _tracked_point_toward)
-    monkeypatch.setattr(chat, "_find_live_bearing", lambda vm, cls, window_s=1.6: 12.0)
+    # 25.0 resolves to "off to the right" (bearing_to_direction), the
+    # specific case that exposes the "off to the off to the right"
+    # duplication bug -- a bearing that resolves to a phrase not already
+    # starting with "off to the" (e.g. "slightly right of center")
+    # wouldn't have caught it.
+    monkeypatch.setattr(chat, "_find_live_bearing", lambda vm, cls, window_s=1.6: 25.0)
 
     calls = {"n": 0}
 
-    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None):
+    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None, **_kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             return "where is my phone", None, 0, np.zeros(1600, dtype="float32")
@@ -410,6 +511,7 @@ def test_recall_points_at_the_object_before_speaking_and_confirms_if_live(monkey
     class _FakeAgent:
         def __init__(self, store, get_frame=None):
             self.last_light_action = None
+            self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": _FakeObs()})()
 
         def ask(self, question):
@@ -439,6 +541,10 @@ def test_recall_points_at_the_object_before_speaking_and_confirms_if_live(monkey
     # handle()'s comment on why that reply can't be trusted for tense.
     assert order[2][1].startswith("It's right there,")
     assert "I can see it now" in order[2][1]
+    # bearing_to_direction already returns a full phrase ("off to the
+    # right") -- wrapping it in another "off to the {direction}" produced
+    # a real duplication bug ("off to the off to the right"), caught live.
+    assert order[2][1] == "It's right there, off to the right -- I can see it now."
 
 
 def test_recall_does_not_add_a_live_confirmation_when_not_currently_visible(monkeypatch):
@@ -450,7 +556,7 @@ def test_recall_does_not_add_a_live_confirmation_when_not_currently_visible(monk
 
     calls = {"n": 0}
 
-    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None):
+    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None, **_kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             return "where is my phone", None, 0, np.zeros(1600, dtype="float32")
@@ -470,6 +576,7 @@ def test_recall_does_not_add_a_live_confirmation_when_not_currently_visible(monk
     class _FakeAgent:
         def __init__(self, store, get_frame=None):
             self.last_light_action = None
+            self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": _FakeObs()})()
 
         def ask(self, question):

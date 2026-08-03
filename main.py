@@ -18,8 +18,8 @@ Usage:
 
 Keys (interactive mode):
     q       quit
-    c       clear stored memory and reset learned attention-seek timing (live -- unlike
-            --fresh-memory, doesn't need a restart)
+    c       clear stored memory, reset learned attention-seek timing, and cancel all reminders
+            (live -- unlike --fresh-memory, doesn't need a restart)
     SPACE   (with --label) toggle "I am currently looking at the lamp" ground truth
 """
 from __future__ import annotations
@@ -38,6 +38,7 @@ import viz
 from behavior.adaptation import AdaptationEngine
 from behavior.idle_scan import IdleScanner
 from behavior.object_watch import ObjectWatcher, play_wave_back
+from behavior.reminders import ReminderEngine
 from behavior.state_machine import BehaviorFSM, State
 from lamp import SimulatedLamp
 from memory.store import MemoryStore
@@ -93,6 +94,12 @@ def run(args: argparse.Namespace) -> None:
 
     ambient_sensor = AmbientLightSensor() if args.ambient_light else None
 
+    reminder_engine = None
+    if not args.no_reminders:
+        if args.fresh_reminders and config.LOGS_DIR.joinpath("reminders.json").exists():
+            config.LOGS_DIR.joinpath("reminders.json").unlink()
+        reminder_engine = ReminderEngine.load()
+
     hand_wave = None
     if not args.no_hand_wave:
         if config.HAND_LANDMARKER_MODEL.exists():
@@ -112,7 +119,8 @@ def run(args: argparse.Namespace) -> None:
         # chat.run's docstring), not handed in from this one.
         chat_thread = threading.Thread(
             target=chat.run, args=(chat_args,),
-            kwargs={"lamp": lamp, "fsm": fsm, "vision_memory": vision_memory, "shutdown_event": chat_shutdown},
+            kwargs={"lamp": lamp, "fsm": fsm, "vision_memory": vision_memory, "shutdown_event": chat_shutdown,
+                    "reminder_engine": reminder_engine},
             daemon=True)
         chat_thread.start()
 
@@ -163,6 +171,17 @@ def run(args: argparse.Namespace) -> None:
                 adapt_engine.on_check_timeout()
                 adapt_engine.apply_to(fsm)  # keep the FSM synced as the engine adapts mid-session
             prev_fsm_state = fsm_state
+
+            if reminder_engine is not None:
+                # time.time() (wall clock), not the perf_counter-based
+                # `now`/`dt` above -- reminders persist across restarts
+                # and compare against real elapsed time, which
+                # perf_counter's arbitrary per-process origin can't do.
+                # face_found (not fsm_state/engaged) is presence's actual
+                # signal -- "did I get up from my desk" means "is a face
+                # even in frame," not "am I currently looking at the
+                # lamp specifically."
+                reminder_engine.tick(time.time(), reading.face_found if reading else False, lamp)
 
             if not args.no_camera_pan:
                 # base_yaw is the same degrees-of-bearing convention as
@@ -260,6 +279,11 @@ def run(args: argparse.Namespace) -> None:
                     side_lines.append("")
                     side_lines.append("room busy (talking/media) --")
                     side_lines.append("holding off on attention-seeking")
+                if reminder_engine is not None and reminder_engine.active_count() > 0:
+                    side_lines.append("")
+                    side_lines.append("reminders: (c to cancel all)")
+                    for line in reminder_engine.active_summaries()[:5]:
+                        side_lines.append(f"  - {line}")
                 if args.label:
                     side_lines.append("")
                     side_lines.append(f"ground_truth: {'LOOKING' if ground_truth_label else 'away'} (SPACE to toggle)")
@@ -323,7 +347,10 @@ def run(args: argparse.Namespace) -> None:
                 if adapt_engine is not None:
                     adapt_engine.reset()
                     adapt_engine.apply_to(fsm)
-                print("[main] cleared stored memory and reset learned attention-seek timing")
+                if reminder_engine is not None:
+                    reminder_engine.cancel_all()
+                print("[main] cleared stored memory, reset learned attention-seek timing, "
+                      "and cancelled all reminders")
 
             interactive_elapsed += dt
             if args.auto_quit_after is not None and interactive_elapsed >= args.auto_quit_after:
@@ -349,6 +376,9 @@ def run(args: argparse.Namespace) -> None:
         if adapt_engine is not None:
             adapt_engine.save()
             print(f"[adapt] {adapt_engine.summary()}")
+        if reminder_engine is not None:
+            reminder_engine.save()
+            print(f"[reminder] {reminder_engine.active_count()} active reminder(s) saved")
         if store is not None:
             store.close()
         if video_writer is not None:
@@ -391,6 +421,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ambient-light", action="store_true",
                     help="enable ambient-light brightness reactivity (opt-in: brightens the "
                          "idle/engaged look in a dark room, dims it in a bright one)")
+    p.add_argument("--no-reminders", action="store_true",
+                    help="disable self-initiated timed checks (behavior/reminders.py) -- "
+                         "with --chat, create_reminder becomes a no-op instead of setting anything up")
+    p.add_argument("--fresh-reminders", action="store_true", help="wipe stored reminders at startup")
     args = p.parse_args()
     if args.chat and not args.voice:
         # Typed chat blocks on input(), which no shutdown_event can reach

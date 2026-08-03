@@ -56,6 +56,21 @@ def test_resamples_and_smooths_after_the_interval():
     assert bright_nudge < dark_nudge
 
 
+def test_a_small_bright_region_still_registers_despite_a_normal_frame_average():
+    # The actual flashlight-at-camera scenario: a bright source lights up
+    # only part of the frame while the rest stays at a normal room level
+    # -- a plain frame-wide mean dilutes that down to barely moving.
+    # Percentile-based reading should still catch it clearly.
+    frame = _frame(int(config.AMBIENT_LIGHT_MIDPOINT * 255))  # normal room level everywhere
+    frame[:50, :90] = 255  # a bright patch covering roughly a quarter of the frame
+    plain_mean = float(np.mean(frame)) / 255.0
+
+    sensor = AmbientLightSensor()
+    sensor.update(frame, now=0.0)
+
+    assert sensor._smoothed_luma > plain_mean + 0.1
+
+
 if __name__ == "__main__":
     test_dark_room_produces_a_positive_nudge()
     test_bright_room_produces_a_negative_nudge()

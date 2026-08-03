@@ -19,6 +19,7 @@ def _agent():
     agent.get_frame = None
     agent.last_recall = RecallResult()
     agent.last_light_action = None
+    agent.last_reminder_action = None
     return agent
 
 
@@ -45,6 +46,70 @@ def test_control_light_is_case_insensitive():
 
 def test_every_light_action_is_a_valid_string():
     assert all(isinstance(a, str) and a for a in LIGHT_ACTIONS)
+
+
+def test_create_reminder_recurring_records_the_intended_action():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "recurring", "interval_minutes": 30, "message": "stand up",
+    })
+    assert result == {"created": True, "kind": "recurring"}
+    assert image is None
+    assert agent.last_reminder_action == {
+        "action": "create", "kind": "recurring", "message": "stand up", "interval_s": 1800.0,
+    }
+
+
+def test_create_reminder_presence_does_not_require_an_interval():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "presence", "message": "come back and sit down",
+    })
+    assert result == {"created": True, "kind": "presence"}
+    assert agent.last_reminder_action["interval_s"] is None
+
+
+def test_create_reminder_recurring_without_an_interval_is_rejected():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "recurring", "message": "stand up",
+    })
+    assert result["created"] is False
+    assert agent.last_reminder_action is None  # rejected -- nothing recorded for chat.py to apply
+
+
+def test_create_reminder_rejects_an_unknown_kind():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {"action": "create", "kind": "weather", "message": "x"})
+    assert result["created"] is False
+    assert agent.last_reminder_action is None
+
+
+def test_create_reminder_requires_a_message():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {"action": "create", "kind": "presence"})
+    assert result["created"] is False
+    assert agent.last_reminder_action is None
+
+
+def test_create_reminder_cancel_defaults_to_every_kind():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {"action": "cancel"})
+    assert result == {"cancelled": True}
+    assert agent.last_reminder_action == {"action": "cancel", "kind": None}
+
+
+def test_create_reminder_cancel_can_target_one_kind():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {"action": "cancel", "kind": "recurring"})
+    assert agent.last_reminder_action == {"action": "cancel", "kind": "recurring"}
+
+
+def test_create_reminder_rejects_an_unknown_action():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {"action": "snooze"})
+    assert "error" in result
+    assert agent.last_reminder_action is None
 
 
 class _FakeBlock:
@@ -83,11 +148,13 @@ def test_ask_resets_last_light_action_and_last_recall_at_the_start_of_each_turn(
     agent.client = _FakeClient()
     agent.last_light_action = "cozy"
     agent.last_recall.observation = object()
+    agent.last_reminder_action = {"action": "create", "kind": "recurring", "message": "x", "interval_s": 60.0}
 
     agent.ask("just chatting, nothing about lights or objects")
 
     assert agent.last_light_action is None
     assert agent.last_recall.observation is None
+    assert agent.last_reminder_action is None
 
 
 def test_describe_current_view_unavailable_with_no_frame_provider():

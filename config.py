@@ -189,6 +189,17 @@ OPENAI_MODEL = "gpt-4o-mini"
 # better transcription accuracy -- base.en was mishearing plain speech
 # often enough in testing to be the complaint, not just the wake word.
 WHISPER_MODEL = "small.en"
+# A separate, much smaller model just for wake-word chunks (see
+# _check_wake_chunk) -- decoding a 1-2s clip on small.en was the dominant
+# cost in "why does it take a while to notice I'm talking to it" (small.en
+# chosen for WHISPER_MODEL specifically for its better accuracy on real
+# questions, at a real latency cost that doesn't matter there but does
+# here). tiny.en only has to catch one distinctive word ("lamp"), not
+# transcribe a full sentence accurately, so the accuracy tradeoff that
+# ruled tiny.en out for WHISPER_MODEL doesn't apply to this narrower job.
+# ~75MB vs small.en's ~460MB -- a real but small extra download/RAM cost
+# for a meaningfully snappier wake response.
+WAKE_WHISPER_MODEL = "tiny.en"
 VOICE_SAMPLE_RATE = 16000
 
 # Wake-word gated instead of a blind fixed-length recording window: the
@@ -199,7 +210,11 @@ VOICE_SAMPLE_RATE = 16000
 # at random, and means you don't have to time your speech into an
 # arbitrary window that starts the instant the script gets there.
 WAKE_WORD = "hey lamp"
-WAKE_CHUNK_S = 2.5   # kept short-ish so the wake phrase rarely spans a chunk boundary
+WAKE_CHUNK_S = 1.8   # kept short-ish so the wake phrase rarely spans a chunk boundary
+                      # (and when it does, wait_for_wake_word's prev_text concatenation
+                      # still catches it) -- shorter means less buffering delay before a
+                      # chunk is even checked at all, which is most of "takes a while to
+                      # notice I'm talking to it" alongside WAKE_WHISPER_MODEL above
 VOICE_SILENCE_TIMEOUT_S = 1.2   # stop recording the question after this much continuous silence
 VOICE_NO_SPEECH_TIMEOUT_S = 3.0  # bail out this fast if nothing at all was said after waking
                                   # (e.g. a false-positive wake trigger) -- otherwise this case
@@ -225,6 +240,17 @@ CONVERSATION_FOLLOWUP_TIMEOUT_S = 60.0
 # below those observed peaks and above the ambient noise floor seen in
 # the same session (mostly 0.0000-0.0066).
 VOICE_GATE_RMS_THRESHOLD = 0.008
+
+# A real yell's RMS floor -- shared between conversation/voice.py (fires
+# the jerk-back/startled reaction live, mid-recording, off the raw audio
+# callback) and conversation/emotion.py (labels the whole utterance
+# "yelling" after the fact). One shared number so "did that count as a
+# yell" means the same thing whether it's judged in real time on a single
+# callback block or after the fact on peak-RMS over the full clip. Well
+# above VOICE_GATE_RMS_THRESHOLD and above conversation/emotion.py's own
+# _LOUD_RMS ("tense"/"energetic" territory) -- tuned by ear, same caveat
+# as every other threshold in this file.
+VOICE_YELL_RMS_THRESHOLD = 0.032
 
 # --- Interruption awareness -------------------------------------------------
 # RMS level (float32 samples, [-1, 1]) above which the mic counts as

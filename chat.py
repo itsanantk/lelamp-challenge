@@ -36,6 +36,7 @@ import re
 import sys
 import threading
 import time
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -60,9 +61,25 @@ from perception.multi_face import SpeakerDetector
 # is what actually keeps the palette feeling coherent).
 FOUND_NUDGE = (-0.2, 0.35)
 # tense reads as a little warmer/brighter (agitated); quiet as cooler/
-# dimmer (subdued) -- "calm"/"energetic" never reach here, see
-# _REACTIVE_TONES below.
-_TONE_NUDGES = {"tense": (0.15, 0.25), "quiet": (-0.15, -0.25)}
+# dimmer (subdued); yelling as a sharp, hot spike -- "calm"/"energetic"
+# never reach here, see _REACTIVE_TONES below.
+_TONE_NUDGES = {"yelling": (0.35, 0.3), "tense": (0.15, 0.25), "quiet": (-0.15, -0.25)}
+
+# Additive pose offsets for tone-reactive gestures -- added to whatever
+# pose the lamp is currently in (not a fixed absolute target), the same
+# "nudge, don't replace" convention the color dials use. set_target_pose
+# clamps the result to JOINT_LIMITS internally, so these don't need
+# clamping here even though they push well past a normal look-at pose.
+_JERK_BACK_OFFSET = np.array([0.0, 25.0, -30.0, -20.0, 0.0, 14.0])
+# shoulder_pitch/elbow_pitch pull back and collapse (the opposite of
+# pose_for_look_at's "leaned in" direction) instead of reaching toward
+# whatever it was looking at; wrist_pitch tips the head up and away, like
+# recoiling from something loud in front of it; head_twist adds a sharp
+# flinch accent.
+_DROOP_OFFSET = np.array([0.0, 12.0, -18.0, 18.0, 0.0, 0.0])
+# Same direction as a jerk (less "leaned in") but much smaller and no
+# twist accent -- a sag, not a flinch. wrist_pitch tips the opposite way
+# from a jerk (down, not up) -- a small sad nod instead of recoiling.
 
 # Voice-controlled lighting (control_light tool in conversation/agent.py).
 # All of these set the persistent (warmth, brightness) *mood* dial (see
@@ -77,6 +94,11 @@ _DIM_STEP = 0.15       # each "dim" lowers the brightness dial by this much
 _BRIGHTNESS_FLOOR = 0.03  # floor so repeated "dim" settles near-off without hitting
                             # literal 0 brightness -- that's what "off" is explicitly for
 _ON_BRIGHTNESS = 0.95   # "on" sets brightness dial to (near-)full, warmth untouched
+
+# How long "was recently visually engaged" keeps skipping the wake word
+# after gaze actually leaves ENGAGED -- see its use below for why this
+# needs to outlast BehaviorFSM's own much-faster exit dwell.
+_ENGAGED_WAKE_GRACE_S = 2.5
 
 
 def _wait_out_attention_seek(fsm, timeout: float = 1.5) -> None:
@@ -149,6 +171,27 @@ def _apply_light_command(lamp: SimulatedLamp, action: str, show_gui: bool, secon
     return target
 
 
+def _apply_reminder_action(reminder_action: dict, reminder_engine) -> None:
+    """Applies the last create_reminder tool call -- same split as
+    _apply_light_command/last_light_action: the agent only records intent
+    (it doesn't own reminder_engine), this actually does it. reminder_engine
+    is None in standalone chat.py (see run()'s docstring) -- the tool call
+    still succeeded from the LLM's point of view, so this says so out loud
+    rather than silently dropping it."""
+    if reminder_engine is None:
+        print("[chat] (reminders need main.py's own camera loop to check against -- "
+              "not available running chat.py standalone)")
+        return
+    if reminder_action["action"] == "create":
+        r = reminder_engine.add(kind=reminder_action["kind"], message=reminder_action["message"],
+                                 interval_s=reminder_action.get("interval_s"))
+        detail = f" every {r.interval_s / 60:.0f} min" if r.interval_s else ""
+        print(f"[chat] reminder #{r.id} set ({r.kind}{detail}): {r.message}")
+    elif reminder_action["action"] == "cancel":
+        n = reminder_engine.cancel_all(kind=reminder_action.get("kind"))
+        print(f"[chat] cancelled {n} reminder(s)")
+
+
 def _look_attentive(lamp: SimulatedLamp, bearing_deg: float | None, set_light: bool = True, fsm=None,
                      light_color: tuple[int, int, int] | None = None) -> None:
     """Held during the post-wake conversation window so the lamp visibly
@@ -213,6 +256,28 @@ def _settle_from_point(lamp: SimulatedLamp, show_gui: bool, seconds: float, stan
     lamp.set_target_pose(kinematics.NEUTRAL_POSE, duration=0.6, overshoot=False)
 
 
+def _jerk_back(lamp: SimulatedLamp) -> None:
+    """Quick, sharp recoil -- the visible half of a yell reaction. Additive
+    off get_current_pose() rather than a fixed absolute target, so it
+    reads as flinching from wherever the lamp actually is (same idea as
+    _point_toward's anticipation/overshoot for a snappy move, pushed
+    further and faster here). Whatever runs after this turn's handle()
+    returns (_look_attentive, typically) brings the pose back -- no
+    explicit restore here, same as how the color nudge below is left to
+    settle rather than snapped back immediately."""
+    current = lamp.get_current_pose()
+    lamp.set_target_pose(current + _JERK_BACK_OFFSET, duration=0.15, anticipation=True, overshoot=True)
+
+
+def _droop(lamp: SimulatedLamp) -> None:
+    """Small, slow sag -- the visible half of the whine reaction. Same
+    additive-off-current-pose idea as _jerk_back, deliberately much
+    gentler and slower -- a sag reads as sad, a fast one would just read
+    as another flinch."""
+    current = lamp.get_current_pose()
+    lamp.set_target_pose(current + _DROOP_OFFSET, duration=0.5, anticipation=False, overshoot=False)
+
+
 # Only these read as something worth visibly reacting to -- "calm" and
 # "energetic" are just normal speech and shouldn't tint the light at all,
 # every voice turn used to flash *some* color regardless of tone, which
@@ -220,7 +285,29 @@ def _settle_from_point(lamp: SimulatedLamp, show_gui: bool, seconds: float, stan
 # reason. quiet is the closest existing bucket to "sad" (see
 # conversation/emotion.py's own module docstring on the 4-label system's
 # limits -- there's no real "sad" label, this is the nearest proxy).
-_REACTIVE_TONES = ("tense", "quiet")
+# "yelling" still gets the lingering hot/bright color tint below (a "still
+# a bit rattled" afterglow), but NOT a sound or gesture here -- those fire
+# immediately, live, off raw mic loudness (see _on_loud_during_listen and
+# voice.record_until_silence's on_loud param) rather than waiting for the
+# full utterance to finish recording and get classified. A yell reaction
+# that lands a second-plus late, only once the whole sentence has been
+# transcribed, reads as sluggish, not startled.
+_REACTIVE_TONES = ("yelling", "tense", "quiet")
+_TONE_SOUNDS = {"quiet": "whine"}
+_TONE_GESTURES = {"quiet": _droop}
+
+
+def _on_loud_during_listen(lamp: SimulatedLamp, rms: float) -> None:
+    """Wired as voice.record_until_silence's on_loud -- fires from the
+    audio callback thread the instant a single block crosses
+    config.VOICE_YELL_RMS_THRESHOLD, well before the utterance finishes
+    recording, gets transcribed, or gets tone-classified. Deliberately
+    skips _wait_out_attention_seek (unlike every other reactive gesture
+    here): a startle is involuntary -- it shouldn't politely wait for the
+    current gesture to finish the way a considered reaction does."""
+    print(f"[voice] loud sound detected (rms={rms:.4f}) -- flinching")
+    _jerk_back(lamp)
+    lamp.play_sound("startled")
 
 
 def _flash_tone(lamp: SimulatedLamp, label: str, show_gui: bool, seconds: float = 0.6,
@@ -228,7 +315,13 @@ def _flash_tone(lamp: SimulatedLamp, label: str, show_gui: bool, seconds: float 
     _wait_out_attention_seek(fsm)
     mood = lamp.get_mood()
     dw, db = _TONE_NUDGES.get(label, (0.0, 0.0))
-    lamp.set_light(color.from_dials(*color.nudge(*mood, dw, db)), transition_s=0.2)
+    lamp.set_light(color.from_dials(*color.nudge(*mood, dw, db)), transition_s=0.15 if label == "yelling" else 0.2)
+    sound = _TONE_SOUNDS.get(label)
+    if sound is not None:
+        lamp.play_sound(sound)
+    gesture = _TONE_GESTURES.get(label)
+    if gesture is not None:
+        gesture(lamp)
     _hold(lamp, seconds, show_gui, standalone)
     # Settle into a smaller nudge off the same mood instead of a fixed
     # neutral amber -- this is what makes the reaction actually track how
@@ -304,7 +397,8 @@ def _seconds_ago_phrase(seconds: float) -> str:
 
 def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None,
             no_speech_timeout_s: float | None = None,
-            shutdown_event: threading.Event | None = None) -> tuple[str, float | None, int, np.ndarray]:
+            shutdown_event: threading.Event | None = None,
+            on_loud: Callable[[float], None] | None = None) -> tuple[str, float | None, int, np.ndarray]:
     """Records the mic until the question trails off into silence, and --
     if a speaker_detector is available -- samples video for who's-talking
     over the *same* window concurrently, since "who was talking" only
@@ -318,9 +412,11 @@ def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None
     ceiling on the whole call, no-speech-wait included, and the speaker
     detector's own timeout has to cover at least as long or it'll return a
     stale bearing before the mic side is done waiting. shutdown_event, if
-    given, aborts recording early (process is shutting down). Returns (transcript,
-    speaker bearing or None, faces seen, raw audio -- the last one for
-    emotion.analyze)."""
+    given, aborts recording early (process is shutting down). on_loud, if
+    given, is passed straight through to record_until_silence -- see that
+    function's own docstring; this layer has no reason to touch it, just
+    to pass it along. Returns (transcript, speaker bearing or None, faces
+    seen, raw audio -- the last one for emotion.analyze)."""
     kwargs = {}
     if max_s is not None:
         kwargs["max_s"] = max_s
@@ -328,6 +424,8 @@ def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None
         kwargs["no_speech_timeout_s"] = no_speech_timeout_s
     if shutdown_event is not None:
         kwargs["shutdown_event"] = shutdown_event
+    if on_loud is not None:
+        kwargs["on_loud"] = on_loud
     detect_cap = max_s if max_s is not None else config.VOICE_MAX_RECORD_S
 
     if speaker_detector is not None and speaker_detector.available:
@@ -366,7 +464,8 @@ def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None
 
 
 def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: MemoryStore | None = None,
-        fsm=None, vision_memory=None, shutdown_event: threading.Event | None = None) -> None:
+        fsm=None, vision_memory=None, shutdown_event: threading.Event | None = None,
+        reminder_engine=None) -> None:
     """lamp/store/fsm/vision_memory are supplied by main.py when this runs
     embedded on a background thread (--chat) instead of as its own
     process -- see the module docstring. Left as None, this owns and
@@ -374,6 +473,15 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
     this; vision_memory has no standalone equivalent (there's no live
     camera loop to ask), so recall always falls back to the remembered
     bearing in that mode, same as it always has.
+
+    reminder_engine has no standalone equivalent either, for the same
+    reason -- presence/recurring reminders need main.py's own per-frame
+    loop to tick against, not this module's much coarser
+    listen/reply cadence (which can block for up to a minute inside a
+    single _listen() call). Left None in standalone mode; create_reminder
+    still exists as a tool either way (see describe_current_view for the
+    same "always offered, gracefully degrades" precedent), it just can't
+    actually do anything without somewhere to tick.
 
     store gets its own sqlite3 connection either way, never one handed in
     from another thread -- sqlite3 connections are confined to the thread
@@ -481,7 +589,7 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
             # tense.
             if live_bearing is not None:
                 direction = bearing_to_direction(live_bearing)
-                reply = f"It's right there, off to the {direction} -- I can see it now."
+                reply = f"It's right there, {direction} -- I can see it now."
             else:
                 direction = bearing_to_direction(obs.bearing_deg)
                 ago = _seconds_ago_phrase(time.time() - obs.timestamp)
@@ -493,6 +601,8 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
         if agent.last_light_action is not None:
             _apply_light_command(lamp, agent.last_light_action, show_gui=not args.no_gui,
                                   standalone=standalone, fsm=fsm)
+        if agent.last_reminder_action is not None:
+            _apply_reminder_action(agent.last_reminder_action, reminder_engine)
 
     if args.ask:
         handle(args.ask)
@@ -504,6 +614,7 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
             speaker_detector.close()
         return
 
+    last_engaged_seen_t: float | None = None
     try:
         in_conversation = False  # True while listening for a follow-up without needing the wake word again
         while True:
@@ -524,7 +635,24 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
                 # already set an accurate look-at-you pose + ENGAGED_COLOR
                 # on the transition in, so there's nothing to add before
                 # anything's actually been said.
-                engaged_now = fsm is not None and fsm.state == State.ENGAGED
+                #
+                # Gating strictly on fsm.state == ENGAGED at this exact
+                # instant looked right but wasn't: BehaviorFSM's own
+                # ENGAGE_EXIT_DWELL_FRAMES (tuned for its own snappy
+                # disengage/attention-seek timing, not this) flips it out
+                # of ENGAGED after roughly a quarter-second of not looking
+                # dead at the camera -- which a person does constantly
+                # while actually talking (glancing down, looking aside to
+                # think). That flicker isn't "they left," but reading the
+                # instantaneous state as if it were forced the wake word
+                # again mid-conversation. _ENGAGED_WAKE_GRACE_S below is a
+                # short memory of "was recently engaged," independent of
+                # the FSM's own fast dwell tuning, so a normal glance away
+                # doesn't re-arm the wake-word gate.
+                if fsm is not None and fsm.state == State.ENGAGED:
+                    last_engaged_seen_t = time.monotonic()
+                engaged_now = last_engaged_seen_t is not None and \
+                    time.monotonic() - last_engaged_seen_t < _ENGAGED_WAKE_GRACE_S
                 if not in_conversation and not engaged_now:
                     woken = voice.wait_for_wake_word(args.wake_word, shutdown_event=shutdown_event)
                     if woken == "quit":
@@ -533,7 +661,9 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
                     time.sleep(0.2)  # let the chirp clear the speaker before the mic opens -- otherwise its tail can leak into the recording and falsely trip the silence detector
                     _look_attentive(lamp, None, fsm=fsm)
                     print("[voice] listening...")
-                    question, speaker_bearing, n_faces, audio = _listen(speaker_detector, shutdown_event=shutdown_event)
+                    question, speaker_bearing, n_faces, audio = _listen(
+                        speaker_detector, shutdown_event=shutdown_event,
+                        on_loud=lambda rms: _on_loud_during_listen(lamp, rms))
                 else:
                     print("[voice] still listening for a follow-up..." if in_conversation
                           else "[voice] engaged -- listening without a wake word...")
@@ -541,7 +671,8 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
                         speaker_detector,
                         max_s=config.CONVERSATION_FOLLOWUP_TIMEOUT_S,
                         no_speech_timeout_s=config.CONVERSATION_FOLLOWUP_TIMEOUT_S,
-                        shutdown_event=shutdown_event)
+                        shutdown_event=shutdown_event,
+                        on_loud=lambda rms: _on_loud_during_listen(lamp, rms))
 
                 if n_faces > 1:
                     print(f"[multi-user] {n_faces} faces in frame, "

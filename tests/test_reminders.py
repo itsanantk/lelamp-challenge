@@ -1,0 +1,246 @@
+"""Unit tests for behavior/reminders.py. Run with: python -m pytest tests/ -v"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import numpy as np
+import pytest
+
+import behavior.reminders as reminders_mod
+from behavior.reminders import Reminder, ReminderEngine
+
+
+class _ImmediateThread:
+    """Stand-in for threading.Thread that runs its target synchronously on
+    .start() instead of on a real background thread -- _fire() fires off
+    voice.speak() this way specifically so it doesn't block the render
+    loop (see its own comment), but that makes the spoken text arrive on
+    a real timing-dependent thread from a test's point of view. Rebinding
+    reminders.threading (not the shared global threading module) to a
+    fake module-like object exposing just this class keeps the test
+    deterministic without touching real threading.Thread at all, even
+    temporarily."""
+
+    def __init__(self, target=None, args=(), daemon=None):
+        self._target = target
+        self._args = args
+
+    def start(self):
+        if self._target is not None:
+            self._target(*self._args)
+
+
+class _FakeThreadingModule:
+    Thread = _ImmediateThread
+
+
+class _FakeLamp:
+    def __init__(self):
+        self.pose_calls = []
+        self.sounds = []
+        self._pose = np.zeros(6)
+
+    def set_target_pose(self, angles, *args, **kwargs):
+        self.pose_calls.append(np.array(angles))
+        self._pose = np.array(angles)
+
+    def get_current_pose(self):
+        return self._pose
+
+    def play_sound(self, event):
+        self.sounds.append(event)
+
+
+@pytest.fixture(autouse=True)
+def _isolate(tmp_path, monkeypatch):
+    # Same reasoning as test_adaptation.py's _isolate_state_path -- every
+    # test in this file that fires a reminder calls save() as a side
+    # effect, so redirect to a throwaway path rather than touching the
+    # real logs/reminders.json. Also fakes out the threading used to fire
+    # voice.speak() (see _ImmediateThread) and voice.speak itself, so
+    # nothing here touches real audio hardware or Piper/SAPI5 loading.
+    monkeypatch.setattr(reminders_mod, "REMINDERS_PATH", tmp_path / "reminders.json")
+    monkeypatch.setattr(reminders_mod, "threading", _FakeThreadingModule())
+    spoken = []
+    monkeypatch.setattr(reminders_mod.voice, "speak", lambda text: spoken.append(text))
+    return spoken
+
+
+def test_add_creates_an_active_reminder_and_persists_it(_isolate):
+    engine = ReminderEngine()
+    r = engine.add(kind="recurring", message="stand up", interval_s=1800.0)
+
+    assert r.active
+    assert r.kind == "recurring"
+    assert engine.active_count() == 1
+    assert reminders_mod.REMINDERS_PATH.exists()
+
+
+def test_recurring_reminder_fires_once_the_interval_elapses():
+    engine = ReminderEngine()
+    r = engine.add(kind="recurring", message="stand up", interval_s=100.0)
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at + 50.0, face_found=True, lamp=lamp)
+    assert lamp.sounds == []  # too soon
+
+    engine.tick(now=r.created_at + 100.0, face_found=True, lamp=lamp)
+    assert lamp.sounds == ["attention_seek"]
+    assert len(lamp.pose_calls) == 1
+    assert r.last_fired_at == r.created_at + 100.0
+
+
+def test_recurring_reminder_fires_again_after_resetting():
+    engine = ReminderEngine()
+    r = engine.add(kind="recurring", message="stand up", interval_s=100.0)
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at + 100.0, face_found=True, lamp=lamp)
+    engine.tick(now=r.created_at + 150.0, face_found=True, lamp=lamp)  # too soon since the reset
+    assert len(lamp.sounds) == 1
+
+    engine.tick(now=r.created_at + 200.0, face_found=True, lamp=lamp)
+    assert len(lamp.sounds) == 2
+
+
+def test_presence_reminder_fires_once_when_the_user_leaves():
+    engine = ReminderEngine()
+    engine.add(kind="presence", message="come back")
+    lamp = _FakeLamp()
+
+    engine.tick(now=0.0, face_found=True, lamp=lamp)   # still there -- no fire
+    assert lamp.sounds == []
+    engine.tick(now=1.0, face_found=False, lamp=lamp)  # just left -- fires
+    assert lamp.sounds == ["attention_seek"]
+
+
+def test_presence_reminder_does_not_refire_every_tick_while_still_away():
+    engine = ReminderEngine()
+    engine.add(kind="presence", message="come back")
+    lamp = _FakeLamp()
+
+    engine.tick(now=0.0, face_found=True, lamp=lamp)
+    engine.tick(now=1.0, face_found=False, lamp=lamp)
+    engine.tick(now=2.0, face_found=False, lamp=lamp)
+    engine.tick(now=3.0, face_found=False, lamp=lamp)
+
+    assert len(lamp.sounds) == 1  # not one per tick spent away
+
+
+def test_presence_reminder_rearms_after_the_user_returns():
+    engine = ReminderEngine()
+    engine.add(kind="presence", message="come back")
+    lamp = _FakeLamp()
+
+    engine.tick(now=0.0, face_found=True, lamp=lamp)
+    engine.tick(now=1.0, face_found=False, lamp=lamp)  # leaves -- fires
+    engine.tick(now=2.0, face_found=True, lamp=lamp)   # returns
+    engine.tick(now=3.0, face_found=False, lamp=lamp)  # leaves again -- fires again
+
+    assert len(lamp.sounds) == 2
+
+
+def test_firing_speaks_the_reminder_message(_isolate):
+    spoken = _isolate
+    engine = ReminderEngine()
+    engine.add(kind="presence", message="hey, come back and sit down")
+    lamp = _FakeLamp()
+
+    engine.tick(now=0.0, face_found=True, lamp=lamp)
+    engine.tick(now=1.0, face_found=False, lamp=lamp)
+
+    assert spoken == ["hey, come back and sit down"]
+
+
+def test_inactive_reminders_never_fire():
+    engine = ReminderEngine()
+    r = engine.add(kind="recurring", message="stand up", interval_s=1.0)
+    r.active = False
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at + 100.0, face_found=True, lamp=lamp)
+
+    assert lamp.sounds == []
+
+
+def test_cancel_all_deactivates_every_active_reminder_and_returns_the_count():
+    engine = ReminderEngine()
+    engine.add(kind="recurring", message="a", interval_s=1.0)
+    engine.add(kind="presence", message="b")
+
+    cancelled = engine.cancel_all()
+
+    assert cancelled == 2
+    assert engine.active_count() == 0
+
+
+def test_cancel_all_can_target_just_one_kind():
+    engine = ReminderEngine()
+    engine.add(kind="recurring", message="a", interval_s=1.0)
+    engine.add(kind="presence", message="b")
+
+    cancelled = engine.cancel_all(kind="recurring")
+
+    assert cancelled == 1
+    assert engine.active_count() == 1
+    assert engine.reminders[1].kind == "presence"
+    assert engine.reminders[1].active
+
+
+def test_cancelled_reminder_never_fires_again():
+    engine = ReminderEngine()
+    engine.add(kind="recurring", message="stand up", interval_s=1.0)
+    engine.cancel_all()
+    lamp = _FakeLamp()
+
+    engine.tick(now=1000.0, face_found=True, lamp=lamp)
+
+    assert lamp.sounds == []
+
+
+def test_load_with_no_file_returns_an_empty_engine():
+    engine = ReminderEngine.load()
+    assert engine.reminders == []
+    assert engine.active_count() == 0
+
+
+def test_save_load_roundtrip_preserves_reminder_state():
+    engine = ReminderEngine()
+    engine.add(kind="recurring", message="stand up", interval_s=1800.0)
+    engine.add(kind="presence", message="come back")
+    engine.save()
+
+    loaded = ReminderEngine.load()
+
+    assert len(loaded.reminders) == 2
+    assert {r.kind for r in loaded.reminders} == {"recurring", "presence"}
+    assert loaded._next_id == engine._next_id
+
+
+def test_new_ids_continue_from_the_loaded_counter_not_restart_at_one():
+    engine = ReminderEngine()
+    engine.add(kind="presence", message="a")
+    engine.add(kind="presence", message="b")
+    engine.save()
+
+    loaded = ReminderEngine.load()
+    r3 = loaded.add(kind="presence", message="c")
+
+    assert r3.id == 3
+
+
+def test_active_summaries_only_lists_active_reminders():
+    engine = ReminderEngine()
+    engine.add(kind="recurring", message="stand up", interval_s=1800.0)
+    r2 = engine.add(kind="presence", message="come back")
+    r2.active = False
+
+    summaries = engine.active_summaries()
+
+    assert len(summaries) == 1
+    assert "stand up" in summaries[0]
+
+
+if __name__ == "__main__":
+    print("Run with pytest -- this file relies on monkeypatch fixtures.")

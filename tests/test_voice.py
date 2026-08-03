@@ -11,8 +11,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
+import pytest
 
 from conversation import voice
+
+
+@pytest.fixture(autouse=True)
+def _no_real_wake_whisper(monkeypatch):
+    # _check_wake_chunk calls _load_wake_whisper() before transcribe() --
+    # without this, every test below would trigger a real whisper.load_model
+    # ("tiny.en") the first time it ran, even though voice.transcribe
+    # itself is monkeypatched per-test. None here simulates "the smaller
+    # model isn't available," which _check_wake_chunk already falls back
+    # from cleanly (see its own comment).
+    monkeypatch.setattr(voice, "_load_wake_whisper", lambda: None)
 
 
 def test_rms_of_silence_is_near_zero():
@@ -55,7 +67,7 @@ _SR = 16000
 
 def test_check_wake_chunk_ignores_silent_audio_and_never_transcribes_it(monkeypatch):
     transcribed = []
-    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: transcribed.append("called") or "n/a")
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None, model=None: transcribed.append("called") or "n/a")
 
     silent = np.zeros(10, dtype="float32")
     result, prev_text = voice._check_wake_chunk(silent, _SR, "hey lamp", "lamp", "")
@@ -65,7 +77,7 @@ def test_check_wake_chunk_ignores_silent_audio_and_never_transcribes_it(monkeypa
 
 
 def test_check_wake_chunk_matches_the_wake_word_in_loud_audio(monkeypatch):
-    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "hey lamp what time is it")
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None, model=None: "hey lamp what time is it")
 
     loud = np.ones(10, dtype="float32")
     result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")
@@ -80,11 +92,11 @@ def test_check_wake_chunk_matches_phrase_split_across_a_chunk_boundary(monkeypat
     chunk alone contains "lamp"."""
     loud = np.ones(10, dtype="float32")
 
-    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "turn on the hey")
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None, model=None: "turn on the hey")
     result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")
     assert result is None
 
-    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "lamp please")
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None, model=None: "lamp please")
     result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", prev_text)
     assert result == "wake"
 
@@ -95,17 +107,17 @@ def test_check_wake_chunk_requires_the_distinctive_word_not_just_hey(monkeypatch
     distinctive word of the phrase) actually has to be heard."""
     loud = np.ones(10, dtype="float32")
 
-    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "hey there, how's it going")
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None, model=None: "hey there, how's it going")
     result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")
     assert result is None, "should NOT have matched on 'hey' alone"
 
-    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "ok hey lamp for real this time")
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None, model=None: "ok hey lamp for real this time")
     result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", prev_text)
     assert result == "wake"
 
 
 def test_check_wake_chunk_matches_case_insensitively(monkeypatch):
-    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "HEY LAMP are you there")
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None, model=None: "HEY LAMP are you there")
 
     loud = np.ones(10, dtype="float32")
     result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")
@@ -113,11 +125,41 @@ def test_check_wake_chunk_matches_case_insensitively(monkeypatch):
     assert result == "wake"
 
 
+def test_check_wake_chunk_transcribes_with_the_wake_word_model_when_available(monkeypatch):
+    # Latency fix: wake-word chunks decode on the smaller/faster
+    # WAKE_WHISPER_MODEL, not the main (more accurate but slower) one --
+    # confirms _check_wake_chunk actually passes _load_wake_whisper()'s
+    # result through to transcribe() rather than always using the default.
+    sentinel = object()
+    monkeypatch.setattr(voice, "_load_wake_whisper", lambda: sentinel)
+    seen_models = []
+    monkeypatch.setattr(voice, "transcribe",
+                         lambda audio, initial_prompt=None, model=None: seen_models.append(model) or "hey lamp")
+
+    loud = np.ones(10, dtype="float32")
+    voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")
+
+    assert seen_models == [sentinel]
+
+
+def test_check_wake_chunk_falls_back_to_the_main_model_if_the_wake_model_failed_to_load(monkeypatch):
+    monkeypatch.setattr(voice, "_load_wake_whisper", lambda: None)
+    monkeypatch.setattr(voice, "_whisper_model", "main-model-sentinel")
+    seen_models = []
+    monkeypatch.setattr(voice, "transcribe",
+                         lambda audio, initial_prompt=None, model=None: seen_models.append(model) or "hey lamp")
+
+    loud = np.ones(10, dtype="float32")
+    voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")
+
+    assert seen_models == ["main-model-sentinel"]
+
+
 def test_check_wake_chunk_recognizes_quit_without_needing_the_wake_word_first(monkeypatch):
     """A wake-gated loop with no quit path of its own is a dead end short
     of Ctrl-C -- the user has to be able to leave voice mode without first
     successfully waking it up."""
-    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None: "quit")
+    monkeypatch.setattr(voice, "transcribe", lambda audio, initial_prompt=None, model=None: "quit")
 
     loud = np.ones(10, dtype="float32")
     result, prev_text = voice._check_wake_chunk(loud, _SR, "hey lamp", "lamp", "")

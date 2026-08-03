@@ -3,7 +3,8 @@ not a trained emotion classifier, three cheap prosodic features (loudness,
 pitch level/variability, speaking rate) mapped to a handful of buckets.
 
 Good enough to color how the lamp reacts (a brighter pulse for energetic,
-a calmer glow for quiet/subdued) -- nowhere near good enough to be
+a calmer glow for quiet/subdued, a startled flinch if you flat-out yell)
+-- nowhere near good enough to be
 presented as clinically meaningful, and it will absolutely get fooled by
 things like a monotone loud voice or a quiet excited whisper. Real
 emotion recognition from speech needs a model trained on labeled prosody
@@ -31,6 +32,14 @@ from conversation import voice
 # louder than a flat average for the same clip.
 _QUIET_RMS = 0.005
 _LOUD_RMS = 0.016
+# config.VOICE_YELL_RMS_THRESHOLD, not a private constant here -- the same
+# "was that a yell" line is also checked live, mid-recording, off raw
+# audio in conversation/voice.py (see its own comment on that constant).
+# Blending loudness with rate/pitch the way _classify() does for
+# tense-vs-energetic would let a fast, animated but not-actually-loud
+# sentence read as a yell; a yell is unambiguous on raw loudness alone, so
+# it's checked first here and skips the blend entirely.
+_YELL_RMS = config.VOICE_YELL_RMS_THRESHOLD
 _CALM_RATE_HZ = 1.0   # rate floor for scoring -- a short, clipped, tense
 _FAST_RATE_HZ = 3.5   # sentence doesn't reliably hit "fast" the way a long excited one does
 # 15.0 was calibrated against std-dev; IQR runs larger for the same
@@ -44,7 +53,7 @@ _AROUSAL_THRESHOLD = 0.5  # scored average of loud/fast needed to leave "calm"
 
 @dataclass
 class VoiceTone:
-    label: str  # "energetic" | "tense" | "quiet" | "calm"
+    label: str  # "yelling" | "energetic" | "tense" | "quiet" | "calm"
     rms: float
     pitch_hz: float | None
     pitch_variability_hz: float | None
@@ -107,6 +116,8 @@ def _normalize(value: float, lo: float, hi: float) -> float:
 
 
 def _classify(rms: float, pitch_var: float | None, rate: float) -> str:
+    if rms >= _YELL_RMS:
+        return "yelling"
     if rms < _QUIET_RMS:
         return "quiet"
 

@@ -65,6 +65,14 @@ EVENT_SOUNDS: dict[str, list[tuple[int, int, int]]] = {
     "give_up": [(480, 340, 320), (340, 260, 380)],
     # Quick, bright, playful double-blip -- a cheerful little "hi!" back.
     "wave_back": [(700, 950, 90), (950, 750, 80), (750, 1050, 110)],
+    # Sharp, short, and dissonant -- a genuine startle, not a curious
+    # chirp. A quick downward snap (opposite of the curious upward sweeps
+    # above) reads as flinching away from something, not toward it.
+    "startled": [(1100, 650, 90), (650, 500, 60)],
+    # Slow, quiet, wavering -- higher and thinner than "give_up" (which is
+    # a resigned sigh after being ignored), this is meant to read as a
+    # plaintive whimper in the moment, not a sign-off.
+    "whine": [(500, 620, 260), (620, 430, 340), (430, 480, 220)],
 }
 
 

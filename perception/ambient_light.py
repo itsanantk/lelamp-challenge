@@ -41,7 +41,23 @@ class AmbientLightSensor:
         # read, not per-pixel precision, and a full 1920x1080 grayscale
         # convert+mean every sample is wasted work at this cadence.
         small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
-        luma = float(np.mean(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))) / 255.0
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        # A high percentile, not the plain mean -- a flashlight (or any
+        # small, genuinely bright thing) pointed at the camera only lights
+        # up a fraction of the frame; the rest stays at normal room
+        # brightness, or even darkens as the webcam's own auto-exposure
+        # compensates for the bright spot. Averaged over the whole frame,
+        # that swing gets diluted down to barely registering. The
+        # brightest ~20% of pixels, though, clearly reflects it -- this
+        # still reads as an unlit room's overall level in a normal room
+        # (nothing pathologically bright anywhere), but responds to a
+        # concentrated bright source the mean was blind to. No real
+        # calibration data behind 80 specifically (same caveat as every
+        # other threshold in this module) -- lower catches a smaller/more
+        # distant light source but drifts closer to the mean's original
+        # blind spot; higher stays cleaner in a normal room but needs a
+        # bigger fraction of the frame lit up before it responds at all.
+        luma = float(np.percentile(gray, 80)) / 255.0
         if self._first_sample:
             self._smoothed_luma = luma
             self._first_sample = False

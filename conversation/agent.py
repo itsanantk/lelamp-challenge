@@ -23,6 +23,7 @@ from typing import Callable
 import cv2
 import numpy as np
 
+from behavior import reminders
 from memory.store import MemoryStore, Observation, bearing_to_direction
 import config
 
@@ -62,6 +63,13 @@ you weren't given data for.
 If the user asks you to change the light itself (not a question about an object), call \
 control_light instead of just replying in text -- a spoken "sure, dimming it" with no actual \
 tool call would leave the light unchanged.
+
+If the user asks you to set up a recurring check-in or an ongoing "make sure I..." habit \
+(e.g. "make sure I get up every 30 minutes", "make sure I don't leave my desk", "stop \
+reminding me to stand up"), call create_reminder instead of just replying in text -- same \
+reasoning as control_light, a spoken acknowledgment with no tool call wouldn't actually set \
+anything up. This is for ongoing self-initiated checks the lamp runs on its own, not for a \
+one-time question you can just answer directly.
 
 recall_object_location only knows a fixed list of common object types (the classes your \
 object detector recognizes) -- it has no idea what a "black water bottle" or "the blue \
@@ -108,6 +116,34 @@ TOOL_SPECS = [
         "params": {
             "action": {"type": "string", "enum": list(LIGHT_ACTIONS),
                        "description": "one of: " + ", ".join(LIGHT_ACTIONS)},
+        },
+        "required": ["action"],
+    },
+    {
+        "name": "create_reminder",
+        "description": "Create or cancel a self-initiated timed check the lamp runs on its "
+                        "own, without being asked again -- 'make sure I get up every 30 "
+                        "minutes' (recurring) or 'make sure I don't get up from my desk' / "
+                        "'tell me if I leave' (presence). Also handles cancelling ('stop "
+                        "reminding me', 'cancel that', 'never mind about the check-ins').",
+        "params": {
+            "action": {"type": "string", "enum": ["create", "cancel"],
+                       "description": "'create' a new reminder, or 'cancel' existing one(s)"},
+            "kind": {"type": "string", "enum": list(reminders.KINDS),
+                     "description": "'recurring': fires repeatedly on a fixed interval (e.g. "
+                                     "every 30 minutes). 'presence': fires once each time the "
+                                     "user leaves the desk (a face stops being detected), then "
+                                     "re-arms once they're back. Required for a 'create' action; "
+                                     "for 'cancel', omit to cancel every active reminder instead "
+                                     "of just one kind."},
+            "interval_minutes": {"type": "number",
+                                  "description": "required when creating a 'recurring' reminder "
+                                                  "-- how often it fires, in minutes"},
+            "message": {"type": "string",
+                        "description": "required when creating a reminder -- what to say out "
+                                        "loud when it fires, phrased the way you'd actually say "
+                                        "it (e.g. 'time to stand up and stretch for a bit' or "
+                                        "'hey, come back and sit down')"},
         },
         "required": ["action"],
     },
@@ -173,6 +209,7 @@ class MemoryAgent:
         self.messages: list[dict] = []
         self.last_recall = RecallResult()
         self.last_light_action: str | None = None  # set by the last control_light call, so chat.py can apply it
+        self.last_reminder_action: dict | None = None  # set by the last create_reminder call, so chat.py can apply it
 
         if self.provider == "openai":
             import openai
@@ -223,6 +260,34 @@ class MemoryAgent:
                 return {"applied": False, "error": f"'{action}' isn't a valid action"}, None
             self.last_light_action = action
             return {"applied": True, "action": action}, None
+        if name == "create_reminder":
+            action = str(tool_input.get("action", "")).strip().lower()
+            if action == "create":
+                kind = str(tool_input.get("kind", "")).strip().lower()
+                if kind not in reminders.KINDS:
+                    return {"created": False, "error": f"kind must be one of {list(reminders.KINDS)}"}, None
+                message = str(tool_input.get("message") or "").strip()
+                if not message:
+                    return {"created": False, "error": "message is required"}, None
+                interval_s = None
+                if kind == "recurring":
+                    minutes = tool_input.get("interval_minutes")
+                    if not minutes or float(minutes) <= 0:
+                        return {"created": False,
+                                "error": "interval_minutes is required (and must be positive) "
+                                         "for a recurring reminder"}, None
+                    interval_s = float(minutes) * 60.0
+                self.last_reminder_action = {"action": "create", "kind": kind, "message": message,
+                                              "interval_s": interval_s}
+                return {"created": True, "kind": kind}, None
+            if action == "cancel":
+                kind = tool_input.get("kind")
+                kind = str(kind).strip().lower() if kind else None
+                if kind is not None and kind not in reminders.KINDS:
+                    return {"cancelled": False, "error": f"kind must be one of {list(reminders.KINDS)}"}, None
+                self.last_reminder_action = {"action": "cancel", "kind": kind}
+                return {"cancelled": True}, None
+            return {"error": f"unknown action '{action}' -- must be 'create' or 'cancel'"}, None
         if name == "describe_current_view":
             if self.get_frame is None:
                 return {"available": False, "reason": "no live camera in this session"}, None
@@ -243,6 +308,7 @@ class MemoryAgent:
         # re-point at a stale object that had nothing to do with this turn.
         self.last_recall = RecallResult()
         self.last_light_action = None
+        self.last_reminder_action = None
         if self.provider == "openai":
             return self._ask_openai(user_text)
         return self._ask_anthropic(user_text)

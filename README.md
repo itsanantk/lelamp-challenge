@@ -182,10 +182,13 @@ scope of each — what they actually do versus a "real" version.
   Shares main.py's own camera frame rather than opening a second capture
   handle. `--no-multi-user` to disable.
 - **Emotion from voice tone** — every voice turn gets a coarse read
-  (energetic/tense/quiet/calm) from loudness, pitch variability, and
-  speaking rate (`conversation/emotion.py`), and the lamp flashes a
-  matching color before it answers. Printed in the terminal too
-  (`[voice] tone: ...`).
+  (yelling/energetic/tense/quiet/calm) from loudness, pitch variability,
+  and speaking rate (`conversation/emotion.py`), and the lamp flashes a
+  matching color before it answers. A genuine yell gets a physical
+  reaction too — a startled flinch + sound, fired live off raw mic
+  loudness the instant it crosses the threshold, not after the sentence
+  finishes recording and gets classified. A quiet/subdued tone gets a
+  soft whine + droop. Printed in the terminal too (`[voice] tone: ...`).
 - **Self-learning attention-seeking** — `behavior/adaptation.py` tracks
   whether attention-seeking attempts actually get a response and nudges
   the delay/cooldown/max-tries within fixed bounds accordingly, persisted
@@ -194,6 +197,32 @@ scope of each — what they actually do versus a "real" version.
   `--fresh-adaptation` wipes the learned state and starts over at
   startup; the `c` key does the same live, mid-session, alongside
   clearing scene memory.
+
+### Self-initiated reminders
+
+Not one of the four challenge bonuses, but built the same way -- ask it to
+watch something and check back on its own, no further prompting needed
+(`behavior/reminders.py`, requires `--chat --voice` or `--chat` since it's
+created via conversation). Two kinds so far:
+
+- **Recurring** — "make sure I get up every 30 minutes." Fires on a fixed
+  interval, resets, repeats.
+- **Presence** — "make sure I don't get up from my desk" / "tell me if I
+  leave." Fires once each time a face stops being detected, then re-arms
+  once you're back (not once per frame you're away).
+
+Both fire the same way: a physical wiggle, a sound cue, and the message
+spoken aloud on a background thread (so firing one doesn't stutter the
+render loop for the length of the TTS clip). "Stop reminding me"/"cancel
+that" cancels active reminders through the same tool. Persisted to
+`logs/reminders.json` across runs, same pattern as adaptation state;
+`--no-reminders` disables it, `--fresh-reminders` wipes it at startup, and
+the `c` key cancels everything active, live.
+
+A third kind — track where an object gets set down (e.g. a water bottle),
+then check on it and its contents at a deadline via a vision-LLM look —
+is a deliberate later addition; it needs placement-tracking and
+vision-judgment machinery this first pass doesn't have yet.
 
 ### Recording the actual video
 
@@ -229,7 +258,9 @@ person shows up mid-watch. `tests/test_viz.py` — display-only mirroring.
 mic-hardware pieces are live-verified instead, same as
 `perception/audio_monitor.py` — see the architecture doc).
 `tests/test_emotion.py` — tone classification thresholds and the
-peak-RMS measurement fix.
+peak-RMS measurement fix. `tests/test_reminders.py` — recurring/presence
+firing and edge-detection logic, cancellation, and the save/load
+round-trip.
 
 ## Layout
 
@@ -253,6 +284,7 @@ lamp/real_backend.py       stub for real servo/LED/speaker hardware
 behavior/state_machine.py  IDLE / ENGAGED / DISENGAGED / ATTENTION_SEEKING
 behavior/object_watch.py   continuously tracks a tracked object (phone) while visible
 behavior/adaptation.py     bounded self-learning of attention-seek timing (bonus)
+behavior/reminders.py      self-initiated timed/recurring/presence checks, created via conversation
 
 memory/store.py            SQLite scene memory
 conversation/agent.py      Claude/OpenAI tool-use agent over the memory store
@@ -268,6 +300,7 @@ tests/test_object_watch.py
 tests/test_viz.py
 tests/test_voice.py
 tests/test_emotion.py
+tests/test_reminders.py
 docs/ARCHITECTURE.md       full writeup
 docs/requirements_traceability.md   challenge brief -> where it's addressed
 docs/demo_script.md        demo recording walkthrough

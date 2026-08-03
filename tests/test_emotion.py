@@ -40,6 +40,23 @@ def test_fast_but_not_loud_still_registers_as_energetic():
     assert emotion._classify(rms=0.008, pitch_var=25.0, rate=5.0) == "energetic"
 
 
+def test_very_loud_classifies_as_yelling_regardless_of_pitch_or_rate():
+    # Loudness alone decides "yelling" -- unlike tense/energetic, it isn't
+    # blended with rate/pitch, since a genuine yell is unambiguous on raw
+    # loudness alone and blending would let a fast-but-quiet sentence
+    # dilute a real yell's classification.
+    assert emotion._classify(rms=0.04, pitch_var=5.0, rate=1.0) == "yelling"
+    assert emotion._classify(rms=0.04, pitch_var=25.0, rate=4.0) == "yelling"
+
+
+def test_yelling_threshold_is_a_hard_floor_above_tense():
+    # Just under the yell floor still classifies via the normal blend
+    # (tense here); just at/over it is yelling outright.
+    just_under = emotion.config.VOICE_YELL_RMS_THRESHOLD - 0.001
+    assert emotion._classify(rms=just_under, pitch_var=5.0, rate=4.0) == "tense"
+    assert emotion._classify(rms=emotion.config.VOICE_YELL_RMS_THRESHOLD, pitch_var=5.0, rate=1.0) == "yelling"
+
+
 def test_analyze_uses_peak_rms_not_a_flat_whole_clip_average():
     # A brief loud burst in an otherwise-quiet clip: the old flat-average
     # rms would dilute this below _LOUD_RMS on every real utterance
@@ -61,5 +78,7 @@ if __name__ == "__main__":
     test_moderate_speech_classifies_as_calm()
     test_loud_but_not_fast_still_registers_as_tense()
     test_fast_but_not_loud_still_registers_as_energetic()
+    test_very_loud_classifies_as_yelling_regardless_of_pitch_or_rate()
+    test_yelling_threshold_is_a_hard_floor_above_tense()
     test_analyze_uses_peak_rms_not_a_flat_whole_clip_average()
     print("ALL EMOTION TESTS PASSED")
