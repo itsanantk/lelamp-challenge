@@ -26,7 +26,8 @@ Say "quit" any time (no need to wake it first) to leave voice mode.
 
 Set LELAMP_LLM_PROVIDER=openai to use OpenAI instead of Anthropic if
 that's the key with credit on it (see config.py). Voice mode runs
-entirely locally (Whisper + SAPI5 TTS) regardless of which LLM you use.
+entirely locally (Whisper + Piper TTS, falling back to SAPI5 if Piper's
+model isn't downloaded) regardless of which LLM you use.
 """
 from __future__ import annotations
 
@@ -47,7 +48,7 @@ if sys.stdout.encoding.lower() != "utf-8":
 import viz
 from behavior.state_machine import ENGAGED_NUDGE, IDLE_COLOR, State
 from lamp import SimulatedLamp, color, kinematics
-from memory.store import MemoryStore
+from memory.store import MemoryStore, bearing_to_direction
 from conversation.agent import MemoryAgent
 from conversation import emotion, voice
 from perception.multi_face import SpeakerDetector
@@ -267,6 +268,19 @@ def _find_live_bearing(vision_memory, object_class: str, window_s: float = 1.6,
     return None
 
 
+def _seconds_ago_phrase(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 90:
+        n = round(seconds)
+        return f"{n} second{'s' if n != 1 else ''}"
+    minutes = seconds / 60.0
+    if minutes < 90:
+        n = round(minutes)
+        return f"{n} minute{'s' if n != 1 else ''}"
+    n = round(minutes / 60.0)
+    return f"{n} hour{'s' if n != 1 else ''}"
+
+
 def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None,
             no_speech_timeout_s: float | None = None,
             shutdown_event: threading.Event | None = None) -> tuple[str, float | None, int, np.ndarray]:
@@ -429,13 +443,25 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
                   f"-- {'confirming' if live_bearing is not None else 'going with the last known spot'}")
             _settle_from_point(lamp, show_gui=not args.no_gui, seconds=1.2, standalone=standalone,
                                 confirmed=live_bearing is not None)
+            # The status sentence is constructed here, deterministically,
+            # instead of using the LLM's own reply -- that reply is always
+            # composed from the remembered sighting alone (it has no way to
+            # know the live-check result, which only just happened), so it
+            # always reads in a "spotted X ago" / "still over there" past-
+            # tense frame. Prefixing "it's right there" onto that used to
+            # produce "it's right there -- spotted 40 seconds ago," which
+            # contradicts itself; and the unprefixed miss case ("still off
+            # to the left") read as claiming current presence when there
+            # wasn't any. live_bearing is the one fact that actually
+            # differs turn to turn, so it -- not the LLM -- decides the
+            # tense.
             if live_bearing is not None:
-                # The reply text itself was composed from the remembered
-                # sighting only (re-prompting the LLM on the live-check
-                # result isn't worth a second round trip) -- this is what
-                # actually makes "yes, it's here right now" audible rather
-                # than always defaulting to "last seen" phrasing.
-                reply = f"It's right there -- {reply}"
+                direction = bearing_to_direction(live_bearing)
+                reply = f"It's right there, off to the {direction} -- I can see it now."
+            else:
+                direction = bearing_to_direction(obs.bearing_deg)
+                ago = _seconds_ago_phrase(time.time() - obs.timestamp)
+                reply = f"I don't see it right now, but it was last seen {direction}, about {ago} ago."
 
         print(f"LAMP: {reply}\n")
         if args.voice:

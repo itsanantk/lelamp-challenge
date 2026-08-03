@@ -27,12 +27,16 @@ gitignored since they're big binaries — redownload on a fresh clone):
 curl -L -o models/face_landmarker.task https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
 curl -L -o models/yolo11s.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo11s.pt
 curl -L -o models/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+curl -L -o models/en_US-amy-medium.onnx https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx
+curl -L -o models/en_US-amy-medium.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json
 ```
 
 The hand-landmarker model is only needed for hand-wave detection
 (perception/hand_wave.py) — if it's missing, main.py prints a note and
 carries on with that feature disabled (`--no-hand-wave` to skip it
-outright).
+outright). The Piper voice model is spoken-output only (conversation/voice.py)
+— if it's missing, TTS falls back to the built-in, noticeably more robotic
+SAPI5 voice instead of failing outright.
 
 Object detection is YOLO11s (small), not the nano tier — noticeably
 better hit rate for a small latency cost, see the tradeoffs section in

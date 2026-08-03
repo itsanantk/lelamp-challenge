@@ -13,6 +13,8 @@ RECORDINGS_DIR = ROOT_DIR / "recordings"
 FACE_LANDMARKER_MODEL = MODELS_DIR / "face_landmarker.task"
 HAND_LANDMARKER_MODEL = MODELS_DIR / "hand_landmarker.task"
 YOLO_MODEL = MODELS_DIR / "yolo11s.pt"
+PIPER_MODEL = MODELS_DIR / "en_US-amy-medium.onnx"
+PIPER_MODEL_CONFIG = MODELS_DIR / "en_US-amy-medium.onnx.json"
 MEMORY_DB = LOGS_DIR / "memory.sqlite3"
 
 for _d in (MODELS_DIR, LOGS_DIR, RECORDINGS_DIR):

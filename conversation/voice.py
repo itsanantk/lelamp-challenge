@@ -1,12 +1,18 @@
 """Voice I/O for chat.py: mic -> local Whisper -> text, and text -> TTS.
 
-Both directions run locally (Whisper via openai-whisper, TTS via pyttsx3
-on top of SAPI5) so voice mode doesn't depend on which LLM key is funded,
-and doesn't add a network round trip on top of the one the LLM call
-already needs. Whisper gets its audio as an in-memory float32 array
+Both directions run locally so voice mode doesn't depend on which LLM key
+is funded, and doesn't add a network round trip on top of the one the LLM
+call already needs. Whisper gets its audio as an in-memory float32 array
 straight from sounddevice rather than a file path, which sidesteps
 needing ffmpeg installed (openai-whisper only shells out to ffmpeg when
 you hand it a file path).
+
+TTS is Piper (a real local neural voice, ONNX-based) when its model files
+are present, falling back to pyttsx3/SAPI5 otherwise -- SAPI5 is decades-old
+formant/concatenative synthesis with a real ceiling on how natural it can
+ever sound, which is exactly what live listening flagged ("robotic," "not
+smooth or gentle"); Piper is what actually fixes that while staying fully
+local. See README for the model download command.
 """
 from __future__ import annotations
 
@@ -19,17 +25,48 @@ import sounddevice as sd
 import config
 
 _whisper_model = None
+_piper_voice = None
+_piper_load_failed = False
 
 
 def preload() -> None:
-    """Load the Whisper model up front so the first turn of a conversation
-    isn't the one eating the ~10-15s load time."""
+    """Loads Whisper and (if its model files are present) Piper up front,
+    so the first turn of a conversation isn't the one eating their load
+    times -- Whisper's ~10-15s, and Piper's own first inference separately
+    eats a one-time ONNX graph-optimization cost (~4s locally, same
+    reasoning as YOLO's warmup call in vision_memory.py) which the
+    explicit warmup synthesis call below absorbs here instead."""
     global _whisper_model
     if _whisper_model is None:
         import whisper
         print(f"[voice] loading Whisper ({config.WHISPER_MODEL})...")
         _whisper_model = whisper.load_model(config.WHISPER_MODEL)
         print("[voice] ready")
+    _load_piper()
+
+
+def _load_piper():
+    """Returns the cached PiperVoice, loading (and warming up) it on first
+    use. Returns None -- permanently, via _piper_load_failed -- if the
+    model files aren't there or fail to load, so every later speak() call
+    doesn't re-attempt and re-print the same failure."""
+    global _piper_voice, _piper_load_failed
+    if _piper_voice is not None or _piper_load_failed:
+        return _piper_voice
+    if not (config.PIPER_MODEL.exists() and config.PIPER_MODEL_CONFIG.exists()):
+        print(f"[voice] Piper model not found at {config.PIPER_MODEL} -- falling back to "
+              f"the built-in SAPI5 voice (see README for the download command)")
+        _piper_load_failed = True
+        return None
+    try:
+        from piper import PiperVoice
+        voice = PiperVoice.load(str(config.PIPER_MODEL), config_path=str(config.PIPER_MODEL_CONFIG))
+        list(voice.synthesize("Hi."))  # warmup -- see preload()'s docstring
+        _piper_voice = voice
+    except Exception as e:
+        print(f"[voice] couldn't load Piper ({e}) -- falling back to the built-in SAPI5 voice")
+        _piper_load_failed = True
+    return _piper_voice
 
 
 def _rms(block: np.ndarray) -> float:
@@ -281,6 +318,28 @@ def _select_warmer_voice(engine) -> None:
 def speak(text: str) -> None:
     if not text:
         return
+    voice = _load_piper()
+    if voice is not None:
+        _speak_piper(voice, text)
+    else:
+        _speak_sapi5(text)
+
+
+def _speak_piper(voice, text: str) -> None:
+    chunks = list(voice.synthesize(text))
+    if not chunks:
+        return
+    sr = chunks[0].sample_rate
+    audio = np.concatenate([c.audio_float_array for c in chunks])
+    sd.play(audio, samplerate=sr)
+    sd.wait()
+
+
+def _speak_sapi5(text: str) -> None:
+    """Fallback when Piper's model files aren't downloaded -- see
+    _load_piper(). SAPI5 via pyttsx3; genuinely more robotic/less natural
+    than Piper (decades-old formant/concatenative synthesis, not neural),
+    kept only so voice mode still works with zero extra setup."""
     import pyttsx3
     engine = pyttsx3.init()
     _select_warmer_voice(engine)

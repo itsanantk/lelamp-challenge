@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 models/*.task
 models/*.pt
+models/*.onnx
+models/*.onnx.json
 logs/*.csv
 logs/*.sqlite3
 logs/*.json

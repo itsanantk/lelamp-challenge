@@ -6,6 +6,7 @@ Run with: python -m pytest tests/ -v
 import argparse
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -394,6 +395,7 @@ def test_recall_points_at_the_object_before_speaking_and_confirms_if_live(monkey
     class _FakeObs:
         object_class = "cell phone"
         bearing_deg = 30.0
+        timestamp = time.time()
 
     class _FakeAgent:
         def __init__(self, store):
@@ -423,7 +425,10 @@ def test_recall_points_at_the_object_before_speaking_and_confirms_if_live(monkey
     # actually confirms the find.
     assert [kind for kind, _ in order] == ["point", "speak", "speak"]
     assert order[0][1] == 30.0  # pointed at the remembered bearing -- see docstring above
-    assert order[2][1].startswith("It's right there --")
+    # Deterministic status sentence, not the LLM's own reply -- see
+    # handle()'s comment on why that reply can't be trusted for tense.
+    assert order[2][1].startswith("It's right there,")
+    assert "I can see it now" in order[2][1]
 
 
 def test_recall_does_not_add_a_live_confirmation_when_not_currently_visible(monkeypatch):
@@ -450,6 +455,7 @@ def test_recall_does_not_add_a_live_confirmation_when_not_currently_visible(monk
     class _FakeObs:
         object_class = "cell phone"
         bearing_deg = 30.0
+        timestamp = time.time()
 
     class _FakeAgent:
         def __init__(self, store):
@@ -474,9 +480,11 @@ def test_recall_does_not_add_a_live_confirmation_when_not_currently_visible(monk
     chat.run(args, lamp=_FakeLamp(), store=_FakeStore())
 
     # The "let me check" filler still plays (it's audible regardless of
-    # outcome), but no "It's right there" confirmation gets prefixed since
-    # the live check came back empty.
-    assert spoken == ["Let me check.", "I last saw your phone on the desk."]
+    # outcome). The reply itself is the deterministic "not seen right now"
+    # sentence, not the LLM's own (misleadingly present-tense-sounding)
+    # reply text -- see handle()'s comment.
+    assert spoken[0] == "Let me check."
+    assert spoken[1].startswith("I don't see it right now, but it was last seen")
 
 
 class _FakeDetection:
