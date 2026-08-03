@@ -318,4 +318,35 @@ class SimulatedLamp(LampActuator):
         cv2.putText(canvas, "SIMULATED LAMP", (int(12 * _SCALE), int(24 * _SCALE)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55 * _SCALE, (150, 150, 150),
                     max(1, int(1 * _SCALE)), cv2.LINE_AA)
+
+        self._draw_mood_bars(canvas)
         return canvas
+
+    def _draw_mood_bars(self, canvas: np.ndarray) -> None:
+        """The two dials (lamp/color.py) as actual bars, not just a color
+        you have to eyeball -- this is self._mood_warmth/_mood_brightness
+        directly (the persistent baseline set_mood() controls), not the
+        currently-displayed light, which can be transiently nudged away
+        from it by tracking/tone/ambient -- the bars show the setting,
+        not every momentary reaction on top of it."""
+        s = _SCALE
+        bar_w, bar_h = int(150 * s), int(14 * s)
+        gap = int(28 * s)
+        x0 = int(12 * s)
+        y0 = CANVAS_SIZE - int(20 * s) - 2 * bar_h - gap
+        font_scale = 0.42 * s
+        text_w = max(1, int(1 * s))
+
+        rows = [
+            ("WARMTH", self._mood_warmth, (25, 130, 255)),     # fill = the warm endpoint's own color
+            ("BRIGHT", self._mood_brightness, (225, 225, 225)),  # fill = a plain white -- brightness has no hue of its own
+        ]
+        for i, (label, value, fill_color) in enumerate(rows):
+            y = y0 + i * (bar_h + gap)
+            cv2.putText(canvas, f"{label} {int(round(value * 100))}%", (x0, y - int(4 * s)),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (190, 190, 190), text_w, cv2.LINE_AA)
+            cv2.rectangle(canvas, (x0, y), (x0 + bar_w, y + bar_h), (55, 52, 48), -1)
+            fill_w = int(bar_w * float(np.clip(value, 0.0, 1.0)))
+            if fill_w > 0:
+                cv2.rectangle(canvas, (x0, y), (x0 + fill_w, y + bar_h), fill_color, -1)
+            cv2.rectangle(canvas, (x0, y), (x0 + bar_w, y + bar_h), (110, 108, 104), text_w)

@@ -9,3 +9,9 @@ piper-tts>=1.6
 openai-whisper>=20250625
 sounddevice>=0.5
 numpy>=2.4
+resemblyzer>=0.1.4
+# resemblyzer's webrtcvad dependency imports pkg_resources at module load,
+# which setuptools>=81 no longer ships -- pin below that until webrtcvad
+# updates. If you hit "ModuleNotFoundError: No module named 'pkg_resources'"
+# from perception/speaker_id.py, this is why.
+setuptools<81

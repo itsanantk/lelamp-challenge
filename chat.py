@@ -52,6 +52,7 @@ from memory.store import MemoryStore, bearing_to_direction
 from conversation.agent import MemoryAgent
 from conversation import emotion, voice
 from perception.multi_face import SpeakerDetector
+from perception.speaker_id import SpeakerIdentifier
 
 # "Found it" reads as a bright, slightly cooler spotlight -- a nudge off
 # whatever mood is currently showing, not an unrelated fixed hue (see
@@ -344,6 +345,47 @@ def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None
     return text, bearing, n_faces, audio
 
 
+# Stripped off the front of a name-question response before taking
+# whatever's left as the name itself -- Whisper transcribes a full
+# sentence ("my name is Anant"), not just the word we actually want.
+_NAME_PREFIXES = ("my name is ", "i'm ", "im ", "it's ", "its ", "call me ", "this is ", "i am ")
+
+
+def _extract_name(text: str) -> str | None:
+    t = text.strip().lower()
+    if not t:
+        return None
+    for prefix in _NAME_PREFIXES:
+        if t.startswith(prefix):
+            t = t[len(prefix):]
+            break
+    t = t.strip(" .!?,")
+    if not t:
+        return None
+    # Just the first token -- "anant, nice to meet you" or "anant here"
+    # said past the name itself shouldn't get folded into it. Stripped
+    # again after splitting, not just before -- "anant, nice to meet you"
+    # leaves a trailing comma stuck to the first token otherwise.
+    return t.split()[0].strip(" .!?,").capitalize()
+
+
+def _ask_for_name(speaker_identifier, speaker_id: str,
+                   shutdown_event: threading.Event | None = None) -> None:
+    """A brand-new voice (see perception/speaker_id.py) gets asked its
+    name once, right here, before the turn continues on to actually
+    answering whatever question triggered this -- a short, self-contained
+    exchange, not folded into the LLM conversation (naming yourself isn't
+    something to route through recall/tool-use at all)."""
+    voice.speak("Hey, I don't think we've met -- what should I call you?")
+    answer, _, _, _ = _listen(None, max_s=8.0, no_speech_timeout_s=4.0, shutdown_event=shutdown_event)
+    name = _extract_name(answer)
+    if name:
+        speaker_identifier.set_name(speaker_id, name)
+        voice.speak(f"Nice to meet you, {name}!")
+    else:
+        voice.speak("No worries, I'll just get to know your voice for now.")
+
+
 def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: MemoryStore | None = None,
         fsm=None, vision_memory=None, shutdown_event: threading.Event | None = None) -> None:
     """lamp/store/fsm/vision_memory are supplied by main.py when this runs
@@ -365,7 +407,7 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
     owns_store = store is None
     if store is None:
         store = MemoryStore()
-    agent = MemoryAgent(store)
+    agent = MemoryAgent(store, get_frame=(lambda: vision_memory.last_frame) if vision_memory is not None else None)
     owns_lamp = lamp is None
     if lamp is None:
         lamp = SimulatedLamp(mute=args.mute)
@@ -382,6 +424,14 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
             if not speaker_detector.available:
                 print("[chat] --multi-user: couldn't open the camera (main.py might already have it), "
                       "continuing without speaker ID")
+
+    # Voice-embedding speaker ID (perception/speaker_id.py) is independent
+    # of --multi-user/SpeakerDetector above -- that one only ever answers
+    # "which face in frame was talking this turn" from video, with no
+    # memory of who that was; this persists a voice fingerprint across
+    # turns *and* sessions, and works even with just one person and no
+    # camera-based face tracking at all.
+    speaker_identifier = SpeakerIdentifier() if (args.voice and not args.no_speaker_id) else None
 
     known = store.list_known_classes()
     print(f"[chat] LeLamp remembers {len(known)} object type(s): {', '.join(known) or '(nothing yet -- run main.py first)'}")
@@ -537,6 +587,17 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
                 pitch_var_str = f"{tone.pitch_variability_hz:.1f}" if tone.pitch_variability_hz is not None else "n/a"
                 print(f"[voice] tone: {tone.label} (rms={tone.rms:.4f} rate={tone.speaking_rate_hz:.2f}Hz "
                       f"pitch_var={pitch_var_str})")
+                if speaker_identifier is not None:
+                    # Same audio clip already recorded for transcription/
+                    # tone above -- no extra recording needed. Persists
+                    # across turns *and* sessions (see perception/
+                    # speaker_id.py), unlike n_faces/speaker_bearing above,
+                    # which only ever know "someone" for this one turn.
+                    voice_speaker_id, is_new_voice = speaker_identifier.identify(audio, config.VOICE_SAMPLE_RATE)
+                    tag = " (new voice)" if is_new_voice else ""
+                    print(f"[voice] speaker: {speaker_identifier.display_name(voice_speaker_id)}{tag}")
+                    if is_new_voice:
+                        _ask_for_name(speaker_identifier, voice_speaker_id, shutdown_event=shutdown_event)
                 print(f"YOU (voice): {question}")
             else:
                 try:
@@ -573,6 +634,8 @@ def parse_args() -> argparse.Namespace:
                     help="with --voice: identify which face was talking when more than one is in frame")
     p.add_argument("--wake-word", type=str, default=config.WAKE_WORD,
                     help=f'with --voice: phrase that wakes it up to listen (default: "{config.WAKE_WORD}")')
+    p.add_argument("--no-speaker-id", action="store_true",
+                    help="disable persistent voice-based speaker identification")
     return p.parse_args()
 
 

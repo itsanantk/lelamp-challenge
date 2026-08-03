@@ -61,6 +61,12 @@ class VisionMemory:
         self.scan_count = 0  # bumped once per *actual* YOLO call -- lets another thread
                                # (chat.py's recall) detect when a requested scan has landed
         self._force_scan = False
+        self.last_frame: np.ndarray | None = None  # kept fresh every tick regardless of
+                                                       # whether a YOLO scan actually ran this
+                                                       # tick -- conversation/agent.py's
+                                                       # describe_current_view tool hands this
+                                                       # straight to the LLM for objects outside
+                                                       # the fixed detection classes
 
     def request_immediate_scan(self) -> None:
         """Bypasses both the interval and scene-change-skip gating for the
@@ -99,6 +105,7 @@ class VisionMemory:
         inference-time input restriction, not a new coordinate system
         leaking out. None (the default) scans the full frame, unchanged
         from before this existed."""
+        self.last_frame = frame
         now = now if now is not None else time.monotonic()
         interval = config.YOLO_FAST_SCAN_INTERVAL_S if self.fast_mode else config.YOLO_SCAN_INTERVAL_S
         if not self._force_scan and now - self._last_scan_t < interval:

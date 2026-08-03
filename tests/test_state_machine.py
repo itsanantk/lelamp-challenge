@@ -219,6 +219,62 @@ def test_give_up_dips_briefly_then_recovers_to_a_normal_resting_look():
     lamp.close()
 
 
+def test_ambient_brightness_nudge_reasserts_the_idle_color_when_it_drifts():
+    fsm = BehaviorFSM(lamp=FakeLamp())
+    fsm.update(engaged=False, user_bearing_deg=0.0, dt=0.05)  # settle into IDLE
+    assert fsm.state == State.IDLE
+    fsm.lamp.calls.clear()
+
+    fsm.ambient_brightness_nudge = 0.15  # well past the 0.03 re-apply threshold
+    fsm.update(engaged=False, user_bearing_deg=0.0, dt=0.05)
+
+    assert any(c[0] == "light" for c in fsm.lamp.calls), "expected the idle color to be reasserted"
+
+
+def test_ambient_brightness_nudge_does_not_reapply_for_tiny_drift():
+    fsm = BehaviorFSM(lamp=FakeLamp())
+    fsm.update(engaged=False, user_bearing_deg=0.0, dt=0.05)
+    fsm.lamp.calls.clear()
+
+    fsm.ambient_brightness_nudge = 0.01  # under the 0.03 threshold
+    fsm.update(engaged=False, user_bearing_deg=0.0, dt=0.05)
+
+    assert not any(c[0] == "light" for c in fsm.lamp.calls)
+
+
+def test_ambient_brightness_nudge_also_reapplies_while_engaged():
+    # IDLE and ENGAGED are the two sustained-look states -- between them
+    # the lamp spends most of any real session, which is the whole point
+    # of covering both (see the field's own comment in state_machine.py).
+    fsm = BehaviorFSM(lamp=FakeLamp())
+    fsm.update(engaged=True, user_bearing_deg=0.0, dt=0.05)
+    fsm.lamp.calls.clear()
+
+    fsm.ambient_brightness_nudge = 0.15
+    fsm.update(engaged=True, user_bearing_deg=0.0, dt=0.05)
+
+    assert any(c[0] == "light" for c in fsm.lamp.calls)
+
+
+def test_ambient_brightness_nudge_is_not_reapplied_during_attention_seeking():
+    fsm = BehaviorFSM(lamp=FakeLamp())
+    fsm.update(engaged=True, user_bearing_deg=0.0, dt=0.03)
+    fsm.update(engaged=False, user_bearing_deg=0.0, dt=0.03)
+
+    t = 0.0
+    while t < config.ATTENTION_SEEK_DELAY_S + config.DISENGAGE_GRACE_S + 1.0 \
+            and fsm.state != State.ATTENTION_SEEKING:
+        fsm.update(engaged=False, user_bearing_deg=0.0, dt=0.05)
+        t += 0.05
+    assert fsm.state == State.ATTENTION_SEEKING
+    fsm.lamp.calls.clear()
+
+    fsm.ambient_brightness_nudge = 0.15
+    fsm.update(engaged=False, user_bearing_deg=0.0, dt=0.05)
+
+    assert not any(c[0] == "light" for c in fsm.lamp.calls)
+
+
 if __name__ == "__main__":
     test_idle_to_engaged()
     test_engaged_to_disengaged_grace_then_attention_seek()

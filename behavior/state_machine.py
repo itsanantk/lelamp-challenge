@@ -100,6 +100,18 @@ class BehaviorFSM:
     _seek_tilt_sign: float = 1.0  # alternates per attempt -- a puppy doesn't cock its head the same way either
     _give_up_phase: int = 0  # 0 = not giving up, 1 = brief dip, 2 = recovering to a normal resting look
     _give_up_timer: float = 0.0
+    # Set by main.py each tick from perception/ambient_light.py -- a plain
+    # float, not a sensor reference, so this class stays camera/model-free
+    # (see the module docstring). Read by _idle_color()/_engaged_color()
+    # and re-applied while IDLE or ENGAGED (see update()) -- the two
+    # sustained-look states, and between them where the lamp spends most
+    # of any real session. ATTENTION_SEEKING/tracking/tone-flash stay
+    # untouched -- those are already brief, deliberately-tuned reactive
+    # moments, and layering a second brightness source into short-lived
+    # transitions risked reading as flickery instead of "the room got
+    # darker, so it's helping a little."
+    ambient_brightness_nudge: float = 0.0
+    _last_ambient_nudge_applied: float = 0.0
 
     def update(self, engaged: bool, user_bearing_deg: float | None, dt: float,
                user_busy: bool = False) -> State:
@@ -123,6 +135,20 @@ class BehaviorFSM:
         elif self._give_up_phase != 0:
             self._tick_give_up(dt)
 
+        # Re-asserts the current look whenever ambient_brightness_nudge has
+        # drifted enough to matter -- _idle_color()/_engaged_color() only
+        # otherwise get called at state-transition moments, so without
+        # this a long uninterrupted idle/engaged stretch would never
+        # notice the room actually got darker. Gated to a real drift (not
+        # every tick) and a slow 2s fade -- ambient changes are gradual in
+        # real life, the lamp's own reaction should read as gradual too,
+        # not a snap.
+        if self.state in (State.IDLE, State.ENGAGED) and \
+                abs(self.ambient_brightness_nudge - self._last_ambient_nudge_applied) > 0.02:
+            color_fn = self._idle_color if self.state == State.IDLE else self._engaged_color
+            self.lamp.set_light(color_fn(), transition_s=2.0)
+            self._last_ambient_nudge_applied = self.ambient_brightness_nudge
+
         return self.state
 
     # -- mood-relative colors --------------------------------------------
@@ -130,10 +156,11 @@ class BehaviorFSM:
     # constant -- see the module docstring above IDLE_COLOR.
 
     def _idle_color(self) -> tuple[int, int, int]:
-        return color.from_dials(*self.lamp.get_mood())
+        return color.from_dials(*color.nudge(*self.lamp.get_mood(), db=self.ambient_brightness_nudge))
 
     def _engaged_color(self) -> tuple[int, int, int]:
-        return color.from_dials(*color.nudge(*self.lamp.get_mood(), *ENGAGED_NUDGE))
+        dw, db = ENGAGED_NUDGE
+        return color.from_dials(*color.nudge(*self.lamp.get_mood(), dw=dw, db=db + self.ambient_brightness_nudge))
 
     def _attention_color(self, intensity: float) -> tuple[int, int, int]:
         pulse = color.from_dials(*color.nudge(*self.lamp.get_mood(), *ATTENTION_NUDGE))

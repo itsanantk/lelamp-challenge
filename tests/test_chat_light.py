@@ -173,7 +173,7 @@ def test_run_with_a_shared_lamp_and_store_never_closes_them(monkeypatch):
     # survive after this conversation turn returns -- closing either out
     # from under main.py's own still-running loop would be a real bug.
     class _FakeAgent:
-        def __init__(self, store):
+        def __init__(self, store, get_frame=None):
             self.last_light_action = None
             self.last_recall = type("R", (), {"observation": None})()
 
@@ -195,7 +195,7 @@ def test_run_with_a_shared_lamp_and_store_never_closes_them(monkeypatch):
     lamp = _FakeLamp()
     store = _FakeStore()
     args = argparse.Namespace(no_gui=True, voice=False, mute=True, ask="where is my phone",
-                               multi_user=False, wake_word="hey lamp")
+                               multi_user=False, wake_word="hey lamp", no_speaker_id=True)
 
     chat.run(args, lamp=lamp, store=store)
 
@@ -215,7 +215,7 @@ def test_shutdown_event_already_set_never_touches_real_mic_io(monkeypatch):
     monkeypatch.setattr(chat.voice, "wait_for_wake_word", lambda *a, **k: called.append(1) or "wake")
 
     class _FakeAgent:
-        def __init__(self, store):
+        def __init__(self, store, get_frame=None):
             self.last_light_action = None
             self.last_recall = type("R", (), {"observation": None})()
 
@@ -234,7 +234,7 @@ def test_shutdown_event_already_set_never_touches_real_mic_io(monkeypatch):
     shutdown = threading.Event()
     shutdown.set()
     args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
-                               multi_user=False, wake_word="hey lamp")
+                               multi_user=False, wake_word="hey lamp", no_speaker_id=True)
 
     chat.run(args, lamp=_FakeLamp(), store=_FakeStore(), shutdown_event=shutdown)
 
@@ -262,7 +262,7 @@ def test_being_engaged_skips_the_wake_word_gate_entirely(monkeypatch):
     monkeypatch.setattr(chat, "_listen", _fake_listen)
 
     class _FakeAgent:
-        def __init__(self, store):
+        def __init__(self, store, get_frame=None):
             self.last_light_action = None
             self.last_recall = type("R", (), {"observation": None})()
 
@@ -279,7 +279,7 @@ def test_being_engaged_skips_the_wake_word_gate_entirely(monkeypatch):
             pass
 
     args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
-                               multi_user=False, wake_word="hey lamp")
+                               multi_user=False, wake_word="hey lamp", no_speaker_id=True)
 
     chat.run(args, lamp=_FakeLamp(), store=_FakeStore(), fsm=_FakeFSM(State.ENGAGED))
 
@@ -330,7 +330,7 @@ def test_calm_speech_never_triggers_a_tone_flash(monkeypatch):
                                                        "pitch_variability_hz": None})())
 
     class _FakeAgent:
-        def __init__(self, store):
+        def __init__(self, store, get_frame=None):
             self.last_light_action = None
             self.last_recall = type("R", (), {"observation": None})()
 
@@ -347,7 +347,7 @@ def test_calm_speech_never_triggers_a_tone_flash(monkeypatch):
             pass
 
     args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
-                               multi_user=False, wake_word="hey lamp")
+                               multi_user=False, wake_word="hey lamp", no_speaker_id=True)
 
     chat.run(args, lamp=_FakeLamp(), store=_FakeStore())
 
@@ -398,7 +398,7 @@ def test_recall_points_at_the_object_before_speaking_and_confirms_if_live(monkey
         timestamp = time.time()
 
     class _FakeAgent:
-        def __init__(self, store):
+        def __init__(self, store, get_frame=None):
             self.last_light_action = None
             self.last_recall = type("R", (), {"observation": _FakeObs()})()
 
@@ -415,7 +415,7 @@ def test_recall_points_at_the_object_before_speaking_and_confirms_if_live(monkey
             pass
 
     args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
-                               multi_user=False, wake_word="hey lamp")
+                               multi_user=False, wake_word="hey lamp", no_speaker_id=True)
 
     chat.run(args, lamp=_FakeLamp(), store=_FakeStore())
 
@@ -458,7 +458,7 @@ def test_recall_does_not_add_a_live_confirmation_when_not_currently_visible(monk
         timestamp = time.time()
 
     class _FakeAgent:
-        def __init__(self, store):
+        def __init__(self, store, get_frame=None):
             self.last_light_action = None
             self.last_recall = type("R", (), {"observation": _FakeObs()})()
 
@@ -475,7 +475,7 @@ def test_recall_does_not_add_a_live_confirmation_when_not_currently_visible(monk
             pass
 
     args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
-                               multi_user=False, wake_word="hey lamp")
+                               multi_user=False, wake_word="hey lamp", no_speaker_id=True)
 
     chat.run(args, lamp=_FakeLamp(), store=_FakeStore())
 
@@ -485,6 +485,115 @@ def test_recall_does_not_add_a_live_confirmation_when_not_currently_visible(monk
     # reply text -- see handle()'s comment.
     assert spoken[0] == "Let me check."
     assert spoken[1].startswith("I don't see it right now, but it was last seen")
+
+
+def test_extract_name_strips_common_lead_ins():
+    assert chat._extract_name("my name is Anant") == "Anant"
+    assert chat._extract_name("I'm anant") == "Anant"
+    assert chat._extract_name("it's Anant, nice to meet you too") == "Anant"
+    assert chat._extract_name("Anant") == "Anant"
+
+
+def test_extract_name_returns_none_for_empty_or_silence():
+    assert chat._extract_name("") is None
+    assert chat._extract_name("   ") is None
+
+
+class _FakeSpeakerIdentifier:
+    def __init__(self):
+        self.named = {}
+
+    def set_name(self, speaker_id, name):
+        self.named[speaker_id] = name
+
+
+def test_ask_for_name_enrolls_the_name_when_given(monkeypatch):
+    spoken = []
+    monkeypatch.setattr(chat.voice, "speak", lambda text: spoken.append(text))
+    monkeypatch.setattr(chat, "_listen", lambda *a, **k: ("my name is Anant", None, 0, None))
+
+    ident = _FakeSpeakerIdentifier()
+    chat._ask_for_name(ident, "speaker-abc123")
+
+    assert ident.named["speaker-abc123"] == "Anant"
+    assert spoken[0].startswith("Hey, I don't think we've met")
+    assert "Anant" in spoken[1]
+
+
+def test_ask_for_name_handles_no_response(monkeypatch):
+    spoken = []
+    monkeypatch.setattr(chat.voice, "speak", lambda text: spoken.append(text))
+    monkeypatch.setattr(chat, "_listen", lambda *a, **k: ("", None, 0, None))
+
+    ident = _FakeSpeakerIdentifier()
+    chat._ask_for_name(ident, "speaker-abc123")
+
+    assert "speaker-abc123" not in ident.named
+    assert len(spoken) == 2  # still asked, still says something back -- just no name learned
+
+
+def test_new_voice_triggers_asking_for_a_name_during_the_voice_loop(monkeypatch):
+    monkeypatch.setattr(chat.voice, "preload", lambda: None)
+    monkeypatch.setattr(chat.voice, "speak", lambda text: None)
+    monkeypatch.setattr(chat.voice, "wait_for_wake_word", lambda *a, **k: "wake")
+    monkeypatch.setattr(chat.emotion, "analyze",
+                         lambda audio: type("T", (), {"label": "calm", "rms": 0.0,
+                                                       "speaking_rate_hz": 0.0,
+                                                       "pitch_variability_hz": None})())
+
+    asked = []
+    monkeypatch.setattr(chat, "_ask_for_name", lambda ident, sid, shutdown_event=None: asked.append(sid))
+
+    class _FakeIdentifier:
+        def __init__(self):
+            self._asked_once = False
+
+        def identify(self, audio, sample_rate):
+            # Real SpeakerIdentifier only reports is_new=True the first
+            # time a given voice is seen -- the follow-up turn later in
+            # this same test must not re-trigger _ask_for_name.
+            is_new = not self._asked_once
+            self._asked_once = True
+            return "speaker-new1", is_new
+
+        def display_name(self, sid):
+            return "speaker new1"
+
+    monkeypatch.setattr(chat, "SpeakerIdentifier", lambda: _FakeIdentifier())
+
+    calls = {"n": 0}
+
+    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "hello there", None, 0, np.zeros(1600, dtype="float32")
+        return "quit", None, 0, np.zeros(1600, dtype="float32")
+
+    monkeypatch.setattr(chat, "_listen", _fake_listen)
+
+    class _FakeAgent:
+        def __init__(self, store, get_frame=None):
+            self.last_light_action = None
+            self.last_recall = type("R", (), {"observation": None})()
+
+        def ask(self, question):
+            return "hi!"
+
+    monkeypatch.setattr(chat, "MemoryAgent", _FakeAgent)
+
+    class _FakeStore:
+        def list_known_classes(self):
+            return []
+
+        def close(self):
+            pass
+
+    args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
+                               multi_user=False, wake_word="hey lamp", no_speaker_id=False)
+
+    chat.run(args, lamp=_FakeLamp(), store=_FakeStore())
+
+    assert asked == ["speaker-new1"]
 
 
 class _FakeDetection:

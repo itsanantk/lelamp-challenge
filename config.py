@@ -16,6 +16,7 @@ YOLO_MODEL = MODELS_DIR / "yolo11s.pt"
 PIPER_MODEL = MODELS_DIR / "en_US-amy-medium.onnx"
 PIPER_MODEL_CONFIG = MODELS_DIR / "en_US-amy-medium.onnx.json"
 MEMORY_DB = LOGS_DIR / "memory.sqlite3"
+SPEAKER_DB = LOGS_DIR / "speakers.json"
 
 for _d in (MODELS_DIR, LOGS_DIR, RECORDINGS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
@@ -133,6 +134,36 @@ WATCH_WAVE_MIN_REVERSALS = 3   # this many back-and-forth direction changes with
                                  # below counts as a wave, not just ordinary repositioning
 WATCH_WAVE_WINDOW_S = 2.0       # how recent those direction changes need to be
 
+# --- Idle look-around (behavior/idle_scan.py) -------------------------------
+# Deliberately much longer than ATTENTION_SEEK_DELAY_S -- that timeline is
+# about re-engaging a person who just left; this is a "nothing's happened
+# in a while, let's glance around for anything new" behavior that should
+# feel occasional, not restless.
+IDLE_SCAN_DELAY_S = 14.0
+IDLE_SCAN_HOLD_S = 2.0  # long enough for a real scan or two to land at each waypoint
+                          # (see YOLO_SCAN_INTERVAL_S) before moving to the next one
+
+# --- Ambient light reactivity (perception/ambient_light.py) ----------------
+# Opt-in (--ambient-light), not opt-out -- and tuned to actually be
+# noticeable when someone turns it on to see it work, not a background
+# effect subtle enough to miss entirely. The original pass here (2.0s
+# interval, 0.15 smoothing, 0.18 max nudge) took ~15-20s to converge and
+# topped out as a barely-visible shift -- correct in principle, unverifiable
+# in practice. This is the version someone can cover the camera with a
+# hand and actually watch happen.
+AMBIENT_LIGHT_SAMPLE_INTERVAL_S = 1.0  # room lighting doesn't change fast, but this
+                                          # still shouldn't take forever to catch up
+AMBIENT_LIGHT_SMOOTHING = 0.35  # EMA alpha on the luma reading -- still smooths out a
+                                   # single-frame blip (samples are already 1s apart),
+                                   # but converges in a handful of seconds, not ~20
+AMBIENT_LIGHT_MIDPOINT = 0.35  # "normal room" reference luma (0..1) -- tuned lower than a
+                                  # naive 0.5, since an indoor room read through a webcam
+                                  # typically averages darker than that
+AMBIENT_LIGHT_RESPONSE = 0.5   # how strongly a luma deviation from the midpoint maps to
+                                  # a brightness nudge
+AMBIENT_LIGHT_MAX_NUDGE = 0.35   # cap -- a real, visible swing now that this is
+                                    # something the user explicitly turned on to see
+
 # --- Hand-wave detection (perception/hand_wave.py) -------------------------
 # A real hand, not the tracked object's own bearing -- MediaPipe's
 # HandLandmarker, run at a modest gated interval and only while ENGAGED
@@ -151,6 +182,15 @@ HAND_WAVE_MIN_DELTA = 0.02         # normalized-x wrist movement (0..1 frame wid
 LLM_PROVIDER = os.environ.get("LELAMP_LLM_PROVIDER", "anthropic").lower()
 ANTHROPIC_MODEL = "claude-sonnet-5"
 OPENAI_MODEL = "gpt-4o-mini"
+
+# --- Per-speaker voice ID (perception/speaker_id.py) -----------------------
+# Cosine similarity on resemblyzer embeddings -- tuned against a quick
+# local check with two different synthesized voices reading the same and
+# different sentences: same-speaker landed ~0.87, different-speaker ~0.50,
+# so 0.72 sits with real margin on both sides rather than splitting the
+# difference exactly.
+SPEAKER_MATCH_THRESHOLD = 0.72
+SPEAKER_MIN_AUDIO_S = 1.0  # shorter clips don't carry enough signal for a reliable embedding
 
 # --- Voice I/O ---------------------------------------------------------
 # Both directions run locally so voice mode doesn't depend on which LLM

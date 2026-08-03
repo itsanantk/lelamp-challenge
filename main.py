@@ -34,10 +34,12 @@ import chat
 import config
 import viz
 from behavior.adaptation import AdaptationEngine
+from behavior.idle_scan import IdleScanner
 from behavior.object_watch import ObjectWatcher, play_wave_back
 from behavior.state_machine import BehaviorFSM, State
 from lamp import SimulatedLamp
 from memory.store import MemoryStore
+from perception.ambient_light import AmbientLightSensor
 from perception.audio_monitor import AudioActivityMonitor
 from perception.engagement import EngagementPipeline
 from perception.hand_wave import HandWaveDetector
@@ -75,15 +77,19 @@ def run(args: argparse.Namespace) -> None:
     store = None
     vision_memory = None
     object_watcher = None
+    idle_scanner = None
     if not args.no_memory:
         store = MemoryStore(fresh=args.fresh_memory)
         vision_memory = VisionMemory(store)
         object_watcher = ObjectWatcher(lamp)
+        idle_scanner = IdleScanner(lamp)
 
     audio_monitor = None
     if not args.no_audio_gate:
         audio_monitor = AudioActivityMonitor()
         audio_monitor.start()
+
+    ambient_sensor = AmbientLightSensor() if args.ambient_light else None
 
     hand_wave = None
     if not args.no_hand_wave:
@@ -98,7 +104,8 @@ def run(args: argparse.Namespace) -> None:
     if args.chat:
         chat_shutdown = threading.Event()
         chat_args = argparse.Namespace(no_gui=True, voice=args.voice, mute=args.mute, ask=None,
-                                        multi_user=args.multi_user, wake_word=args.wake_word)
+                                        multi_user=args.multi_user, wake_word=args.wake_word,
+                                        no_speaker_id=args.no_speaker_id)
         # store=None here on purpose -- MemoryAgent's own sqlite3 connection
         # has to be created on the thread that'll actually use it (see
         # chat.run's docstring), not handed in from this one.
@@ -141,6 +148,9 @@ def run(args: argparse.Namespace) -> None:
             engaged = reading.engaged if reading else False
             bearing = reading.user_bearing_deg if reading else None
             user_busy = audio_monitor.is_active() if audio_monitor is not None else False
+            if ambient_sensor is not None:
+                ambient_sensor.update(frame, now)
+                fsm.ambient_brightness_nudge = ambient_sensor.brightness_nudge()
             fsm_state = fsm.update(engaged=engaged, user_bearing_deg=bearing, dt=dt, user_busy=user_busy)
             lamp.update(dt)
 
@@ -183,6 +193,14 @@ def run(args: argparse.Namespace) -> None:
                 scanned = vision_memory.maybe_scan(frame, pan_bearing_deg=pan_bearing_ema, pan_zoom=pan_zoom)
                 if scanned is not None:  # only a real sample on ticks that actually ran YOLO
                     yolo_latency_ms = vision_memory.last_scan_latency_ms
+                # Runs before object_watcher.update() on purpose: if the
+                # sweep this tick turns an object up, object_watcher's own
+                # acquire pose (set below) needs to be the last
+                # set_target_pose call this tick, not overwritten by the
+                # scanner settling back to neutral (see idle_scan.py's
+                # docstring on why preemption is silent, not a competing
+                # pose command).
+                idle_scanner.update(fsm_state, object_watcher.active, dt)
                 object_watcher.update(vision_memory.last_detections, fsm_state, dt, user_bearing_deg=bearing)
                 vision_memory.fast_mode = object_watcher.should_scan_fast()
 
@@ -234,6 +252,9 @@ def run(args: argparse.Namespace) -> None:
                     if object_watcher.active:
                         side_lines.append("")
                         side_lines.append("watching tracked object...")
+                    if idle_scanner.active:
+                        side_lines.append("")
+                        side_lines.append("looking around...")
                 if audio_monitor is not None and user_busy:
                     side_lines.append("")
                     side_lines.append("room busy (talking/media) --")
@@ -352,6 +373,11 @@ def parse_args() -> argparse.Namespace:
                     help="disable the webcam view panning to follow the lamp's own gaze")
     p.add_argument("--no-hand-wave", action="store_true",
                     help="disable hand-wave detection (a third CPU model, only run while ENGAGED)")
+    p.add_argument("--ambient-light", action="store_true",
+                    help="enable ambient-light brightness reactivity (opt-in: brightens the "
+                         "idle/engaged look in a dark room, dims it in a bright one)")
+    p.add_argument("--no-speaker-id", action="store_true",
+                    help="with --chat --voice: disable persistent voice-based speaker identification")
     args = p.parse_args()
     if args.chat and not args.voice:
         # Typed chat blocks on input(), which no shutdown_event can reach

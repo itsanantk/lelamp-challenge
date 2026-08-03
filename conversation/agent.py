@@ -15,8 +15,13 @@ actual bottleneck while building this, not architecture.
 """
 from __future__ import annotations
 
+import base64
 import json
 import time
+from typing import Callable
+
+import cv2
+import numpy as np
 
 from memory.store import MemoryStore, Observation, bearing_to_direction
 import config
@@ -52,7 +57,17 @@ you weren't given data for.
 
 If the user asks you to change the light itself (not a question about an object), call \
 control_light instead of just replying in text -- a spoken "sure, dimming it" with no actual \
-tool call would leave the light unchanged."""
+tool call would leave the light unchanged.
+
+recall_object_location only knows a fixed list of common object types (the classes your \
+object detector recognizes) -- it has no idea what a "black water bottle" or "the blue \
+notebook" is beyond the generic class. If recall_object_location comes back found=false, or \
+the user describes something more specific than a bare class name, call \
+describe_current_view to actually look at the live camera feed before giving up -- the thing \
+might be sitting in plain sight even though it isn't one of your tracked types. Describe only \
+what you can actually see in that image; if it's not visible there either, say so plainly, \
+the same as you would for a recall_object_location miss. Don't call describe_current_view \
+more than once per question -- one live look is enough."""
 
 # "dim" and "on" are relative to whatever's currently showing (dim steps
 # down, on restores to a plain default); the rest are absolute presets.
@@ -92,6 +107,16 @@ TOOL_SPECS = [
         },
         "required": ["action"],
     },
+    {
+        "name": "describe_current_view",
+        "description": "Look at what the camera currently sees, live -- for objects outside "
+                        "your fixed detection classes, a more specific description than a bare "
+                        "class name (color, brand, which one of several), or open-ended "
+                        "questions about what's around right now. Returns the live image "
+                        "itself for you to describe, not a text answer.",
+        "params": {},
+        "required": [],
+    },
 ]
 
 
@@ -130,9 +155,17 @@ class RecallResult:
 
 
 class MemoryAgent:
-    def __init__(self, store: MemoryStore, provider: str | None = None):
+    def __init__(self, store: MemoryStore, provider: str | None = None,
+                 get_frame: Callable[[], np.ndarray | None] | None = None):
+        """get_frame: optional zero-arg callable returning the current raw
+        camera frame (or None), used only by describe_current_view. None
+        in standalone chat.py (no live camera loop to ask) and in any
+        session without --chat's vision_memory wired through -- the tool
+        just reports itself unavailable rather than the agent needing a
+        real camera dependency to construct at all."""
         self.store = store
         self.provider = (provider or config.LLM_PROVIDER).lower()
+        self.get_frame = get_frame
         self.messages: list[dict] = []
         self.last_recall = RecallResult()
         self.last_light_action: str | None = None  # set by the last control_light call, so chat.py can apply it
@@ -144,7 +177,13 @@ class MemoryAgent:
             import anthropic
             self.client = anthropic.Anthropic()
 
-    def _execute_tool(self, name: str, tool_input: dict) -> dict:
+    def _execute_tool(self, name: str, tool_input: dict) -> tuple[dict, bytes | None]:
+        """Returns (json_result, jpeg_bytes_or_None) -- only
+        describe_current_view ever returns real image bytes; every other
+        tool's second element is always None. Kept as one return shape
+        (not a special path just for the vision tool) so both provider
+        loops below have exactly one place that decides whether to attach
+        an image, not two slightly different tool-dispatch code paths."""
         if name == "recall_object_location":
             # `.get(key, "")` only falls back to "" when the key is
             # *missing* -- a tool call with an explicit {"object_name":
@@ -154,7 +193,7 @@ class MemoryAgent:
             obs = self.store.get_latest_by_class(str(tool_input.get("object_name") or ""))
             if obs is None:
                 self.last_recall = RecallResult()
-                return {"found": False}
+                return {"found": False}, None
             direction = bearing_to_direction(obs.bearing_deg)
             seen_ago_s = max(0.0, time.time() - obs.timestamp)
             cooccurring = self.store.get_cooccurring(obs.frame_group_id, exclude_class=obs.object_class)
@@ -171,16 +210,26 @@ class MemoryAgent:
                     {"object_class": cls, "direction": bearing_to_direction(bearing), "confidence": round(conf, 2)}
                     for cls, bearing, conf in cooccurring
                 ],
-            }
+            }, None
         if name == "list_seen_objects":
-            return {"objects": self.store.list_known_classes()}
+            return {"objects": self.store.list_known_classes()}, None
         if name == "control_light":
             action = str(tool_input.get("action", "")).strip().lower()
             if action not in LIGHT_ACTIONS:
-                return {"applied": False, "error": f"'{action}' isn't a valid action"}
+                return {"applied": False, "error": f"'{action}' isn't a valid action"}, None
             self.last_light_action = action
-            return {"applied": True, "action": action}
-        return {"error": f"unknown tool {name}"}
+            return {"applied": True, "action": action}, None
+        if name == "describe_current_view":
+            if self.get_frame is None:
+                return {"available": False, "reason": "no live camera in this session"}, None
+            frame = self.get_frame()
+            if frame is None:
+                return {"available": False, "reason": "no frame captured yet"}, None
+            ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if not ok:
+                return {"available": False, "reason": "couldn't encode the current frame"}, None
+            return {"available": True}, jpeg.tobytes()
+        return {"error": f"unknown tool {name}"}, None
 
     def ask(self, user_text: str) -> str:
         # Reset per-turn side state up front, not just inside the tool
@@ -219,10 +268,23 @@ class MemoryAgent:
             for block in response.content:
                 if block.type == "tool_use":
                     try:
-                        result = self._execute_tool(block.name, block.input)
+                        result, image_bytes = self._execute_tool(block.name, block.input)
                     except Exception as e:
-                        result = {"error": f"tool failed: {e}"}
-                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(result)})
+                        result, image_bytes = {"error": f"tool failed: {e}"}, None
+                    if image_bytes is not None:
+                        # Anthropic tool_result content can be a list of
+                        # blocks, not just a text string -- an image block
+                        # here is what actually lets the model *see* the
+                        # frame describe_current_view captured, not just
+                        # read a caption about it.
+                        content = [
+                            {"type": "text", "text": json.dumps(result)},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                          "data": base64.b64encode(image_bytes).decode("ascii")}},
+                        ]
+                    else:
+                        content = json.dumps(result)
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
             self.messages.append({"role": "user", "content": results})
             response = self.client.messages.create(
                 model=config.ANTHROPIC_MODEL, max_tokens=512, system=SYSTEM_PROMPT,
@@ -253,10 +315,21 @@ class MemoryAgent:
             for call in message.tool_calls:
                 try:
                     args = json.loads(call.function.arguments or "{}")
-                    result = self._execute_tool(call.function.name, args)
+                    result, image_bytes = self._execute_tool(call.function.name, args)
                 except Exception as e:
-                    result = {"error": f"tool failed: {e}"}
+                    result, image_bytes = {"error": f"tool failed: {e}"}, None
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
+                if image_bytes is not None:
+                    # OpenAI's tool-role messages are text-only -- an
+                    # image has to ride along on a normal user message
+                    # instead, which is why this follows the tool result
+                    # rather than being part of it. The model still sees
+                    # it before composing its next reply either way.
+                    b64 = base64.b64encode(image_bytes).decode("ascii")
+                    self.messages.append({"role": "user", "content": [
+                        {"type": "text", "text": "(current camera view, for describe_current_view)"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    ]})
             response = self.client.chat.completions.create(
                 model=config.OPENAI_MODEL, messages=self.messages, tools=tools, tool_choice="auto",
             )

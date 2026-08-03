@@ -8,12 +8,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
+
 from conversation.agent import MemoryAgent, RecallResult, LIGHT_ACTIONS
 
 
 def _agent():
     agent = MemoryAgent.__new__(MemoryAgent)
     agent.store = None
+    agent.get_frame = None
     agent.last_recall = RecallResult()
     agent.last_light_action = None
     return agent
@@ -21,14 +24,15 @@ def _agent():
 
 def test_control_light_accepts_a_known_action():
     agent = _agent()
-    result = agent._execute_tool("control_light", {"action": "cozy"})
+    result, image = agent._execute_tool("control_light", {"action": "cozy"})
     assert result == {"applied": True, "action": "cozy"}
+    assert image is None
     assert agent.last_light_action == "cozy"
 
 
 def test_control_light_rejects_an_unknown_action():
     agent = _agent()
-    result = agent._execute_tool("control_light", {"action": "strobe"})
+    result, image = agent._execute_tool("control_light", {"action": "strobe"})
     assert result["applied"] is False
     assert agent.last_light_action is None
 
@@ -86,6 +90,30 @@ def test_ask_resets_last_light_action_and_last_recall_at_the_start_of_each_turn(
     assert agent.last_recall.observation is None
 
 
+def test_describe_current_view_unavailable_with_no_frame_provider():
+    agent = _agent()  # get_frame=None -- standalone chat.py, no live camera loop
+    result, image = agent._execute_tool("describe_current_view", {})
+    assert result == {"available": False, "reason": "no live camera in this session"}
+    assert image is None
+
+
+def test_describe_current_view_unavailable_when_no_frame_captured_yet():
+    agent = _agent()
+    agent.get_frame = lambda: None
+    result, image = agent._execute_tool("describe_current_view", {})
+    assert result["available"] is False
+    assert image is None
+
+
+def test_describe_current_view_returns_jpeg_bytes_for_a_real_frame():
+    agent = _agent()
+    agent.get_frame = lambda: np.zeros((48, 64, 3), dtype=np.uint8)
+    result, image = agent._execute_tool("describe_current_view", {})
+    assert result == {"available": True}
+    assert isinstance(image, bytes) and len(image) > 0
+    assert image[:2] == b"\xff\xd8"  # JPEG magic bytes
+
+
 class _FakeStore:
     def get_latest_by_class(self, object_class):
         assert isinstance(object_class, str), "must never reach the store as None"
@@ -99,8 +127,9 @@ def test_recall_with_an_explicit_null_object_name_does_not_crash():
     # normalize_class (None.strip()).
     agent = _agent()
     agent.store = _FakeStore()
-    result = agent._execute_tool("recall_object_location", {"object_name": None})
+    result, image = agent._execute_tool("recall_object_location", {"object_name": None})
     assert result == {"found": False}
+    assert image is None
 
 
 class _FakeToolUseBlock:
