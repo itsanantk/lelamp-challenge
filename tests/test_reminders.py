@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import pytest
 
+import config
 import behavior.reminders as reminders_mod
 from behavior.reminders import Reminder, ReminderEngine
 
@@ -173,6 +174,51 @@ def test_presence_reminder_rearms_after_the_user_returns():
     engine.tick(now=10.0, face_found=True, lamp=lamp)                    # returns
     engine.tick(now=11.0, face_found=False, lamp=lamp)
     engine.tick(now=11.0 + _DEBOUNCE + 0.1, face_found=False, lamp=lamp)  # leaves again -- fires again
+
+    assert len(lamp.sounds) == 2
+
+
+def test_presence_reminder_does_not_refire_within_the_cooldown_even_after_returning_and_leaving_again():
+    # The actual point of PRESENCE_FIRE_COOLDOWN_S: a much shorter
+    # PRESENCE_ABSENCE_DEBOUNCE_S now confirms a departure fast, which
+    # means a choppy return-then-drop-out-again mid-motion (the same real
+    # flicker the old, longer debounce alone used to have to fully absorb)
+    # could otherwise trigger a second "come back" nudge a moment after
+    # the first one. The cooldown blocks that even though _was_present
+    # correctly re-armed on the return.
+    engine = ReminderEngine()
+    engine.add(kind="presence", message="come back")
+    lamp = _FakeLamp()
+
+    engine.tick(now=0.0, face_found=True, lamp=lamp)
+    engine.tick(now=1.0, face_found=False, lamp=lamp)
+    engine.tick(now=1.0 + _DEBOUNCE + 0.1, face_found=False, lamp=lamp)  # leaves -- fires
+    assert len(lamp.sounds) == 1
+
+    engine.tick(now=2.0, face_found=True, lamp=lamp)                     # a flickered return...
+    engine.tick(now=2.1, face_found=False, lamp=lamp)
+    engine.tick(now=2.1 + _DEBOUNCE + 0.1, face_found=False, lamp=lamp)  # ...and gone again, still within 5s
+
+    assert len(lamp.sounds) == 1  # cooldown suppressed the second nudge
+
+
+def test_presence_reminder_fires_again_once_the_cooldown_has_actually_elapsed():
+    engine = ReminderEngine()
+    engine.add(kind="presence", message="come back")
+    lamp = _FakeLamp()
+
+    engine.tick(now=0.0, face_found=True, lamp=lamp)
+    engine.tick(now=1.0, face_found=False, lamp=lamp)
+    engine.tick(now=1.0 + _DEBOUNCE + 0.1, face_found=False, lamp=lamp)  # leaves -- fires
+    fire_t = 1.0 + _DEBOUNCE + 0.1
+
+    # Returns and leaves again well *past* PRESENCE_FIRE_COOLDOWN_S after
+    # the first fire -- a genuinely new departure, not flicker, so it must
+    # fire again rather than being permanently silenced.
+    return_t = fire_t + reminders_mod.PRESENCE_FIRE_COOLDOWN_S + 1.0
+    engine.tick(now=return_t, face_found=True, lamp=lamp)
+    engine.tick(now=return_t + 1.0, face_found=False, lamp=lamp)
+    engine.tick(now=return_t + 1.0 + _DEBOUNCE + 0.1, face_found=False, lamp=lamp)
 
     assert len(lamp.sounds) == 2
 
@@ -420,6 +466,25 @@ def test_object_check_with_a_check_question_defers_instead_of_firing_directly():
     assert lamp.pose_calls == []
 
 
+def test_object_check_with_a_check_question_defers_at_the_deadline_even_unconfirmed():
+    # The actual bug report: "make sure I'm still reading my book in 10
+    # seconds" -- a book in active use rarely holds still long enough to
+    # confirm placement, so placement_confirmed may still be False when
+    # due_at arrives. due_for_check must flip anyway (using whatever
+    # tracked_bearing is known, possibly still None) rather than waiting
+    # on a confirmation that might never come.
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="are you still reading?",
+                    object_class="book", due_in_s=10.0, check_question="is the person reading")
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at + 10.5, face_found=True, lamp=lamp, vision_memory=_FakeVisionMemory())
+
+    assert r.due_for_check
+    assert not r.placement_confirmed
+    assert r.active  # still pending until chat.py resolves it
+
+
 def test_object_check_with_a_check_question_only_flips_due_for_check_once():
     # chat.py's poller clears due_for_check the instant it claims a
     # reminder (see _resolve_object_check_judgment), *before* it finishes
@@ -443,6 +508,79 @@ def test_object_check_with_a_check_question_only_flips_due_for_check_once():
     assert not r.due_for_check
 
 
+def test_object_check_with_a_check_question_dispatches_early_on_sustained_move():
+    # "make sure I don't go on my phone for five minutes" -- picking it up
+    # at second 10 should trigger the check_question then, not stay silent
+    # until due_at five minutes later.
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check", object_class="cell phone", due_in_s=300.0,
+                    check_question="is the phone still untouched, sitting where it was left")
+    r.tracked_bearing = 20.0
+    r.placement_confirmed = True
+    lamp = _FakeLamp()
+
+    moved = _FakeVisionMemory([_FakeDetection("cell phone", 30.0)])  # 10deg away, past WATCH_REAIM_DEG
+    engine.tick(now=r.created_at + 10.0, face_found=True, lamp=lamp, vision_memory=moved)
+    assert not r.due_for_check  # single tick -- still inside the debounce
+
+    engine.tick(now=r.created_at + 10.0 + config.WATCH_LOST_GRACE_S, face_found=True, lamp=lamp, vision_memory=moved)
+    assert r.due_for_check
+    assert r.active  # not deactivated -- chat.py's poller resolves and deactivates it
+    assert r.due_at is not None and r.due_at > r.created_at + 10.0  # nowhere near due_at yet
+
+
+def test_object_check_with_a_check_question_dispatches_early_when_the_object_goes_missing():
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check", object_class="cell phone", due_in_s=300.0,
+                    check_question="is the phone still untouched, sitting where it was left")
+    r.tracked_bearing = 20.0
+    r.placement_confirmed = True
+    lamp = _FakeLamp()
+    gone = _FakeVisionMemory([])  # picked up and out of frame entirely
+
+    engine.tick(now=r.created_at + 10.0, face_found=True, lamp=lamp, vision_memory=gone)
+    assert not r.due_for_check  # single tick -- still inside the debounce
+    engine.tick(now=r.created_at + 10.0 + config.WATCH_LOST_GRACE_S, face_found=True, lamp=lamp, vision_memory=gone)
+    assert r.due_for_check
+
+
+def test_object_check_disturbance_debounce_resets_if_the_object_is_seen_back_in_place():
+    # A brief wobble/off-angle miss must not fire this -- only a move
+    # that's still there config.WATCH_LOST_GRACE_S later counts.
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check", object_class="cell phone", due_in_s=300.0,
+                    check_question="is the phone still untouched, sitting where it was left")
+    r.tracked_bearing = 20.0
+    r.placement_confirmed = True
+    lamp = _FakeLamp()
+
+    moved = _FakeVisionMemory([_FakeDetection("cell phone", 30.0)])
+    engine.tick(now=r.created_at + 10.0, face_found=True, lamp=lamp, vision_memory=moved)
+    back = _FakeVisionMemory([_FakeDetection("cell phone", 20.0)])  # back at the confirmed spot
+    engine.tick(now=r.created_at + 11.0, face_found=True, lamp=lamp, vision_memory=back)
+    engine.tick(now=r.created_at + 10.0 + config.WATCH_LOST_GRACE_S, face_found=True, lamp=lamp, vision_memory=moved)
+
+    assert not r.due_for_check  # the earlier move doesn't carry over -- the clock restarted
+
+
+def test_object_check_without_a_check_question_never_dispatches_early_on_disturbance():
+    # No check_question means no judgment to make early -- "check on my
+    # keys in an hour" doesn't imply "and yell if I touch them earlier."
+    # These just wait for due_at like before, even if the object moves.
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check", object_class="keys", due_in_s=300.0)
+    r.tracked_bearing = 20.0
+    r.placement_confirmed = True
+    lamp = _FakeLamp()
+    moved = _FakeVisionMemory([_FakeDetection("keys", 30.0)])
+
+    engine.tick(now=r.created_at + 10.0 + config.WATCH_LOST_GRACE_S, face_found=True, lamp=lamp, vision_memory=moved)
+
+    assert not r.due_for_check
+    assert r.active
+    assert lamp.sounds == []
+
+
 def test_object_check_deactivates_itself_after_firing_one_shot():
     engine = ReminderEngine()
     r = engine.add(kind="object_check", message="check", object_class="bottle", due_in_s=10.0)
@@ -458,17 +596,21 @@ def test_object_check_deactivates_itself_after_firing_one_shot():
     assert lamp.sounds == ["attention_seek"]
 
 
-def test_object_check_does_not_fire_before_placement_is_confirmed_even_past_the_deadline():
-    # An object never seen/settled has nothing to check on -- must not
-    # fire (and definitely must not point at bearing=None).
+def test_object_check_still_fires_at_the_deadline_even_if_placement_never_confirmed():
+    # An object that's actively handled (picked up, turned, moved) rather
+    # than set down and left alone may never hold still long enough to
+    # confirm placement. The deadline must not be held hostage to that --
+    # it fires on schedule regardless, falling back to a wiggle instead of
+    # pointing at a bearing it never learned (bearing=None).
     engine = ReminderEngine()
     r = engine.add(kind="object_check", message="check", object_class="bottle", due_in_s=1.0)
     lamp = _FakeLamp()
 
     engine.tick(now=r.created_at + 100.0, face_found=True, lamp=lamp, vision_memory=_FakeVisionMemory())
 
-    assert lamp.sounds == []
-    assert r.active  # still waiting -- not expired (no duration set) and never got to fire
+    assert lamp.sounds == ["attention_seek"]
+    assert not r.placement_confirmed
+    assert not r.active  # no check_question -- fires directly and deactivates
 
 
 def test_object_check_without_vision_memory_never_confirms_placement():
@@ -497,6 +639,30 @@ def test_pending_placement_classes_only_includes_unconfirmed_object_checks():
 
     r1.active = False
     assert engine.pending_placement_classes() == []
+
+
+def test_watched_classes_only_includes_confirmed_object_checks_with_a_check_question():
+    engine = ReminderEngine()
+    unconfirmed = engine.add(kind="object_check", message="a", object_class="bottle", due_in_s=3600.0,
+                              check_question="is this bottle full or empty")
+    no_question = engine.add(kind="object_check", message="b", object_class="keys", due_in_s=3600.0)
+    watched = engine.add(kind="object_check", message="c", object_class="cell phone", due_in_s=3600.0,
+                          check_question="is the phone still untouched, sitting where it was left")
+    engine.add(kind="recurring", message="d", interval_s=60.0)  # no object_class -- must not appear
+
+    # Not yet confirmed (still awaiting placement) -- not disturbance-
+    # watched yet, so must not force fast scanning either.
+    assert engine.watched_classes() == []
+
+    unconfirmed.placement_confirmed = True
+    no_question.placement_confirmed = True
+    watched.placement_confirmed = True
+    # unconfirmed now qualifies too (confirmed + has a check_question);
+    # no_question never will, since there's no judgment to watch for.
+    assert set(engine.watched_classes()) == {"bottle", "cell phone"}
+
+    watched._check_dispatched = True  # already claimed -- no longer worth forcing fast scans for
+    assert engine.watched_classes() == ["bottle"]
 
 
 def test_active_summaries_describes_object_check_status():

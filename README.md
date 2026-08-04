@@ -5,9 +5,7 @@ motion/light/sound, keeps a memory of objects it's seen, and can answer
 questions about that memory through an LLM. Full writeup with diagrams is
 in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); a criteria-by-criteria
 mapping to the challenge brief is in
-[docs/requirements_traceability.md](docs/requirements_traceability.md);
-the demo recording walkthrough is in
-[docs/demo_script.md](docs/demo_script.md).
+[docs/requirements_traceability.md](docs/requirements_traceability.md).
 
 I don't have a physical LeLamp, so the arm/light/speaker are simulated
 behind a small hardware abstraction layer (`lamp/hal.py`). A real driver
@@ -208,11 +206,16 @@ created via conversation). Three kinds:
 - **Recurring** — "make sure I get up every 30 minutes." Fires on a fixed
   interval, resets, repeats.
 - **Presence** — "make sure I don't get up from my desk" / "tell me if I
-  leave." Fires once each time presence is lost for a sustained ~1.5s (not
-  a single flickered frame -- raw per-frame face detection briefly drops
-  out during the head motion of actually standing up, which fired this
-  multiple times in the same second before the debounce), then re-arms
-  once you're back.
+  leave." Fires once presence has been lost for a sustained ~0.4s (not a
+  single flickered frame -- raw per-frame face detection briefly drops out
+  during the head motion of actually standing up), then re-arms once
+  you're back. That debounce alone used to be 1.5s, long enough on its own
+  to fully absorb the flicker risk, but that made a real departure feel
+  slow to notice. Shortened it and split the job in two instead: a fast
+  ~0.4s debounce confirms a departure quickly, and a separate 5s cooldown
+  after any fire blocks a second one from a choppy
+  return-then-drop-out-again mid-motion, without slowing down the first
+  reaction.
 - **Object check** — "make sure I drink my water by 6" / "check on my
   water bottle in an hour." Watches wherever the object (resolved through
   the same class aliasing `recall_object_location` uses, so "water
@@ -242,6 +245,19 @@ created via conversation). Three kinds:
   something the model "remembers" saying later. An object check with no
   `check_question` (just "check on my keys") skips all of that and fires
   directly, no LLM round trip needed.
+
+  A `check_question` also means a disturbance is itself worth checking on,
+  not just the deadline -- "make sure I don't go on my phone for five
+  minutes" catches you picking it up at second 10 instead of staying
+  silent for the full window. Once placement is confirmed, the same
+  detections keep being watched for a sustained move away from the
+  confirmed spot, or a sustained disappearance (debounced against a single
+  bad detection the same way presence debounces a flickered face); either
+  one dispatches the existing `check_question` early through the exact
+  same path a real deadline would -- "is this still where it was left"
+  reads correctly whether it's asked because time ran out or because
+  something just moved. No `check_question` means there's nothing to
+  judge early, so those still just wait for the deadline.
 
 Any kind can also be scoped to a limited window -- "only check for the
 next 20 seconds," "just for the next hour" -- after which it deactivates
@@ -275,7 +291,7 @@ else in its context otherwise tells it what time it currently is.
 backup, but it has no audio. For the real submission I used Win+G to
 screen-record instead, since that picks up the sound cues — `main.py
 --chat --voice` runs all four steps in one continuous take now, no cut
-between windows (see `docs/demo_script.md`).
+between windows.
 
 ## Evaluation
 
@@ -348,5 +364,4 @@ tests/test_emotion.py
 tests/test_reminders.py
 docs/ARCHITECTURE.md       full writeup
 docs/requirements_traceability.md   challenge brief -> where it's addressed
-docs/demo_script.md        demo recording walkthrough
 ```

@@ -37,6 +37,21 @@ Three kinds:
     background poller thread (it has agent/lamp/vision_memory) claims it,
     resolves the judgment, and deactivates it. See chat.py's
     _resolve_object_check_judgment.
+
+    A check_question also means something got disturbed is itself worth
+    checking on, not just the deadline -- "make sure I don't go on my
+    phone for five minutes" should catch you picking it up at second 10,
+    not stay silent until the full window elapses. Once placement is
+    confirmed, tick() keeps watching the object via the same detections
+    (see _check_for_disturbance); a sustained move away from the
+    confirmed bearing, or a sustained disappearance, dispatches the
+    check_question early through the exact same due_for_check path a
+    real deadline would -- "is this still where it was left" already
+    reads correctly whether it's asked because time ran out or because
+    something just moved. No check_question means there's no judgment
+    to make early ("check on my keys in an hour" doesn't imply "and
+    yell if I touch them earlier") -- those just wait for due_at like
+    before.
 """
 from __future__ import annotations
 
@@ -62,10 +77,26 @@ KINDS = ("recurring", "presence", "object_check")
 # reminders 2-3 times in the same second on live testing. Requiring
 # face_found to have been continuously false for this long, not just
 # once, is the same dwell-time debounce idea the engagement pipeline
-# already uses for its own ENGAGE_EXIT_DWELL_FRAMES -- longer here since
-# "got up and left" is a bigger, rarer, more deliberate event than "looked
-# away," so there's no cost to waiting a bit longer to be sure.
-PRESENCE_ABSENCE_DEBOUNCE_S = 1.5
+# already uses for its own ENGAGE_EXIT_DWELL_FRAMES.
+#
+# Originally 1.5s (long enough to be genuinely sure before ever firing),
+# but that made real departures feel slow to notice. Shrunk to roughly
+# "confirmed absent for 2-3 checks a second" instead, with
+# PRESENCE_FIRE_COOLDOWN_S below doing the flicker-proofing that the
+# longer debounce used to -- a much faster first reaction, with the
+# multi-fire risk covered a different way rather than just accepted back.
+PRESENCE_ABSENCE_DEBOUNCE_S = 0.4
+
+# Once a presence reminder actually fires, it won't fire again until this
+# much time has passed, regardless of how choppy face detection looks in
+# between (return-then-immediately-drop-out-again mid-motion, the same
+# real flicker PRESENCE_ABSENCE_DEBOUNCE_S alone used to have to fully
+# absorb on its own). The two constants split one job into two: the
+# debounce above answers "was this a real departure," fast; this answers
+# "have I already told them," and doesn't need to be fast at all -- a
+# person who's actually gone doesn't need re-nagging every few seconds,
+# just the one nudge.
+PRESENCE_FIRE_COOLDOWN_S = 5.0
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -90,7 +121,11 @@ class Reminder:
     message: str         # spoken/printed when it fires
     created_at: float    # time.time() -- wall clock, so it's meaningful across a restart
     interval_s: float | None = None     # recurring only
-    last_fired_at: float | None = None  # recurring only; None means "never fired yet"
+    last_fired_at: float | None = None  # recurring: last interval fire. presence: last
+                                          # nudge, gates PRESENCE_FIRE_COOLDOWN_S. Shared
+                                          # field -- a Reminder is only ever one kind, so
+                                          # the two uses never overlap. None means "never
+                                          # fired yet" either way.
     expires_at: float | None = None     # wall-clock deadline after which this auto-deactivates,
                                           # e.g. "only check for the next 20 seconds" -- None runs
                                           # indefinitely until explicitly cancelled
@@ -128,6 +163,8 @@ class Reminder:
     _was_present: bool = True  # presence only -- edge-detection state, see module docstring
     _absent_since: float | None = None  # presence only -- debounce state, see PRESENCE_ABSENCE_DEBOUNCE_S
     _settled_since: float | None = None  # object_check only -- when tracked_bearing last changed
+    _disturbed_since: float | None = None  # object_check only, post-confirmation -- see
+                                             # _check_for_disturbance
 
 
 def _wiggle(lamp) -> None:
@@ -228,6 +265,34 @@ class ReminderEngine:
                      if r.active and r.kind == "object_check" and not r.placement_confirmed
                      and r.object_class is not None})
 
+    def watched_classes(self) -> list[str]:
+        """Object classes at least one active object_check reminder is
+        currently disturbance-watching (placement confirmed, a
+        check_question set, deadline not yet dispatched -- see
+        _check_for_disturbance). main.py folds these into
+        vision_memory.fast_mode alongside ObjectWatcher.should_scan_fast()
+        so the scan cadence stays fast for the whole watch window, not
+        just while the object happens to still be actively moving.
+
+        Real bug this fixes, reported live: "make sure I don't go on my
+        phone" felt slow to notice a pickup. Root cause was cadence, not
+        the disturbance debounce itself -- ObjectWatcher's own fast-scan
+        trigger (should_scan_fast) drops back to the slow interval once an
+        object's been stationary for WATCH_FAST_SCAN_SETTLE_S (1.5s), and
+        placement confirmation itself requires WATCH_STATIONARY_TIMEOUT_S
+        (3.0s) of stillness -- so by the time disturbance-watching even
+        starts, fast-scan has always already lapsed. The very first catch
+        of an actual pickup then had to wait for the next slow-cadence
+        scan (up to YOLO_SCAN_INTERVAL_S, worse if scene-change gating
+        skipped a few), *before* the disturbance debounce even started
+        counting. This keeps the scan itself fast the whole time a
+        disturbance-relevant watch is active, so that lag doesn't stack on
+        top of the debounce."""
+        return list({r.object_class for r in self.reminders
+                     if r.active and r.kind == "object_check" and r.placement_confirmed
+                     and r.check_question is not None and not r._check_dispatched
+                     and r.object_class is not None})
+
     def active_summaries(self, now: float | None = None) -> list[str]:
         """One short line per active reminder, for main.py's HUD panel --
         not the full message (that can be a whole sentence), just enough
@@ -246,14 +311,19 @@ class ReminderEngine:
             if r.kind == "recurring":
                 line = f"#{r.id} every {r.interval_s / 60:.0f}min: {label}"
             elif r.kind == "object_check":
-                if not r.placement_confirmed:
-                    status = "watching for placement"
-                elif r.due_for_check:
+                if r.due_for_check:
                     status = "checking now"
                 elif r.due_at is not None and now is not None:
                     remaining = r.due_at - now
-                    status = f"due in {_fmt_duration(remaining)}" if remaining >= 0 \
+                    time_str = f"due in {_fmt_duration(remaining)}" if remaining >= 0 \
                         else f"overdue by {_fmt_duration(-remaining)}"
+                    # Placement and the deadline now run independently (tick()
+                    # no longer gates the due_at check on confirmation), so
+                    # both can be true at once -- say so rather than implying
+                    # placement finished when it may not have.
+                    status = time_str if r.placement_confirmed else f"watching, {time_str}"
+                elif not r.placement_confirmed:
+                    status = "watching for placement"
                 else:
                     status = "waiting for deadline"
                 line = f"#{r.id} {r.object_class} ({status}): {label}"
@@ -285,6 +355,34 @@ class ReminderEngine:
         elif r._settled_since is not None and now - r._settled_since >= config.WATCH_STATIONARY_TIMEOUT_S:
             r.placement_confirmed = True
 
+    def _check_for_disturbance(self, r: Reminder, now: float, vision_memory) -> bool:
+        """object_check only, post-confirmation -- has the object moved
+        away from its confirmed r.tracked_bearing (frozen once
+        placement_confirmed is set -- _update_placement never runs again
+        after that, so this compares against the original spot, not a
+        drifting one), or gone missing entirely. Reuses
+        config.WATCH_LOST_GRACE_S as the debounce for both -- long enough
+        that a single off-angle miss or a one-frame detection wobble
+        doesn't trip it (object detection flickers harder than face
+        detection; PRESENCE_ABSENCE_DEBOUNCE_S exists for exactly this
+        reason on the face side), short enough that a real pickup is
+        caught in seconds, not left to run out the clock. Returns True
+        once on the tick that crosses the debounce; r._disturbed_since
+        carries the pending state across ticks either way, and resets the
+        moment the object is seen back in place."""
+        if vision_memory is None:
+            return False
+        detections = vision_memory.last_detections or []
+        match = next((d for d in detections if d.object_class == r.object_class), None)
+        disturbed = match is None or abs(match.bearing_deg - r.tracked_bearing) > config.WATCH_REAIM_DEG
+        if not disturbed:
+            r._disturbed_since = None
+            return False
+        if r._disturbed_since is None:
+            r._disturbed_since = now
+            return False
+        return now - r._disturbed_since >= config.WATCH_LOST_GRACE_S
+
     def tick(self, now: float, face_found: bool, lamp, vision_memory=None) -> None:
         """now is wall-clock time.time(), not time.perf_counter() -- both
         interval_s comparisons and on-disk persistence need to make sense
@@ -315,14 +413,49 @@ class ReminderEngine:
                     if r._absent_since is None:
                         r._absent_since = now
                     elif r._was_present and now - r._absent_since >= PRESENCE_ABSENCE_DEBOUNCE_S:
-                        _fire(r, lamp)
-                        fired_any = True
+                        # Confirmed absent -- still one detection per
+                        # departure regardless of the cooldown below, so
+                        # this doesn't keep re-evaluating every tick for
+                        # the same continuous absence once it's already
+                        # been noticed once.
                         r._was_present = False
+                        on_cooldown = r.last_fired_at is not None and \
+                            now - r.last_fired_at < PRESENCE_FIRE_COOLDOWN_S
+                        if not on_cooldown:
+                            _fire(r, lamp)
+                            fired_any = True
+                            r.last_fired_at = now
             elif r.kind == "object_check":
                 if not r.placement_confirmed:
                     self._update_placement(r, now, vision_memory)
                     if r.placement_confirmed:
                         fired_any = True  # not a fire, but placement_confirmed/tracked_bearing changed -- persist it
+                # Deliberately NOT an elif against the placement branch above.
+                # Placement confirmation requires the object to sit still for
+                # WATCH_STATIONARY_TIMEOUT_S -- fine for a bottle set down and
+                # left alone, but an object being actively used (a book being
+                # read, page turns and hand adjustments) can keep resetting
+                # that settle timer and may never confirm at all. Gating the
+                # deadline on confirmation meant due_at could be missed by as
+                # long as placement took to (maybe never) settle. The deadline
+                # now fires on its own schedule regardless, using whatever
+                # tracked_bearing is known (possibly None/unconfirmed) --
+                # _fire/_resolve_object_check_judgment both already fall back
+                # to a plain glance when there's no bearing to point at.
+                # A check_question implies judging the object's state
+                # matters, which makes a disturbance itself worth an early
+                # check -- "make sure I don't go on my phone" should catch
+                # you picking it up at second 10, not report it silently
+                # five minutes later. No check_question means there's no
+                # judgment to make early, so those skip straight to the
+                # due_at branch below and behave exactly as before.
+                if r.placement_confirmed and r.check_question is not None and not r._check_dispatched \
+                        and self._check_for_disturbance(r, now, vision_memory):
+                    r.due_for_check = True
+                    r._check_dispatched = True
+                    fired_any = True
+                    print(f"[reminder] #{r.id} disturbance detected at "
+                          f"{time.strftime('%H:%M:%S', time.localtime(now))} -- dispatching to vision judgment")
                 elif r.due_at is not None and now >= r.due_at and not r._check_dispatched:
                     if r.check_question is not None:
                         # Can't resolve this here -- needs a vision-LLM

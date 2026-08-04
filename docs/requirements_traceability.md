@@ -33,3 +33,17 @@ checkable in one pass instead of hunting through the full writeup.
 | Emotion detection from voice tone | `conversation/emotion.py` — loudness/pitch-variability/speaking-rate heuristic |
 | Self-learning behavior | `behavior/adaptation.py` — bounded adjustment of attention-seek delay/cooldown/max-attempts based on response rate |
 | Interruption awareness | `perception/audio_monitor.py` — energy-based mic gate holds off attention-seeking while the room's active |
+
+## Extra features (beyond the brief)
+
+Not asked for by the challenge doc, built the same way as everything above
+— same perception/behavior/conversation boundaries, same test discipline.
+See README "Self-initiated reminders" for the full behavior writeup.
+
+| Feature | Where |
+|---|---|
+| Recurring reminders ("every 30 minutes") | `behavior/reminders.py` — fixed-interval, ticked from `main.py`'s per-frame loop, persisted to `logs/reminders.json` |
+| Presence reminders ("tell me if I leave") | `behavior/reminders.py` — debounced absence detection (`PRESENCE_ABSENCE_DEBOUNCE_S`) against raw per-frame `face_found` so a standup doesn't multi-fire, re-arms on return |
+| Object-check reminders ("check my water bottle in an hour") | `behavior/reminders.py` watches the object settle (reuses `behavior/object_watch.py`'s stillness thresholds) and points back at it at the deadline; if the request implies judging the object's *state* rather than just its presence, `conversation/agent.py`'s `judge_view()` takes a one-shot vision-LLM look, kept out of the real conversation history on purpose |
+| Time-scoped reminders ("just for the next 20 seconds") | `Reminder.expires_at` — any kind can auto-deactivate after a stated window instead of running until cancelled |
+| Creation/cancellation via conversation | `conversation/agent.py`'s `create_reminder` tool → `chat.py`'s `_apply_reminder_action`, mirroring the existing light-command tool/apply split |

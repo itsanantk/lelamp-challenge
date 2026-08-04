@@ -40,6 +40,7 @@ from behavior.idle_scan import IdleScanner
 from behavior.object_watch import ObjectWatcher, play_wave_back
 from behavior.reminders import ReminderEngine
 from behavior.state_machine import BehaviorFSM, State
+from conversation import voice
 from lamp import SimulatedLamp
 from memory.store import MemoryStore
 from perception.ambient_light import AmbientLightSensor
@@ -156,7 +157,13 @@ def run(args: argparse.Namespace) -> None:
 
             engaged = reading.engaged if reading else False
             bearing = reading.user_bearing_deg if reading else None
-            user_busy = audio_monitor.is_active() if audio_monitor is not None else False
+            # Ambient mic gate (perception/audio_monitor.py) misses two
+            # cases: TTS on headphones (no room bleed to pick up) and a
+            # user turn mid-recording where the gate hasn't tripped yet --
+            # voice.is_speaking()/is_listening() know both directly rather
+            # than inferring them acoustically.
+            user_busy = (audio_monitor.is_active() if audio_monitor is not None else False) \
+                or voice.is_speaking() or voice.is_listening()
             if ambient_sensor is not None:
                 ambient_sensor.update(frame, now)
                 fsm.ambient_brightness_nudge = ambient_sensor.brightness_nudge()
@@ -242,7 +249,19 @@ def run(args: argparse.Namespace) -> None:
                 # pose command).
                 idle_scanner.update(fsm_state, object_watcher.active, dt)
                 object_watcher.update(vision_memory.last_detections, fsm_state, dt, user_bearing_deg=bearing)
-                vision_memory.fast_mode = object_watcher.should_scan_fast()
+                # ObjectWatcher's own should_scan_fast() drops back to the
+                # slow interval once an object's held still for
+                # WATCH_FAST_SCAN_SETTLE_S -- which, for an object_check
+                # reminder, has always already happened by the time
+                # disturbance-watching starts (placement confirmation
+                # itself needs WATCH_STATIONARY_TIMEOUT_S of stillness).
+                # Without this OR, the first scan to actually catch a
+                # pickup would wait for the slow cadence to come back
+                # around before the disturbance debounce even starts
+                # counting -- see ReminderEngine.watched_classes's own
+                # docstring for the live bug report this fixes.
+                watching_for_disturbance = bool(reminder_engine.watched_classes()) if reminder_engine is not None else False
+                vision_memory.fast_mode = object_watcher.should_scan_fast() or watching_for_disturbance
 
             if hand_wave is not None and fsm_state == State.ENGAGED:
                 # Only while ENGAGED -- waving hello is a thing you do
