@@ -49,6 +49,28 @@ def test_peak_rms_catches_a_brief_loud_burst_that_flat_averaging_would_miss():
     assert voice._peak_rms(audio, samplerate) > 0.03
 
 
+def test_is_speaking_reflects_the_speak_lock():
+    # speak() itself needs real TTS hardware (live-verified, see module
+    # docstring) -- is_speaking() only needs to reflect _speak_lock, which
+    # is testable directly without going anywhere near an audio device.
+    assert not voice.is_speaking()
+    with voice._speak_lock:
+        assert voice.is_speaking()
+    assert not voice.is_speaking()
+
+
+def test_is_listening_reflects_the_speech_active_event():
+    # record_until_silence()'s actual speech-detection logic (when this
+    # event gets set/cleared) needs real mic hardware -- live-verified,
+    # see module docstring. is_listening() only needs to reflect
+    # _speech_active, which is testable directly.
+    assert not voice.is_listening()
+    voice._speech_active.set()
+    assert voice.is_listening()
+    voice._speech_active.clear()
+    assert not voice.is_listening()
+
+
 def test_transcribe_of_empty_audio_short_circuits_without_loading_whisper():
     # If this touched preload()/whisper it'd either hang downloading a
     # model or throw in a clean test env -- the empty-audio guard must

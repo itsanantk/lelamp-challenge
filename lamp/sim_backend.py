@@ -19,8 +19,8 @@ import random
 
 import cv2
 import numpy as np
-import sounddevice as sd
 
+import audio_output
 from . import color, kinematics
 from .hal import LampActuator
 from .motion import Trajectory, lerp_color
@@ -142,8 +142,13 @@ class _SoundWorker(threading.Thread):
             if event is None:
                 return
             try:
-                sd.play(_event_waveform(event), samplerate=SOUND_SAMPLE_RATE)
-                sd.wait()
+                # Through audio_output's shared lock, not sd.play()
+                # directly -- see that module's docstring: an unguarded
+                # sd.play() here would stop conversation/voice.py's TTS
+                # mid-sentence if a chirp landed on this thread while
+                # speak() was already playing on another one (confirmed
+                # live), not queue politely behind it.
+                audio_output.play_and_wait(_event_waveform(event), SOUND_SAMPLE_RATE)
             except Exception:
                 pass  # no audio device available; fail silently
 

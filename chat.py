@@ -172,11 +172,14 @@ def _apply_light_command(lamp: SimulatedLamp, action: str, show_gui: bool, secon
 
 
 def _apply_reminder_action(reminder_action: dict, reminder_engine) -> None:
-    """Applies the last create_reminder tool call -- same split as
-    _apply_light_command/last_light_action: the agent only records intent
-    (it doesn't own reminder_engine), this actually does it. reminder_engine
-    is None in standalone chat.py (see run()'s docstring) -- the tool call
-    still succeeded from the LLM's point of view, so this says so out loud
+    """Applies the last create_reminder tool call, post-turn -- the agent
+    only records intent via last_reminder_action (it doesn't own
+    reminder_engine), this actually does it. Unlike control_light (see
+    MemoryAgent's apply_light param), nothing later in the same turn needs
+    to observe a reminder's effect, so there's no ordering reason to apply
+    this any earlier than right here. reminder_engine is None in
+    standalone chat.py (see run()'s docstring) -- the tool call still
+    succeeded from the LLM's point of view, so this says so out loud
     rather than silently dropping it."""
     if reminder_engine is None:
         print("[chat] (reminders need main.py's own camera loop to check against -- "
@@ -462,7 +465,8 @@ def _seconds_ago_phrase(seconds: float) -> str:
 def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None,
             no_speech_timeout_s: float | None = None,
             shutdown_event: threading.Event | None = None,
-            on_loud: Callable[[float], None] | None = None) -> tuple[str, float | None, int, np.ndarray]:
+            on_loud: Callable[[float], None] | None = None,
+            keep_waiting: Callable[[], bool] | None = None) -> tuple[str, float | None, int, np.ndarray]:
     """Records the mic until the question trails off into silence, and --
     if a speaker_detector is available -- samples video for who's-talking
     over the *same* window concurrently, since "who was talking" only
@@ -476,11 +480,12 @@ def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None
     ceiling on the whole call, no-speech-wait included, and the speaker
     detector's own timeout has to cover at least as long or it'll return a
     stale bearing before the mic side is done waiting. shutdown_event, if
-    given, aborts recording early (process is shutting down). on_loud, if
-    given, is passed straight through to record_until_silence -- see that
-    function's own docstring; this layer has no reason to touch it, just
-    to pass it along. Returns (transcript, speaker bearing or None, faces
-    seen, raw audio -- the last one for emotion.analyze)."""
+    given, aborts recording early (process is shutting down). on_loud and
+    keep_waiting, if given, are passed straight through to
+    record_until_silence -- see that function's own docstring; this layer
+    has no reason to touch either, just to pass them along. Returns
+    (transcript, speaker bearing or None, faces seen, raw audio -- the
+    last one for emotion.analyze)."""
     kwargs = {}
     if max_s is not None:
         kwargs["max_s"] = max_s
@@ -488,6 +493,8 @@ def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None
         kwargs["no_speech_timeout_s"] = no_speech_timeout_s
     if shutdown_event is not None:
         kwargs["shutdown_event"] = shutdown_event
+    if keep_waiting is not None:
+        kwargs["keep_waiting"] = keep_waiting
     if on_loud is not None:
         kwargs["on_loud"] = on_loud
     detect_cap = max_s if max_s is not None else config.VOICE_MAX_RECORD_S
@@ -558,7 +565,13 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
     owns_store = store is None
     if store is None:
         store = MemoryStore()
-    agent = MemoryAgent(store, get_frame=(lambda: vision_memory.last_frame) if vision_memory is not None else None)
+    agent = MemoryAgent(
+        store, get_frame=(lambda: vision_memory.last_frame) if vision_memory is not None else None,
+        # lamp isn't assigned its final value until just below -- fine,
+        # this closure reads it at call time (well after that's settled),
+        # not at construction time.
+        apply_light=lambda action: _apply_light_command(lamp, action, show_gui=not args.no_gui,
+                                                          standalone=standalone, fsm=fsm))
     owns_lamp = lamp is None
     if lamp is None:
         lamp = SimulatedLamp(mute=args.mute)
@@ -671,9 +684,13 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
         print(f"LAMP: {reply}\n")
         if args.voice:
             voice.speak(reply)
-        if agent.last_light_action is not None:
-            _apply_light_command(lamp, agent.last_light_action, show_gui=not args.no_gui,
-                                  standalone=standalone, fsm=fsm)
+        # No post-turn _apply_light_command call here anymore -- a
+        # control_light call now applies immediately via the agent's
+        # apply_light callback (see its construction above), specifically
+        # so a describe_current_view later in the same turn sees the
+        # change already applied instead of the pre-change frame.
+        # last_light_action is still set either way, for _look_attentive's
+        # own set_light=agent.last_light_action is None check further down.
         if agent.last_reminder_action is not None:
             _apply_reminder_action(agent.last_reminder_action, reminder_engine)
 
@@ -767,7 +784,20 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
                         max_s=config.CONVERSATION_FOLLOWUP_TIMEOUT_S,
                         no_speech_timeout_s=config.CONVERSATION_FOLLOWUP_TIMEOUT_S,
                         shutdown_event=shutdown_event,
-                        on_loud=lambda rms: _on_loud_during_listen(lamp, rms))
+                        on_loud=lambda rms: _on_loud_during_listen(lamp, rms),
+                        # Only for the "you're engaged, go ahead and talk"
+                        # invitation (in_conversation False here) -- a real
+                        # in-conversation follow-up deliberately omits this,
+                        # since losing eye contact briefly while thinking of
+                        # a reply is expected, not a sign of walking away.
+                        # Real bug this fixes: this call can block up to
+                        # CONVERSATION_FOLLOWUP_TIMEOUT_S (~60s) with
+                        # nothing re-checking engagement the whole time --
+                        # someone engaged when the call started could go
+                        # fully idle and still be heard with no wake word,
+                        # because the decision was made once, up front, and
+                        # never revisited during the wait.
+                        keep_waiting=None if in_conversation else _check_engaged)
 
                 if n_faces > 1:
                     print(f"[multi-user] {n_faces} faces in frame, "

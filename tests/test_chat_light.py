@@ -435,7 +435,7 @@ def test_run_with_a_shared_lamp_and_store_never_closes_them(monkeypatch):
     # survive after this conversation turn returns -- closing either out
     # from under main.py's own still-running loop would be a real bug.
     class _FakeAgent:
-        def __init__(self, store, get_frame=None):
+        def __init__(self, store, get_frame=None, apply_light=None):
             self.last_light_action = None
             self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": None})()
@@ -478,7 +478,7 @@ def test_shutdown_event_already_set_never_touches_real_mic_io(monkeypatch):
     monkeypatch.setattr(chat.voice, "wait_for_wake_word", lambda *a, **k: called.append(1) or "wake")
 
     class _FakeAgent:
-        def __init__(self, store, get_frame=None):
+        def __init__(self, store, get_frame=None, apply_light=None):
             self.last_light_action = None
             self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": None})()
@@ -526,7 +526,7 @@ def test_being_engaged_skips_the_wake_word_gate_entirely(monkeypatch):
     monkeypatch.setattr(chat, "_listen", _fake_listen)
 
     class _FakeAgent:
-        def __init__(self, store, get_frame=None):
+        def __init__(self, store, get_frame=None, apply_light=None):
             self.last_light_action = None
             self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": None})()
@@ -581,7 +581,7 @@ def test_wait_for_wake_word_is_given_a_working_is_engaged_callback(monkeypatch):
     monkeypatch.setattr(chat, "_listen", _fake_listen)
 
     class _FakeAgent:
-        def __init__(self, store, get_frame=None):
+        def __init__(self, store, get_frame=None, apply_light=None):
             self.last_light_action = None
             self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": None})()
@@ -609,6 +609,94 @@ def test_wait_for_wake_word_is_given_a_working_is_engaged_callback(monkeypatch):
     # listen path "wake" already takes -- it did reach _listen(), not
     # crash or loop forever.
     assert calls["n"] == 1
+
+
+def test_engaged_invitation_listen_gets_a_keep_waiting_callback(monkeypatch):
+    # Real bug, reproduced live: "you're engaged, go ahead and talk"
+    # listens with the same generous timeout as an actual follow-up (up to
+    # CONVERSATION_FOLLOWUP_TIMEOUT_S) but never re-checked engagement
+    # during that wait -- someone engaged when the call started could go
+    # fully idle and still be heard with no wake word minutes later.
+    # keep_waiting=_check_engaged closes that; this confirms it's actually
+    # passed (not None) for this branch specifically.
+    monkeypatch.setattr(chat.voice, "preload", lambda: None)
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("wait_for_wake_word must not be called while already engaged")
+
+    monkeypatch.setattr(chat.voice, "wait_for_wake_word", _must_not_be_called)
+
+    seen_keep_waiting = []
+
+    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None, **kwargs):
+        seen_keep_waiting.append(kwargs.get("keep_waiting"))
+        return "quit", None, 0, np.zeros(1600, dtype="float32")
+
+    monkeypatch.setattr(chat, "_listen", _fake_listen)
+
+    class _FakeStore:
+        def list_known_classes(self):
+            return []
+
+        def close(self):
+            pass
+
+    args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
+                               no_multi_user=True, wake_word="hey lamp")
+
+    chat.run(args, lamp=_FakeLamp(), store=_FakeStore(), fsm=_FakeFSM(State.ENGAGED))
+
+    assert len(seen_keep_waiting) == 1
+    assert seen_keep_waiting[0] is not None and callable(seen_keep_waiting[0])
+
+
+def test_a_real_followup_listen_gets_no_keep_waiting_callback(monkeypatch):
+    # The opposite case: once actually in an open conversation
+    # (in_conversation True), losing eye contact briefly while thinking of
+    # a reply is expected, not a sign of walking away -- that listen must
+    # NOT be cut short by keep_waiting the way the engaged-invitation one
+    # deliberately is above.
+    monkeypatch.setattr(chat.voice, "preload", lambda: None)
+    monkeypatch.setattr(chat.voice, "wait_for_wake_word", lambda *a, **k: "wake")
+    monkeypatch.setattr(chat.voice, "speak", lambda text: None)
+
+    seen_keep_waiting = []
+    calls = {"n": 0}
+
+    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "what's the time", None, 0, np.zeros(1600, dtype="float32")
+        seen_keep_waiting.append(kwargs.get("keep_waiting"))
+        return "quit", None, 0, np.zeros(1600, dtype="float32")
+
+    monkeypatch.setattr(chat, "_listen", _fake_listen)
+
+    class _FakeAgent:
+        def __init__(self, store, get_frame=None, apply_light=None):
+            self.last_light_action = None
+            self.last_reminder_action = None
+            self.last_recall = type("R", (), {"observation": None})()
+
+        def ask(self, question):
+            return "reply"
+
+    monkeypatch.setattr(chat, "MemoryAgent", _FakeAgent)
+
+    class _FakeStore:
+        def list_known_classes(self):
+            return []
+
+        def close(self):
+            pass
+
+    args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
+                               no_multi_user=True, wake_word="hey lamp")
+
+    chat.run(args, lamp=_FakeLamp(), store=_FakeStore(), fsm=_FakeFSM(State.DISENGAGED))
+
+    assert calls["n"] == 2
+    assert seen_keep_waiting == [None]
 
 
 def test_relax_to_idle_does_not_fight_an_active_engaged_look():
@@ -655,7 +743,7 @@ def test_calm_speech_never_triggers_a_tone_flash(monkeypatch):
                                                        "pitch_variability_hz": None})())
 
     class _FakeAgent:
-        def __init__(self, store, get_frame=None):
+        def __init__(self, store, get_frame=None, apply_light=None):
             self.last_light_action = None
             self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": None})()
@@ -729,7 +817,7 @@ def test_recall_points_at_the_object_before_speaking_and_confirms_if_live(monkey
         timestamp = time.time()
 
     class _FakeAgent:
-        def __init__(self, store, get_frame=None):
+        def __init__(self, store, get_frame=None, apply_light=None):
             self.last_light_action = None
             self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": _FakeObs()})()
@@ -794,7 +882,7 @@ def test_recall_does_not_add_a_live_confirmation_when_not_currently_visible(monk
         timestamp = time.time()
 
     class _FakeAgent:
-        def __init__(self, store, get_frame=None):
+        def __init__(self, store, get_frame=None, apply_light=None):
             self.last_light_action = None
             self.last_reminder_action = None
             self.last_recall = type("R", (), {"observation": _FakeObs()})()

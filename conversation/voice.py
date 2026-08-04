@@ -23,6 +23,7 @@ from typing import Callable
 import numpy as np
 import sounddevice as sd
 
+import audio_output
 import config
 
 _whisper_model = None
@@ -121,13 +122,42 @@ def record(duration_s: float, samplerate: int = config.VOICE_SAMPLE_RATE) -> np.
     return audio.flatten()
 
 
+_speech_active = threading.Event()
+
+
+def is_listening() -> bool:
+    """True only while actual speech is being captured mid-utterance --
+    NOT for the whole duration of a record_until_silence() call. That
+    matters because the same call also serves the ~minute-long
+    post-reply follow-up window (config.CONVERSATION_FOLLOWUP_TIMEOUT_S),
+    almost all of which is silence with nobody talking -- an earlier
+    version of this flag was held for the entire call, which blocked
+    attention-seeking from starting for that whole window even once the
+    person had looked away and said nothing further. Read by main.py so
+    attention-seeking doesn't start (or talk over) a reply while someone
+    is actually mid-sentence -- see is_speaking() for the lamp's own half
+    of the same problem."""
+    return _speech_active.is_set()
+
+
+def is_speaking() -> bool:
+    """True for the duration of an active speak() call. Checking this
+    (module-level, not tied to any one caller) rather than relying on the
+    mic picking up the lamp's own TTS output is deliberate -- interruption
+    awareness (perception/audio_monitor.py) only sees room noise, which
+    misses this entirely on headphones/quiet output and isn't guaranteed
+    to hold for the TTS clip's full duration even when it does pick it up."""
+    return _speak_lock.locked()
+
+
 def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
                           silence_s: float = config.VOICE_SILENCE_TIMEOUT_S,
                           no_speech_timeout_s: float = config.VOICE_NO_SPEECH_TIMEOUT_S,
                           samplerate: int = config.VOICE_SAMPLE_RATE,
                           stop_event: threading.Event | None = None,
                           shutdown_event: threading.Event | None = None,
-                          on_loud: Callable[[float], None] | None = None) -> np.ndarray:
+                          on_loud: Callable[[float], None] | None = None,
+                          keep_waiting: Callable[[], bool] | None = None) -> np.ndarray:
     """Records from the mic until speech has clearly started and then
     stopped (silence_s of continuous quiet after some sound was heard), or
     max_s is hit as a safety cap. If nothing is said at all -- e.g. a
@@ -140,6 +170,22 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
     timeout. shutdown_event, if given, aborts the wait early (process is
     shutting down) instead of blocking a caller trying to join this thread
     until max_s naturally elapses.
+
+    keep_waiting, if given, is polled once per cycle (same cadence as the
+    shutdown_event check) but only *before* speech has started -- once
+    state["speech_started"] flips True this stops being consulted, so an
+    utterance already in progress is never cut off by it (glancing down
+    mid-sentence is normal, not a sign the person walked away -- see
+    chat.py's _check_engaged). Real bug this fixes: the "you're currently
+    engaged, go ahead and talk without the wake word" invitation used the
+    same generous max_s as an actual in-conversation follow-up (up to
+    CONVERSATION_FOLLOWUP_TIMEOUT_S, ~60s) with nothing re-checking
+    engagement for that whole window -- someone engaged when the call
+    started could walk away, and speech said well after they'd gone idle
+    would still be accepted with no wake word, because the decision to
+    skip it was made once, up front, and never revisited. chat.py passes
+    keep_waiting=_check_engaged for exactly that call (and only that one --
+    a real follow-up deliberately omits it, see run()'s own comment).
 
     on_loud, if given, fires at most once per call, synchronously from the
     audio callback, the instant a single block's RMS crosses
@@ -171,20 +217,31 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
         if rms > threshold:
             state["speech_started"] = True
             state["silence_since"] = None
+            _speech_active.set()
         elif state["speech_started"]:
             if state["silence_since"] is None:
                 state["silence_since"] = now
             elif now - state["silence_since"] > silence_s:
+                _speech_active.clear()  # utterance judged complete -- don't wait for the function to return
                 done.set()
         elif now - start_t > no_speech_timeout_s:
             done.set()
 
-    with sd.InputStream(samplerate=samplerate, channels=1, dtype="float32", callback=_callback):
-        t0 = time.monotonic()
-        while not done.is_set() and (time.monotonic() - t0) < max_s:
-            if shutdown_event is not None and shutdown_event.is_set():
-                break
-            sd.sleep(30)
+    try:
+        with sd.InputStream(samplerate=samplerate, channels=1, dtype="float32", callback=_callback):
+            t0 = time.monotonic()
+            while not done.is_set() and (time.monotonic() - t0) < max_s:
+                if shutdown_event is not None and shutdown_event.is_set():
+                    break
+                if keep_waiting is not None and not state["speech_started"] and not keep_waiting():
+                    break
+                sd.sleep(30)
+    finally:
+        # Belt and braces against the silence-timeout clear above -- covers
+        # every other exit path (max_s cap, shutdown_event, an exception)
+        # so this can never get stuck set and permanently suppress
+        # attention-seeking for the rest of the process.
+        _speech_active.clear()
 
     if stop_event is not None:
         stop_event.set()
@@ -412,8 +469,12 @@ def _speak_piper(voice, text: str) -> None:
         return
     sr = chunks[0].sample_rate
     audio = np.concatenate([c.audio_float_array for c in chunks])
-    sd.play(audio, samplerate=sr)
-    sd.wait()
+    # Through audio_output's shared lock, not sd.play() directly -- see
+    # that module's docstring. _speak_lock (above) only serializes speak()
+    # calls against each other; it has no idea lamp.play_sound() exists on
+    # a completely different thread, and an unguarded sd.play() here could
+    # still get stopped mid-sentence by a chirp landing at the same moment.
+    audio_output.play_and_wait(audio, sr)
 
 
 def _speak_sapi5(text: str) -> None:

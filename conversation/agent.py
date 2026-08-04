@@ -159,13 +159,21 @@ TOOL_SPECS = [
             "action": {"type": "string", "enum": ["create", "cancel"],
                        "description": "'create' a new reminder, or 'cancel' existing one(s)"},
             "kind": {"type": "string", "enum": list(reminders.KINDS),
-                     "description": "'recurring': fires repeatedly on a fixed interval (e.g. "
-                                     "every 30 minutes). 'presence': fires once each time the "
-                                     "user leaves the desk (a face stops being detected), then "
-                                     "re-arms once they're back. 'object_check': watches where a "
-                                     "named object gets set down, then points back at it and "
-                                     "checks in at a deadline -- for 'make sure I do something "
-                                     "with X by/in a certain time.' Required for a 'create' "
+                     "description": "'recurring': fires repeatedly on a fixed interval with no "
+                                     "verification of anything -- a blind, repeating nag (e.g. "
+                                     "'remind me to stand up every 30 minutes'). 'presence': "
+                                     "watches whether the PERSON is at the desk -- fires once "
+                                     "each time they leave (a face stops being detected), then "
+                                     "re-arms once they're back. 'object_check': watches a named "
+                                     "OBJECT and actually checks on it -- either 'make sure I do "
+                                     "something with X by/in a certain time' (a plain presence/ "
+                                     "location check), or 'make sure I DON'T touch/use X for a "
+                                     "while' (a watch that also catches it being disturbed early -- "
+                                     "see deadline_minutes and check_question below). Prefer "
+                                     "'object_check' over 'recurring' any time a specific object is "
+                                     "named, even for phrasing like 'make sure I'm not on my phone "
+                                     "for five minutes' -- 'recurring' can only nag on a timer, it "
+                                     "can't actually look at anything. Required for a 'create' "
                                      "action; for 'cancel', omit to cancel every active reminder "
                                      "instead of just one kind."},
             "interval_minutes": {"type": "number",
@@ -180,7 +188,13 @@ TOOL_SPECS = [
                                   "description": "required when creating an 'object_check' "
                                                   "reminder -- minutes from now until the check, "
                                                   "computed from the current time given above "
-                                                  "(e.g. 'by 6pm' when it's 3:45pm now is 135)"},
+                                                  "(e.g. 'by 6pm' when it's 3:45pm now is 135). "
+                                                  "Also how to express a stated window -- 'for the "
+                                                  "next five minutes'/'in 5 minutes' is "
+                                                  "deadline_minutes=5, same as an explicit clock "
+                                                  "time. Use this, not duration_minutes, for a "
+                                                  "bounded object_check -- duration_minutes doesn't "
+                                                  "apply to this kind (see its own description)."},
             "check_question": {"type": "string",
                                 "description": "optional, 'object_check' only -- if the request "
                                                 "implies judging something about the object's "
@@ -258,16 +272,30 @@ class RecallResult:
 
 class MemoryAgent:
     def __init__(self, store: MemoryStore, provider: str | None = None,
-                 get_frame: Callable[[], np.ndarray | None] | None = None):
+                 get_frame: Callable[[], np.ndarray | None] | None = None,
+                 apply_light: Callable[[str], None] | None = None):
         """get_frame: optional zero-arg callable returning the current raw
         camera frame (or None), used only by describe_current_view. None
         in standalone chat.py (no live camera loop to ask) and in any
         session without --chat's vision_memory wired through -- the tool
         just reports itself unavailable rather than the agent needing a
-        real camera dependency to construct at all."""
+        real camera dependency to construct at all.
+
+        apply_light: optional callable actually applying a control_light
+        action immediately, in addition to last_light_action still being
+        set for chat.py's own post-turn bookkeeping (_look_attentive's
+        set_light=agent.last_light_action is None check). Without this,
+        the light command only took effect after ask() returned in full --
+        fine on its own, but a turn that ALSO calls describe_current_view
+        ("turn on your light and check what it says") would always
+        capture its frame before the light change applied, since nothing
+        during the tool loop itself ever touched the real lamp. None in
+        standalone chat.py, same as get_frame -- there's no lamp there to
+        apply anything to."""
         self.store = store
         self.provider = (provider or config.LLM_PROVIDER).lower()
         self.get_frame = get_frame
+        self.apply_light = apply_light
         self.messages: list[dict] = []
         self.last_recall = RecallResult()
         self.last_light_action: str | None = None  # set by the last control_light call, so chat.py can apply it
@@ -321,6 +349,11 @@ class MemoryAgent:
             if action not in LIGHT_ACTIONS:
                 return {"applied": False, "error": f"'{action}' isn't a valid action"}, None
             self.last_light_action = action
+            if self.apply_light is not None:
+                # Immediately, not after ask() returns -- see apply_light's
+                # own docstring for why a later describe_current_view in
+                # this same turn needs this to have already happened.
+                self.apply_light(action)
             return {"applied": True, "action": action}, None
         if name == "create_reminder":
             action = str(tool_input.get("action", "")).strip().lower()
@@ -426,23 +459,34 @@ class MemoryAgent:
             results = []
             for block in response.content:
                 if block.type == "tool_use":
+                    # Everything that can raise for this block -- not just
+                    # _execute_tool itself, but building its result content
+                    # (json.dumps, the image-block wrapping below) -- has to
+                    # stay inside this one try. It used to only wrap
+                    # _execute_tool; a failure in the content-construction
+                    # step right after it (e.g. a non-serializable result)
+                    # would skip straight past results.append for this
+                    # block, breaking out of the loop with the tool_use
+                    # above left permanently unpaired -- exactly the bug
+                    # this whole try/except exists to prevent, just for a
+                    # different failure point than the one already covered.
                     try:
                         result, image_bytes = self._execute_tool(block.name, block.input)
+                        if image_bytes is not None:
+                            # Anthropic tool_result content can be a list of
+                            # blocks, not just a text string -- an image block
+                            # here is what actually lets the model *see* the
+                            # frame describe_current_view captured, not just
+                            # read a caption about it.
+                            content = [
+                                {"type": "text", "text": json.dumps(result)},
+                                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                              "data": base64.b64encode(image_bytes).decode("ascii")}},
+                            ]
+                        else:
+                            content = json.dumps(result)
                     except Exception as e:
-                        result, image_bytes = {"error": f"tool failed: {e}"}, None
-                    if image_bytes is not None:
-                        # Anthropic tool_result content can be a list of
-                        # blocks, not just a text string -- an image block
-                        # here is what actually lets the model *see* the
-                        # frame describe_current_view captured, not just
-                        # read a caption about it.
-                        content = [
-                            {"type": "text", "text": json.dumps(result)},
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
-                                                          "data": base64.b64encode(image_bytes).decode("ascii")}},
-                        ]
-                    else:
-                        content = json.dumps(result)
+                        content = json.dumps({"error": f"tool failed: {e}"})
                     results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
             self.messages.append({"role": "user", "content": results})
             response = self.client.messages.create(
@@ -451,7 +495,18 @@ class MemoryAgent:
             )
 
         self.messages.append({"role": "assistant", "content": response.content})
-        return "".join(b.text for b in response.content if b.type == "text")
+        reply = "".join(b.text for b in response.content if b.type == "text")
+        if not reply:
+            # Seen live: a turn (no tool call, no error) coming back with
+            # no text at all -- chat.py just prints a blank "LAMP:" and
+            # voice.speak() no-ops on empty text, so the user gets zero
+            # feedback that anything happened. stop_reason/block types
+            # narrow down *why* (end_turn with no text block vs a
+            # max_tokens cutoff vs something else) if it happens again,
+            # rather than guessing from a terminal log after the fact.
+            block_types = [b.type for b in response.content]
+            print(f"[agent] empty reply -- stop_reason={response.stop_reason!r} blocks={block_types}")
+        return reply
 
     # -- OpenAI ----------------------------------------------------------
 
@@ -479,12 +534,18 @@ class MemoryAgent:
             # here needs a matching "tool" role reply in self.messages, or
             # the gap persists across turns for the rest of the session.
             for call in message.tool_calls:
+                # Same reasoning as the Anthropic loop's try/except -- the
+                # json.dumps below has to be inside it too, not just
+                # _execute_tool, or a non-serializable result raises past
+                # the append and leaves this tool_call unpaired.
                 try:
                     args = json.loads(call.function.arguments or "{}")
                     result, image_bytes = self._execute_tool(call.function.name, args)
+                    content = json.dumps(result)
                 except Exception as e:
                     result, image_bytes = {"error": f"tool failed: {e}"}, None
-                self.messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
+                    content = json.dumps(result)
+                self.messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
                 if image_bytes is not None:
                     # OpenAI's tool-role messages are text-only -- an
                     # image has to ride along on a normal user message
@@ -502,6 +563,10 @@ class MemoryAgent:
             message = response.choices[0].message
 
         self.messages.append({"role": "assistant", "content": message.content})
+        if not message.content:
+            # See the matching check in _ask_anthropic for why this is
+            # worth a line instead of silently returning "".
+            print(f"[agent] empty reply -- finish_reason={response.choices[0].finish_reason!r}")
         return message.content or ""
 
     # -- One-shot vision judgment (stage 3 of behavior/reminders.py's

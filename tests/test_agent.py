@@ -17,6 +17,7 @@ def _agent():
     agent = MemoryAgent.__new__(MemoryAgent)
     agent.store = None
     agent.get_frame = None
+    agent.apply_light = None
     agent.last_recall = RecallResult()
     agent.last_light_action = None
     agent.last_reminder_action = None
@@ -42,6 +43,22 @@ def test_control_light_is_case_insensitive():
     agent = _agent()
     agent._execute_tool("control_light", {"action": "COZY"})
     assert agent.last_light_action == "cozy"
+
+
+def test_control_light_invokes_apply_light_immediately_when_set():
+    calls = []
+    agent = _agent()
+    agent.apply_light = lambda action: calls.append(action)
+    agent._execute_tool("control_light", {"action": "dim"})
+    assert calls == ["dim"]
+
+
+def test_control_light_does_not_apply_an_invalid_action():
+    calls = []
+    agent = _agent()
+    agent.apply_light = lambda action: calls.append(action)
+    agent._execute_tool("control_light", {"action": "strobe"})
+    assert calls == []
 
 
 def test_every_light_action_is_a_valid_string():
@@ -370,3 +387,53 @@ def test_a_tool_that_raises_still_gets_a_paired_tool_result():
     assert tool_result_msg["role"] == "user"
     assert tool_result_msg["content"][0]["tool_use_id"] == "toolu_test123"
     assert "error" in tool_result_msg["content"][0]["content"]
+
+
+def test_a_tool_that_returns_an_unserializable_result_still_gets_a_paired_tool_result():
+    # Same bug class, different trigger: _execute_tool succeeding but
+    # returning something json.dumps can't handle used to raise *after*
+    # the try/except (it only wrapped _execute_tool itself), skipping
+    # results.append for that block and leaving its tool_use unpaired --
+    # exactly what surfaced live as a 400 on a *later*, unrelated turn.
+    agent = _agent()
+    agent.provider = "anthropic"
+    agent.messages = []
+    tool_use = _FakeToolUseBlock("create_reminder", {"action": "create"})
+    first_response = type("R", (), {"stop_reason": "tool_use", "content": [tool_use]})()
+    second_response = _FakeResponse("done")
+    agent.client = _SequencedClient([first_response, second_response])
+
+    agent._execute_tool = lambda name, tool_input: ({"created": True, "bad": object()}, None)
+
+    reply = agent.ask("remind me about something")
+
+    assert reply == "done"
+    tool_result_msg = agent.messages[2]
+    assert tool_result_msg["content"][0]["tool_use_id"] == "toolu_test123"
+    assert "error" in tool_result_msg["content"][0]["content"]
+
+
+def test_control_light_applies_before_a_later_describe_current_view_in_the_same_turn():
+    # Real bug, reported live: "turn on your light and check what it says"
+    # -- describe_current_view used to always capture the pre-change frame,
+    # because control_light only ever recorded last_light_action for
+    # chat.py to apply *after* ask() returned, well after any
+    # describe_current_view in the same turn had already run. apply_light
+    # (see MemoryAgent.__init__) fixes this by applying immediately, inside
+    # the tool loop itself -- this exercises the real two-tool-call loop,
+    # not just each tool in isolation, to prove the ordering.
+    agent = _agent()
+    agent.provider = "anthropic"
+    agent.messages = []
+    calls = []
+    agent.apply_light = lambda action: calls.append(("apply_light", action))
+    agent.get_frame = lambda: calls.append(("get_frame",)) or np.zeros((4, 4, 3), dtype=np.uint8)
+    light_block = _FakeToolUseBlock("control_light", {"action": "on"}, id_="toolu_light")
+    describe_block = _FakeToolUseBlock("describe_current_view", {}, id_="toolu_describe")
+    first_response = type("R", (), {"stop_reason": "tool_use", "content": [light_block, describe_block]})()
+    second_response = _FakeResponse("light's on, here's what I see")
+    agent.client = _SequencedClient([first_response, second_response])
+
+    agent.ask("turn on your light and check what it says")
+
+    assert [c[0] for c in calls] == ["apply_light", "get_frame"]
