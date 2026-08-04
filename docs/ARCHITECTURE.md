@@ -555,19 +555,48 @@ tracking rewrite's own lost-tracking timeout.
   stage, the YOLO scan stage, and the full per-frame loop, from the same
   session CSV.
 
+**Engagement reliability**, from a real labeled `main.py --label` session
+(session_20260804_134637.csv, 1224 frames over 70.1s, ~17.5fps effective,
+a deliberate mixed pattern of quick glances and longer stretches, 41% of
+frames labeled "looking"):
+
 ```
-Latency -- session_20260801_173309.csv (150 frames), YOLO11s @ 0.35s/0.18s cadence, torch capped to 4 threads
-  engagement (frame -> yaw/pitch): n=150  p50=15.4ms  p95=23.7ms  p99=30.6ms  max=39.6ms
-  memory scan (YOLO, when it runs): n=25  p50=76.0ms  p95=107.5ms  p99=110.8ms  max=111.4ms
-  full per-frame loop: n=150  p50=29.8ms  p95=131.0ms  p99=158.6ms  max=166.9ms
+Engagement detection reliability -- session_20260804_134637.csv (1224 frames)
+  raw (includes reaction-time/dwell mismatch near transitions) (n=1224):
+    confusion matrix: TP=427 FP=75 FN=72 TN=650
+    precision: 0.851  recall: 0.856  f1: 0.853  accuracy: 0.880
+  windowed (excludes frames within 500ms of a label change) (n=1002):
+    confusion matrix: TP=377 FP=27 FN=11 TN=587
+    precision: 0.933  recall: 0.972  f1: 0.952  accuracy: 0.962
+  flicker: 11.1 predicted-state changes/min
 ```
 
-That run was measured on battery power under the throttling described
-above; an earlier dev run showed faster numbers under an unrecorded
-power state, so the two aren't directly comparable without knowing both
-states. Real engagement precision/recall/F1 from a labeled session goes
-here once run for that purpose specifically — the numbers above are from
-an unlabeled dev run, just to show the output shape.
+The gap between raw and windowed (0.853 -> 0.952 F1) is mostly the
+hysteresis working as designed, not noise: excluding the 500ms around
+each real transition removes exactly the frames where the dwell-frame
+requirement is *supposed* to lag the label by a beat, and F1 climbs
+because those weren't real errors to begin with. 11.1 predicted-state
+changes/min over a 70s session with frequent deliberate glances is a
+handful of real transitions, not boundary flicker — a flat, unchanging
+gaze would read near 0.
+
+**Latency**, from the same session:
+
+```
+Latency -- session_20260804_134637.csv (1224 frames)
+  engagement (frame -> yaw/pitch): n=1224  p50=13.8ms  p95=17.1ms  p99=19.2ms  max=23.9ms
+  memory scan (YOLO, when it runs): n=63  p50=44.3ms  p95=55.9ms  p99=61.4ms  max=64.2ms
+  full per-frame loop: n=1224  p50=44.4ms  p95=84.4ms  p99=132.1ms  max=153.6ms
+```
+
+Faster than the earlier battery-throttled dev run documented in prior
+revisions of this doc (engagement p50 15.4ms -> 13.8ms), though the full
+loop's own p50 went up (29.8ms -> 44.4ms), most likely the 1920x1080
+compositing cost this doc's own tradeoffs section already discloses,
+now actually measured rather than assumed. These two runs aren't a clean
+apples-to-apples comparison either way -- resolution changed between
+them, not just power state -- consistent with the standing guidance
+above to rule out both before chasing latency further.
 
 ## 5. Bonus items, and what's still not built
 
