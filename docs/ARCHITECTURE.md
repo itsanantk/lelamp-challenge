@@ -11,14 +11,28 @@ so the same behavior code would drive real servos without changes.
 flowchart LR
     subgraph Perception
         CAM["Webcam"] --> ENG["EngagementPipeline\n(perception/engagement.py)\nMediaPipe FaceLandmarker\n-> yaw/pitch -> hysteresis"]
-        CAM --> VM["VisionMemory\n(perception/vision_memory.py)\nYOLO11s, 0.35s/0.18s interval"]
+        CAM --> VM["VisionMemory\n(perception/vision_memory.py)\nYOLO11s, scene-change gated\n0.35s/0.18s interval"]
+        CAM --> MF["SpeakerDetector\n(perception/multi_face.py)\nmouth-openness -> active\nspeaker (bonus)"]
+        CAM --> HW["HandWaveDetector\n(perception/hand_wave.py)\nonly while ENGAGED"]
+        CAM --> AL["AmbientLightSensor\n(perception/ambient_light.py)"]
+        MIC["Microphone"] --> AM["AudioActivityMonitor\n(perception/audio_monitor.py)\nRMS gate\n(bonus: interruption awareness)"]
     end
 
     subgraph Behavior
-        ENG -- "engaged: bool, user_bearing" --> FSM["BehaviorFSM\n(behavior/state_machine.py)\nIDLE / ENGAGED / DISENGAGED\n/ ATTENTION_SEEKING"]
+        ENG -- "engaged, user_bearing" --> FSM["BehaviorFSM\n(behavior/state_machine.py)\nIDLE / ENGAGED / DISENGAGED\n/ ATTENTION_SEEKING"]
+        AM -- "user_busy" --> FSM
+        AL -- "brightness nudge" --> FSM
         VM -- "tracked-class detections" --> OW["ObjectWatcher\n(behavior/object_watch.py)\ncontinuous phone tracking"]
+        HW -- "wave bearing" --> OW
+        VM -- "detections" --> RE["ReminderEngine\n(behavior/reminders.py)\nrecurring / presence /\nobject_check (watch OR\nalert_on_detection)"]
+        IS["IdleScanner\n(behavior/idle_scan.py)\nsweeps gaze when nothing\nelse has attention"]
+        AE["AdaptationEngine\n(behavior/adaptation.py)\nbounded self-learning (bonus)"]
+        FSM -. "attempt/response history" .-> AE
+        AE -. "tuned delay/cooldown\n/max-tries" .-> FSM
         FSM -- "set_target_pose / set_light / play_sound" --> HAL["LampActuator (HAL)\n(lamp/hal.py)"]
         OW -- "same calls,\nonly when FSM isn't mid-gesture" --> HAL
+        IS --> HAL
+        RE -- "fire: point + speak + sound" --> HAL
     end
 
     subgraph Actuation
@@ -31,9 +45,12 @@ flowchart LR
     end
 
     subgraph Conversation
-        USER["User (voice or text)"] -- "Whisper (local)" --> AGENT["MemoryAgent\n(conversation/agent.py)\nClaude/OpenAI + tool-use"]
-        AGENT -- "recall_object_location\nlist_seen_objects" --> DB
-        AGENT -- "reply, spoken via SAPI5" --> USER
+        USER["User (voice or text)"] -- "wake word + Whisper (local)\n(conversation/voice.py)" --> AGENT["MemoryAgent\n(conversation/agent.py)\nClaude/OpenAI + tool-use"]
+        MIC -- "raw audio" --> EMO["emotion.analyze()\n(conversation/emotion.py)\nloudness/pitch/rate -> tone\n(bonus)"]
+        EMO -- "tone label" --> HAL
+        AGENT -- "recall_object_location\nlist_seen_objects\ncreate_reminder\ncontrol_light" --> DB
+        AGENT -- "create/cancel" --> RE
+        AGENT -- "reply, spoken via Piper\n(SAPI5 fallback)" --> USER
         AGENT -- "recalled bearing" --> HAL
     end
 
@@ -41,6 +58,8 @@ flowchart LR
     MAIN --- FSM
     MAIN --- VM
     MAIN --- OW
+    MAIN --- RE
+    MAIN --- AM
     MAIN -. "--chat: background thread,\nsame lamp + window" .-> AGENT
 ```
 
@@ -54,13 +73,18 @@ A few boundaries I drew on purpose:
   That's what let me unit test it with a fake lamp
   (`tests/test_state_machine.py`) and what makes `RealLamp` a drop-in
   swap instead of a rewrite.
+- `behavior/reminders.py` has no LLM/API-key access either, same
+  perception-doesn't-know-an-LLM-exists rule applied one layer up — it
+  can flag an object_check as due, but a `chat.py` background thread
+  (which does have `MemoryAgent` access) is what actually claims it,
+  takes the vision-LLM look, and resolves it. See §2's third sequence
+  diagram for that handoff.
 - `memory/store.py` is the one place that knows what the lamp has seen.
   Both the live loop (writer) and the chat agent (reader) touch it and
   nothing else.
-- `conversation/agent.py` can't answer from thin air — its two tools are
-  the only way it learns anything, so a hallucinated location would
-  require the model to fabricate a tool result, which the loop doesn't
-  let it do.
+- `conversation/agent.py` can't answer from thin air — its tools are the
+  only way it learns anything, so a hallucinated location would require
+  the model to fabricate a tool result, which the loop doesn't let it do.
 
 ## 2. Data flow
 
@@ -107,6 +131,35 @@ sequenceDiagram
     A-->>U: "saw it about 40s ago, off to the left"
     A->>L: point at bearing (if found)
     L-->>U: arm turns toward remembered bearing
+```
+
+**Object-check reminder with a judgment call ("make sure I drink all my
+water"), across two threads — `behavior/reminders.py`'s tick (no LLM
+access, by design) hands off to `chat.py`'s background poller (which
+has one) once a check is actually due:**
+
+```mermaid
+sequenceDiagram
+    participant Tick as ReminderEngine.tick() (main.py loop)
+    participant VM as VisionMemory
+    participant Poll as _reminder_judgment_loop (chat.py thread)
+    participant A as MemoryAgent
+    participant C as Claude/OpenAI (vision)
+    participant L as SimulatedLamp
+
+    Tick->>VM: last_detections (placement + disturbance check)
+    Note over Tick: check_question set -> confirms placement on first sighting, no settle wait (see §3)
+    Tick->>Tick: due_at reached OR sustained disturbance
+    Tick-->>Tick: due_for_check=True, _check_dispatched=True
+    Poll->>Poll: polls reminder_engine.reminders every 1s
+    Poll->>Poll: claims it (due_for_check=False immediately, _check_dispatched stays True -- see its own field comment)
+    Poll->>L: point at remembered bearing
+    Poll->>VM: request_immediate_scan()
+    Poll->>A: judge_view("is this bottle full or empty")
+    A->>C: image (1024px downscaled) + question
+    C-->>A: judgment text
+    A-->>Poll: answer
+    Poll->>L: play_sound + voice.speak(message + answer)
 ```
 
 ## 3. Decisions and why I made them
@@ -542,6 +595,31 @@ after a timeout; the underlying lesson (state set once and never
 cleared silently goes stale) carried forward into the continuous-
 tracking rewrite's own lost-tracking timeout.
 
+**Object-check reminders needed two different notions of "disturbed," not
+one.** `behavior/reminders.py`'s original object_check design assumes a
+placement: confirm the object has settled somewhere (a stability wait,
+`REMINDER_PLACEMENT_SETTLE_S`), remember that spot, then watch for a
+sustained move away from it or a sustained disappearance. That fits
+"check on my water bottle in an hour" well — the whole premise is the
+object sitting still until it doesn't. It fits "make sure I don't touch
+my phone" badly, for a reason the settle-wait itself creates: something
+you might pick up jitters in bearing between sightings just from being
+handled, so the stability requirement can go unmet indefinitely and
+disturbance-watching never even starts — reported live as "the reminder
+just doesn't do anything." A prohibition has no baseline position to
+compare against in the first place; the object being detected *at all*
+is the entire violation, and there's nothing to visually judge either
+(no `judge_view()` round trip needed — YOLO's own detection already
+answers the only question there is). Rather than keep stretching one
+mechanism to cover both, `alert_on_detection` is a distinct third mode:
+no placement, no settle wait, no disturbance debounce, fires directly the
+instant the object is seen while the reminder is active. The disturbance-
+watch path's own protections (a stability wait before trusting a
+baseline, a debounce before trusting a move) exist specifically *because*
+there's a baseline to protect against noise around — remove the baseline
+and those protections have nothing left to guard, so removing them too
+is the correct simplification, not a shortcut.
+
 ## 4. Evaluation
 
 - `python -m eval.engagement_eval` — precision/recall/F1/accuracy plus a
@@ -597,6 +675,46 @@ now actually measured rather than assumed. These two runs aren't a clean
 apples-to-apples comparison either way -- resolution changed between
 them, not just power state -- consistent with the standing guidance
 above to rule out both before chasing latency further.
+
+**End-to-end voice/recall latency**, measured separately from the numbers
+above -- `eval/latency_eval.py` only reads columns `main.py`'s own
+per-frame CSV logger writes, which covers the camera/engagement/YOLO loop
+but never touches `chat.py`/`conversation/voice.py` at all (they run on a
+different thread, on their own cadence, not once per frame). Getting real
+numbers for step 4 (recall) meant timing each stage directly against the
+actual local models and a real LLM API call on this machine, not reading
+them out of a log:
+
+```
+Wake-word chunk transcription (tiny.en, 1.8s chunk):        ~155ms  (149-165ms)
+Full-question transcription (small.en, ~3s of speech):     ~1030ms (1012-1048ms)
+LLM reply, no tool call:                                    ~1.6s
+LLM reply, tool-triggering turn (control_light/etc.):       ~3.4s  (2.99-3.83s)
+Vision judgment (judge_view, 1024px downscaled frame):       ~2.5s  (2.08-2.99s)
+Piper TTS synthesis (compute only, not playback):          105-167ms
+Resulting audio playback duration:                          2.0-4.4s (scales with reply length)
+```
+
+Rough feel for a full round trip: ~0.2-0.4s to catch the wake word, however
+long you actually talk, ~1s to transcribe it, ~1.6-3.4s for the model to
+reply (or ~2.5s if it needs a fresh look at the scene), then however long
+the reply takes to play out loud. A typical question lands around
+**4-6 seconds** wake-word to reply-starts-playing; longer for anything
+needing a vision judgment or a longer answer. The vision-judgment number
+is the one worth calling out on its own: before frames were downscaled to
+1024px before the API call (see `_encode_frame_for_vision` in
+`conversation/agent.py`), the same call measured **~12-13 seconds** —
+sending the full 1920x1080 frame meant uploading and having the model
+process roughly 4x the pixels any of these judgments ever needed.
+
+Two honest caveats on these voice-pipeline numbers, in keeping with every
+other timing claim in this doc: the Whisper numbers are measured against
+silent audio (a real floor, not necessarily identical to real speech,
+which has more to decode), and the LLM numbers depend on Anthropic's own
+API latency at the moment they were run, not just anything in this
+codebase — both are real, live-measured numbers on this exact machine,
+not estimates, but neither is a lab-controlled constant the way a local
+CPU-only computation would be.
 
 ## 5. Bonus items, and what's still not built
 
@@ -678,5 +796,117 @@ of visibly looping.
 
 **Whisper accuracy and TTS pacing.** Bumped the transcription model from
 `base.en` to `small.en` for accuracy, at the cost of a bigger download
-and somewhat higher per-turn latency. Slowed SAPI5's TTS rate from its
-default ~200wpm to 175 — the faster default read as rushed.
+and somewhat higher per-turn latency. TTS itself is Piper (a real local
+neural voice) when its model files are present, with SAPI5 as a
+fallback only if they're not — Piper's own speed is a genuine synthesis
+parameter (`length_scale`, lower is faster; `config.PIPER_LENGTH_SCALE`
+in this codebase), not a wpm setting the way SAPI5's is, so the two
+needed separate tuning: SAPI5's rate was slowed from its default ~200wpm
+to 165 (reads softer, less clipped, especially over Bluetooth output),
+while Piper's `length_scale` was lowered from the model's own default of
+1.0 to 0.85 once live testing found the default read as too slow and
+deliberate for back-and-forth conversation — confirmed with a real,
+non-mocked synthesis call: the same sentence went from 3.03s of audio to
+2.73s, a genuine ~10% speedup, not just a config change that looks right
+on paper.
+
+**RMS thresholds calibrated against the wrong signal, three more times.**
+The wake-word gate and the emotion classifier's original `_LOUD_RMS` (see
+above) weren't isolated mistakes — the same shape of bug kept recurring
+across every RMS-based threshold in this codebase, each one discovered
+live rather than caught by a test (thresholds are a live-calibration
+problem no unit test can catch without a labeled audio corpus, which
+this project doesn't have):
+
+- `AUDIO_GATE_RMS_THRESHOLD` (interruption awareness) was 0.02, on the
+  same physical mic as `VOICE_GATE_RMS_THRESHOLD` — which had *already*
+  been corrected down to 0.008 for real speech on this exact setup, for
+  this exact reason. The two constants were never supposed to diverge;
+  one got fixed and the other didn't, so the ambient "is the room busy"
+  monitor had likely never once tripped on ordinary talking since it was
+  added. Matched to the already-validated value instead of re-deriving a
+  new one.
+- Separately, `AudioActivityMonitor`'s "how long a busy reading persists
+  after the last loud block" (`config.AUDIO_GATE_SUSTAIN_S`) was a
+  *second*, independent bug on top of the threshold one: the constant
+  existed but was never actually wired up (`AudioActivityMonitor.__init__`
+  had its own hardcoded default, `main.py` constructed it with no
+  arguments), so tuning it would have done nothing regardless of value.
+  Fixed the wiring, then raised it from 0.6s to 3.0s — a normal
+  conversational pause is longer than 0.6s, so a person mid-conversation
+  with someone else could read as "quiet" for a beat and let
+  attention-seeking start mid-sentence.
+- `conversation/emotion.py`'s follow-up bug, after the `_LOUD_RMS` fix
+  above: real conversational RMS on this mic turned out to reach into
+  the 0.02-0.03+ range during ordinary talking (the same live report,
+  "im at 0.032 sometimes when just talking," that also drove
+  `VOICE_YELL_RMS_THRESHOLD` up from 0.032 to its final 0.5) — which
+  meant the *fixed* `_LOUD_RMS` (0.016) was still below normal speech,
+  so loudness alone saturated to 1.0 on almost every utterance and
+  "calm" stayed unreachable in practice, reported live as "it always
+  says im energetic." Raised `_LOUD_RMS` to 0.1, well above the observed
+  normal-talking ceiling.
+- The live jerk-back/startled flinch and the "yelling" text label used
+  to share one threshold (`VOICE_YELL_RMS_THRESHOLD`) on the theory that
+  "did a loud tone happen" should mean the same thing whether it's judged
+  live or after the fact. In practice the two need different
+  sensitivities: raising the shared number to stop the flinch firing on
+  merely-raised speech also silently raised the bar for the rarer
+  "yelling" label past where it should sit. Split into
+  `VOICE_FLINCH_RMS_THRESHOLD` (0.07, the live physical trip-wire) and
+  `VOICE_YELL_RMS_THRESHOLD` (0.5, the after-the-fact text label), and
+  reused the flinch threshold as `emotion._ANGRY_RMS` so a tone loud
+  enough to trip the physical flinch also skips straight to "tense" in
+  the text classification rather than still blending in speaking rate
+  (a loud, slow utterance was diluting back down to "calm" through the
+  averaged arousal score — the exact dilution problem the original yell
+  threshold was already designed to avoid, just not guarded one tier
+  down).
+
+The pattern across all of these: a threshold picked once, in isolation,
+without live RMS numbers in front of you, is a guess — and this codebase
+had several guesses sitting uncorrected at once even after the *first*
+one got fixed the right way (measure real numbers, then pick a threshold
+with actual margin). Worth checking every threshold that shares a
+"loudness" concept whenever one of them gets recalibrated, not just the
+one that was reported broken.
+
+**Recording introduces performance problems this app can't fully solve
+on its own.** Live feedback: the whole app got noticeably slower the
+moment an external screen recorder started, separate from anything
+already tuned for the base pipeline. Three contributing causes, in the
+order they were found:
+
+- `--record`'s own `cv2.VideoWriter.write()` call was synchronous, sitting
+  directly in the main loop — encoding a large composite frame (webcam +
+  lamp panel + debug text, ~3000x1580px) on every tick, on top of an
+  already CPU-bound pipeline. Moved onto its own thread
+  (`_AsyncVideoWriter` in `main.py`) with a bounded queue that drops the
+  newest frame if the encoder falls behind, rather than blocking the live
+  loop — losing a frame from the *recorded* output is a much smaller
+  problem than the interactive session stalling behind a slow encoder.
+- OpenCV was defaulting to using every logical core (`cv2.getNumThreads()`
+  returned 22 on this 22-core machine) for its own internal parallel ops
+  (resize, color conversion, panel compositing) — unlike
+  `torch.set_num_threads(4)` in `vision_memory.py`, which only throttles
+  YOLO's periodic scan, this runs on *every* frame, making it a far more
+  constant source of thread oversubscription against MediaPipe/Whisper/
+  torch sharing the same cores. Capped to 4 with `cv2.setNumThreads(4)`
+  at import time in `main.py`, same reasoning as torch's own cap, so the
+  process leaves real headroom for whatever else is competing for CPU —
+  a screen recorder doing software encoding, most obviously.
+- Even with both fixed, the composite window itself is large enough that
+  an external recorder capturing it has real, unavoidable encode work to
+  do that lives entirely outside this process — added a live HUD-hide
+  toggle (`h`) that drops the debug/memory text panel (about a third of
+  the composite's total pixels, and one of the costlier things drawn
+  each frame in its own right) specifically for cleaner, cheaper
+  recording, alongside a pause toggle (`p`) for getting a camera/tripod
+  set up without the lamp reacting to the fumbling (attention-seeking at
+  an unlooked-at camera, presence reminders firing because you stepped
+  out of frame, the self-learning engine treating the setup as a real
+  non-interaction) and a mute toggle (`m`, independent of pause) for
+  turning off voice output specifically without freezing tracking or
+  reminders. Pause deliberately keeps the lamp's own idle motion/breathing
+  running rather than freezing it outright — a lamp that visibly goes
+  rigid the instant you hit pause reads as broken on camera, not paused.

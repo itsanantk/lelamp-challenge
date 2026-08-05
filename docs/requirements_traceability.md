@@ -23,7 +23,7 @@ checkable in one pass instead of hunting through the full writeup.
 | Behavior design — expressive and natural reactions | `lamp/motion.py`: anticipation + overshoot easing, randomized per-move so nothing repeats identically. `behavior/state_machine.py`: attention-seeking escalates in intensity across attempts instead of repeating the same gesture. `lamp/sim_backend.py`: synthesized sound cues, randomized per play. |
 | Memory system — accurate store/retrieve | `memory/store.py` (SQLite) + `conversation/agent.py` tool-use: the LLM can only answer from `recall_object_location`/`list_seen_objects` results, so it can't fabricate a location not actually in the store. |
 | Tradeoff reasoning | `docs/ARCHITECTURE.md` §3 — each design decision states the alternative considered and why it lost (e.g. head pose vs. iris tracking, discrete-burst vs. continuous object tracking). |
-| Code quality | `tests/` (146 tests, no camera/mic required), type-hinted function signatures throughout, `lamp/hal.py` as the actuator boundary so `lamp/real_backend.py` is a drop-in swap. |
+| Code quality | `tests/` (263 tests, no camera/mic required), type-hinted function signatures throughout, `lamp/hal.py` as the actuator boundary so `lamp/real_backend.py` is a drop-in swap. |
 
 ## Bonus challenges
 
@@ -45,5 +45,7 @@ See README "Self-initiated reminders" for the full behavior writeup.
 | Recurring reminders ("every 30 minutes") | `behavior/reminders.py` — fixed-interval, ticked from `main.py`'s per-frame loop, persisted to `logs/reminders.json` |
 | Presence reminders ("tell me if I leave") | `behavior/reminders.py` — debounced absence detection (`PRESENCE_ABSENCE_DEBOUNCE_S`) against raw per-frame `face_found` so a standup doesn't multi-fire, re-arms on return |
 | Object-check reminders ("check my water bottle in an hour") | `behavior/reminders.py` watches the object settle (reuses `behavior/object_watch.py`'s stillness thresholds) and points back at it at the deadline; if the request implies judging the object's *state* rather than just its presence, `conversation/agent.py`'s `judge_view()` takes a one-shot vision-LLM look, kept out of the real conversation history on purpose |
+| Prohibition reminders ("don't let me touch my phone") | `behavior/reminders.py`'s `alert_on_detection` mode — a genuinely different mechanism from the disturbance-watch above, not a variant of it: no baseline placement, no settle wait, no vision-LLM judgment, fires directly the instant the object is seen at all while the reminder is active |
 | Time-scoped reminders ("just for the next 20 seconds") | `Reminder.expires_at` — any kind can auto-deactivate after a stated window instead of running until cancelled |
 | Creation/cancellation via conversation | `conversation/agent.py`'s `create_reminder` tool → `chat.py`'s `_apply_reminder_action`, mirroring the existing light-command tool/apply split |
+| Recording-friendly controls | `main.py`'s live `p` (pause reactive loop + voice listening), `m` (mute voice output only), and `h` (hide the debug HUD panel) keys — none asked for by the brief, added specifically to make clean demo recording possible |

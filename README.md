@@ -58,6 +58,17 @@ python main.py --record demo.mp4      # also saves the composite feed to recordi
 python main.py --label                # SPACE toggles ground truth, for eval later
 ```
 
+**Keys** (interactive window, live):
+
+| Key | Does |
+|---|---|
+| `q` | quit |
+| `c` | clear stored memory, reset learned attention-seek timing, cancel all reminders |
+| `p` | pause/resume — freezes the reactive/learning loop *and* wake-word/voice listening, and excludes frames from `--record`'s output, so you can get a camera set up without the lamp reacting to the fumbling. The lamp's own idle motion/breathing keeps running (it stays visually alive, just stops noticing anything new), and an already-open conversation is left to finish rather than cut off mid-reply |
+| `m` | mute/unmute — silences wake-word listening and every spoken reply (conversation *and* reminder announcements), independent of `p`. Tracking/reminders/everything else keeps running; use this instead of `p` if the lamp should keep noticing you on camera but just not talk |
+| `h` | show/hide the debug HUD panel — cuts the composite window's pixel count by about a third and skips its (relatively costly) redraw; useful while screen-recording, since an external recorder's own cost is driven by what's actually on screen, not anything this process can throttle in itself |
+| `SPACE` | (with `--label`) toggle "I am currently looking at the lamp" ground truth |
+
 `--chat` runs the conversational agent (`chat.py`) on a background thread
 against the same lamp and window the live loop is already rendering —
 one process, one lamp, everything (engagement, object tracking, voice
@@ -162,6 +173,18 @@ expect a stutter in the first ~15s specifically — that's Whisper loading
 on the conversation thread, competing for CPU with MediaPipe/YOLO on the
 main one; it clears once the "[voice] ready" line prints.
 
+**If it specifically gets slower the moment you start screen-recording**,
+that's a separate issue from the above — OpenCV was defaulting to using
+every logical core for its own per-frame work (resize, color conversion,
+compositing), which left no real headroom for whatever's capturing the
+screen. `main.py` now caps this to 4 threads at startup
+(`cv2.setNumThreads(4)`), same reasoning as `vision_memory.py`'s existing
+`torch.set_num_threads(4)`. If it's still slow with that in place, check
+whether your recorder is using software (CPU) encoding rather than a
+hardware encoder — that's the one remaining variable outside this app's
+control. The `h` key (hide the debug HUD panel) also directly cuts what
+the recorder has to capture and encode, independent of anything CPU-side.
+
 ### Bonus behavior
 
 All four bonus items from the challenge doc are built and on by default;
@@ -171,8 +194,11 @@ scope of each — what they actually do versus a "real" version.
 
 - **Interruption awareness** — a background mic-RMS gate
   (`perception/audio_monitor.py`) holds off attention-seeking while the
-  room's making noise (you talking, TV on). `python main.py --no-audio-gate`
-  turns it off.
+  room's making noise (you talking, TV on). "Busy" stays true for
+  `AUDIO_GATE_SUSTAIN_S` (3.0s) after the last loud block, not just the
+  instant, so a normal mid-sentence pause doesn't read as the room going
+  quiet and re-arm attention-seeking a beat too early. `python main.py
+  --no-audio-gate` turns it off.
 - **Multi-user speaker detection** — on by default with `--chat --voice`,
   tracks up to 4 faces and picks whoever's mouth was actually moving
   during the question, so it glances at and points toward the right
@@ -182,11 +208,19 @@ scope of each — what they actually do versus a "real" version.
 - **Emotion from voice tone** — every voice turn gets a coarse read
   (yelling/energetic/tense/quiet/calm) from loudness, pitch variability,
   and speaking rate (`conversation/emotion.py`), and the lamp flashes a
-  matching color before it answers. A genuine yell gets a physical
-  reaction too — a startled flinch + sound, fired live off raw mic
-  loudness the instant it crosses the threshold, not after the sentence
-  finishes recording and gets classified. A quiet/subdued tone gets a
-  soft whine + droop. Printed in the terminal too (`[voice] tone: ...`).
+  matching color before it answers. Loud enough (`config.
+  VOICE_FLINCH_RMS_THRESHOLD`) gets a physical reaction too — a startled
+  flinch (jerk-back + a sharp "startled" sound) followed by the same
+  curious chirp used elsewhere for noticing something, fired live off raw
+  mic loudness the instant it crosses the threshold, not after the
+  sentence finishes recording and gets classified — and above that same
+  loudness floor, the text classification itself skips straight to
+  "tense" rather than still weighing speaking rate, so a loud, slow, or
+  drawn-out raised voice doesn't get diluted back down to "calm" by an
+  averaged score. An actual yell (a separate, much higher threshold,
+  `config.VOICE_YELL_RMS_THRESHOLD`) gets its own "yelling" label. A
+  quiet/subdued tone gets a soft whine + droop. Printed in the terminal
+  too (`[voice] tone: ...`).
 - **Self-learning attention-seeking** — `behavior/adaptation.py` tracks
   whether attention-seeking attempts actually get a response and nudges
   the delay/cooldown/max-tries within fixed bounds accordingly, persisted
@@ -247,17 +281,36 @@ created via conversation). Three kinds:
   directly, no LLM round trip needed.
 
   A `check_question` also means a disturbance is itself worth checking on,
-  not just the deadline -- "make sure I don't go on my phone for five
-  minutes" catches you picking it up at second 10 instead of staying
-  silent for the full window. Once placement is confirmed, the same
-  detections keep being watched for a sustained move away from the
-  confirmed spot, or a sustained disappearance (debounced against a single
-  bad detection the same way presence debounces a flickered face); either
-  one dispatches the existing `check_question` early through the exact
-  same path a real deadline would -- "is this still where it was left"
-  reads correctly whether it's asked because time ran out or because
-  something just moved. No `check_question` means there's nothing to
-  judge early, so those still just wait for the deadline.
+  not just the deadline -- "make sure I drink all my water in the next
+  hour" catches you finishing it early instead of staying silent for the
+  full window. Once placement is confirmed, the same detections keep
+  being watched for a sustained move away from the confirmed spot, or a
+  sustained disappearance (debounced against a single bad detection the
+  same way presence debounces a flickered face); either one dispatches
+  the existing `check_question` early through the exact same path a real
+  deadline would -- "is this still where it was left" reads correctly
+  whether it's asked because time ran out or because something just
+  moved. No `check_question` means there's nothing to judge early, so
+  those still just wait for the deadline.
+
+- **Object check, prohibition mode** ("make sure I don't go on my phone
+  for five minutes," "don't let me touch my phone while I'm working") --
+  a genuinely different mechanism from the disturbance-watch above, not
+  a variant of it, set via `alert_on_detection` instead of
+  `check_question`. A disturbance watch has a known baseline (the bottle
+  sitting there) and reports a *change* from it; a prohibition has no
+  baseline at all -- the object simply being detected is itself the
+  violation, so there's no placement to confirm, no settle wait, no
+  disturbance debounce, and no vision-LLM judgment call to make (YOLO's
+  own detection already answers the only question there is). Fires
+  directly the instant the object shows up in a scan while the reminder
+  is active, one-shot, using `_fire()`'s own point-and-speak the same
+  way a plain deadline-only object check does. This exists because the
+  disturbance-watch model genuinely doesn't work for this case: something
+  you're actively handling jitters in bearing between sightings just from
+  being picked up, so the settle-wait's stability requirement could go
+  unmet indefinitely and the watch would silently never activate --
+  reported live as "the reminder just doesn't do anything."
 
 Any kind can also be scoped to a limited window -- "only check for the
 next 20 seconds," "just for the next hour" -- after which it deactivates
@@ -291,7 +344,12 @@ else in its context otherwise tells it what time it currently is.
 backup, but it has no audio. For the real submission I used Win+G to
 screen-record instead, since that picks up the sound cues — `main.py
 --chat --voice` runs all four steps in one continuous take now, no cut
-between windows.
+between windows. Use `p` to pause while getting the camera/tripod
+positioned (idle motion keeps running so the lamp doesn't look frozen on
+camera, but it stops reacting to the setup itself), `h` to hide the debug
+HUD panel for a cleaner frame and a lighter capture load, and `m` if you
+want it to keep tracking/reacting visually without talking during a
+specific segment.
 
 ## Evaluation
 
@@ -319,9 +377,15 @@ person shows up mid-watch. `tests/test_viz.py` — display-only mirroring.
 mic-hardware pieces are live-verified instead, same as
 `perception/audio_monitor.py` — see the architecture doc).
 `tests/test_emotion.py` — tone classification thresholds and the
-peak-RMS measurement fix. `tests/test_reminders.py` — recurring/presence
-firing and edge-detection logic, cancellation, and the save/load
-round-trip.
+peak-RMS measurement fix. `tests/test_reminders.py` — recurring/presence/
+object-check firing and edge-detection logic (including `alert_on_detection`),
+cancellation, and the save/load round-trip.
+
+That's a handful of highlights, not the full list -- there are 263 tests
+across 18 files, one per module (`tests/test_agent.py`,
+`tests/test_hand_wave.py`, `tests/test_ambient_light.py`,
+`tests/test_scene_change.py`, `tests/test_chat_light.py`, and so on --
+see Layout below for the complete module list each one covers).
 
 ## Layout
 
@@ -330,38 +394,40 @@ config.py                 tuning constants + paths
 main.py                   camera -> engagement -> FSM -> lamp -> recording
 chat.py                   conversational recall -- standalone, or embedded via main.py --chat
 viz.py                    HUD overlay + display-only mirroring
+audio_output.py           shared lock around sd.play() so chirps and TTS never talk over each other
+conftest.py               puts the project root on sys.path for pytest
 
 perception/engagement.py       MediaPipe head pose -> hysteresis
 perception/vision_memory.py    interval-triggered YOLO scanning
+perception/scene_change.py     frame-diff gate -- skips a YOLO scan when the scene hasn't visibly changed
 perception/audio_monitor.py    mic-RMS gate for interruption awareness (bonus)
 perception/multi_face.py       tracks faces, picks the active speaker (bonus)
+perception/hand_wave.py        MediaPipe hand landmarker -- wave detection while ENGAGED
+perception/ambient_light.py    samples frame luminance, nudges the lamp's own brightness
 
 lamp/hal.py                abstract actuator interface
 lamp/kinematics.py         6-DOF forward kinematics
 lamp/motion.py             anticipation + overshoot easing
+lamp/color.py              two-dial (warmth, brightness) color model
 lamp/sim_backend.py        render + synthesized-chirp sound implementation
 lamp/real_backend.py       stub for real servo/LED/speaker hardware
 
 behavior/state_machine.py  IDLE / ENGAGED / DISENGAGED / ATTENTION_SEEKING
 behavior/object_watch.py   continuously tracks a tracked object (phone) while visible
+behavior/idle_scan.py      sweeps gaze across waypoints when nothing else has the lamp's attention
 behavior/adaptation.py     bounded self-learning of attention-seek timing (bonus)
-behavior/reminders.py      self-initiated timed/recurring/presence checks, created via conversation
+behavior/reminders.py      self-initiated timed/recurring/presence/object-check checks, created via conversation
 
 memory/store.py            SQLite scene memory
 conversation/agent.py      Claude/OpenAI tool-use agent over the memory store
-conversation/voice.py      wake-word gated mic input (Whisper) + TTS output
+conversation/voice.py      wake-word gated mic input (Whisper) + TTS output (Piper, SAPI5 fallback)
 conversation/emotion.py    heuristic voice-tone read from raw audio (bonus)
 
 eval/engagement_eval.py    precision/recall/F1/flicker-rate
 eval/latency_eval.py       per-stage latency percentiles
 
-tests/test_state_machine.py
-tests/test_adaptation.py
-tests/test_object_watch.py
-tests/test_viz.py
-tests/test_voice.py
-tests/test_emotion.py
-tests/test_reminders.py
+tests/                     263 tests total, no camera/mic required -- one file per module above,
+                            e.g. tests/test_reminders.py, tests/test_agent.py, tests/test_hand_wave.py
 docs/ARCHITECTURE.md       full writeup
 docs/requirements_traceability.md   challenge brief -> where it's addressed
 ```
