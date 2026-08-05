@@ -71,6 +71,76 @@ def test_is_listening_reflects_the_speech_active_event():
     assert not voice.is_listening()
 
 
+@pytest.fixture(autouse=True)
+def _unmute_after(request):
+    # set_muted is process-global state (see its own docstring on why --
+    # every speak() caller needs to see it without being threaded a
+    # param), which means a test that mutes and forgets to clean up would
+    # silently break every later test in the whole suite that touches
+    # voice.speak(), not just this file. Runs for every test in this
+    # module regardless of whether it touches mute, same safety-net shape
+    # as _no_real_wake_whisper above.
+    yield
+    voice.set_muted(False)
+
+
+def test_set_muted_toggles_is_muted():
+    assert not voice.is_muted()
+    voice.set_muted(True)
+    assert voice.is_muted()
+    voice.set_muted(False)
+    assert not voice.is_muted()
+
+
+def test_speak_does_nothing_while_muted(monkeypatch):
+    calls = []
+    monkeypatch.setattr(voice, "_load_piper", lambda: object())
+    monkeypatch.setattr(voice, "_speak_piper", lambda v, t: calls.append(t))
+    voice.set_muted(True)
+
+    voice.speak("hello there")
+
+    assert calls == []
+
+
+def test_speak_works_normally_once_unmuted(monkeypatch):
+    calls = []
+    monkeypatch.setattr(voice, "_load_piper", lambda: object())
+    monkeypatch.setattr(voice, "_speak_piper", lambda v, t: calls.append(t))
+    voice.set_muted(True)
+    voice.set_muted(False)
+
+    voice.speak("hello there")
+
+    assert calls == ["hello there"]
+
+
+def test_speak_piper_applies_the_configured_length_scale(monkeypatch):
+    # _speak_piper needs real Piper model files to test end-to-end (see
+    # module docstring) -- this only checks that it actually asks for
+    # config.PIPER_LENGTH_SCALE rather than silently using Piper's own
+    # default (1.0), which was the whole point of adding the setting.
+    captured = {}
+
+    class _FakeChunk:
+        sample_rate = 22050
+        audio_float_array = np.zeros(4, dtype=np.float32)
+
+    class _FakeVoice:
+        def synthesize(self, text, syn_config=None):
+            captured["text"] = text
+            captured["length_scale"] = syn_config.length_scale
+            return [_FakeChunk()]
+
+    monkeypatch.setattr(voice.audio_output, "play_and_wait", lambda audio, sr: captured.update(played_sr=sr))
+
+    voice._speak_piper(_FakeVoice(), "hello there")
+
+    assert captured["text"] == "hello there"
+    assert captured["length_scale"] == voice.config.PIPER_LENGTH_SCALE
+    assert captured["played_sr"] == 22050
+
+
 def test_transcribe_of_empty_audio_short_circuits_without_loading_whisper():
     # If this touched preload()/whisper it'd either hang downloading a
     # model or throw in a clean test env -- the empty-audio guard must

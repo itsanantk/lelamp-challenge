@@ -39,9 +39,9 @@ Three kinds:
     _resolve_object_check_judgment.
 
     A check_question also means something got disturbed is itself worth
-    checking on, not just the deadline -- "make sure I don't go on my
-    phone for five minutes" should catch you picking it up at second 10,
-    not stay silent until the full window elapses. Once placement is
+    checking on, not just the deadline -- "make sure I drink all my
+    water in the next hour" should catch you finishing it early, not
+    stay silent until the full window elapses. Once placement is
     confirmed, tick() keeps watching the object via the same detections
     (see _check_for_disturbance); a sustained move away from the
     confirmed bearing, or a sustained disappearance, dispatches the
@@ -52,6 +52,21 @@ Three kinds:
     to make early ("check on my keys in an hour" doesn't imply "and
     yell if I touch them earlier") -- those just wait for due_at like
     before.
+
+    A third flavor, alert_on_detection, is for prohibitions rather than
+    disturbance watches -- "make sure I don't go on my phone for five
+    minutes." The distinction that matters: a disturbance watch has a
+    known-good baseline state (the bottle sitting there) and reports a
+    *change* from it; a prohibition has no baseline at all -- the object
+    simply being detected, full stop, is the thing being reported, and
+    there's nothing to visually judge about it (no vision-LLM call, no
+    judge_view() round trip -- YOLO's own detection already answers the
+    only question there is). tick() checks alert_on_detection before
+    anything else in the object_check branch and fires directly (see
+    _fire) the instant the object shows up in a scan, one-shot, no
+    placement step, no settle wait, no debounce -- see that field's own
+    comment for why disturbance-watch's usual protections don't apply
+    (and aren't needed) here.
 """
 from __future__ import annotations
 
@@ -138,6 +153,15 @@ class Reminder:
                                            # deadline. None means "just confirm it's there,"
                                            # handled directly (see _fire) without needing chat.py's
                                            # LLM access at all.
+    alert_on_detection: bool = False     # object_check only -- a prohibition ("don't touch your
+                                           # phone"), not a disturbance watch. The object simply
+                                           # being detected IS the violation -- no baseline
+                                           # position, no placement-settle, no judge_view() vision-
+                                           # LLM call, none of that applies here. tick() checks this
+                                           # before anything else in the object_check branch and
+                                           # fires directly (see _fire) the instant object_class
+                                           # shows up in a scan while active. Takes priority over
+                                           # check_question if a caller somehow sets both.
     due_for_check: bool = False          # object_check only -- deadline hit AND check_question is
                                            # set, so firing needs a vision-LLM call this module
                                            # can't make itself (no LLM/API-key access here -- see
@@ -224,13 +248,14 @@ class ReminderEngine:
 
     def add(self, kind: str, message: str, interval_s: float | None = None,
             duration_s: float | None = None, object_class: str | None = None,
-            due_in_s: float | None = None, check_question: str | None = None) -> Reminder:
+            due_in_s: float | None = None, check_question: str | None = None,
+            alert_on_detection: bool = False) -> Reminder:
         created_at = time.time()
         expires_at = created_at + duration_s if duration_s is not None else None
         due_at = created_at + due_in_s if due_in_s is not None else None
         r = Reminder(id=self._next_id, kind=kind, message=message, created_at=created_at,
                       interval_s=interval_s, expires_at=expires_at, object_class=object_class,
-                      due_at=due_at, check_question=check_question)
+                      due_at=due_at, check_question=check_question, alert_on_detection=alert_on_detection)
         self._next_id += 1
         self.reminders.append(r)
         self.save()
@@ -267,31 +292,38 @@ class ReminderEngine:
 
     def watched_classes(self) -> list[str]:
         """Object classes at least one active object_check reminder is
-        currently disturbance-watching (placement confirmed, a
-        check_question set, deadline not yet dispatched -- see
-        _check_for_disturbance). main.py folds these into
-        vision_memory.fast_mode alongside ObjectWatcher.should_scan_fast()
-        so the scan cadence stays fast for the whole watch window, not
-        just while the object happens to still be actively moving.
+        currently watching closely -- either disturbance-watching
+        (placement confirmed, a check_question set, deadline not yet
+        dispatched -- see _check_for_disturbance) or prohibition-watching
+        (alert_on_detection -- see that field's own comment). main.py
+        folds these into vision_memory.fast_mode alongside
+        ObjectWatcher.should_scan_fast() so the scan cadence stays fast for
+        the whole watch window, not just while the object happens to still
+        be actively moving.
 
         Real bug this fixes, reported live: "make sure I don't go on my
         phone" felt slow to notice a pickup. Root cause was cadence, not
         the disturbance debounce itself -- ObjectWatcher's own fast-scan
         trigger (should_scan_fast) drops back to the slow interval once an
-        object's been stationary for WATCH_FAST_SCAN_SETTLE_S (1.5s), and
-        placement confirmation itself requires WATCH_STATIONARY_TIMEOUT_S
-        (3.0s) of stillness -- so by the time disturbance-watching even
-        starts, fast-scan has always already lapsed. The very first catch
-        of an actual pickup then had to wait for the next slow-cadence
-        scan (up to YOLO_SCAN_INTERVAL_S, worse if scene-change gating
-        skipped a few), *before* the disturbance debounce even started
-        counting. This keeps the scan itself fast the whole time a
-        disturbance-relevant watch is active, so that lag doesn't stack on
-        top of the debounce."""
+        object's been stationary for WATCH_FAST_SCAN_SETTLE_S (1.5s), so by
+        the time disturbance-watching started, fast-scan had often already
+        lapsed. The very first catch of an actual pickup then had to wait
+        for the next slow-cadence scan (up to YOLO_SCAN_INTERVAL_S, worse
+        if scene-change gating skipped a few), *before* the disturbance
+        debounce even started counting. This keeps the scan itself fast the
+        whole time a disturbance-relevant watch is active, so that lag
+        doesn't stack on top of the debounce. (Placement confirmation
+        itself no longer adds its own delay on top for this case --
+        check_question reminders confirm on first sighting, see
+        _update_placement -- but the scan cadence still needs to be fast
+        for the debounce that follows to actually catch anything quickly.)
+        alert_on_detection reminders need this even more directly -- there's
+        no debounce to protect there at all, so a slow-cadence scan is the
+        *entire* delay between a pickup and the lamp noticing it."""
         return list({r.object_class for r in self.reminders
-                     if r.active and r.kind == "object_check" and r.placement_confirmed
-                     and r.check_question is not None and not r._check_dispatched
-                     and r.object_class is not None})
+                     if r.active and r.kind == "object_check" and not r._check_dispatched
+                     and r.object_class is not None
+                     and (r.alert_on_detection or (r.placement_confirmed and r.check_question is not None))})
 
     def active_summaries(self, now: float | None = None) -> list[str]:
         """One short line per active reminder, for main.py's HUD panel --
@@ -311,7 +343,14 @@ class ReminderEngine:
             if r.kind == "recurring":
                 line = f"#{r.id} every {r.interval_s / 60:.0f}min: {label}"
             elif r.kind == "object_check":
-                if r.due_for_check:
+                if r.alert_on_detection:
+                    if r.due_at is not None and now is not None:
+                        remaining = r.due_at - now
+                        status = f"alert on sight, {_fmt_duration(max(0.0, remaining))} left" if remaining >= 0 \
+                            else "alert on sight"
+                    else:
+                        status = "alert on sight"
+                elif r.due_for_check:
                     status = "checking now"
                 elif r.due_at is not None and now is not None:
                     remaining = r.due_at - now
@@ -336,23 +375,53 @@ class ReminderEngine:
 
     def _update_placement(self, r: Reminder, now: float, vision_memory) -> None:
         """object_check only -- has r.object_class's detected position
-        stayed put long enough to count as "set down." Deliberately reuses
-        ObjectWatcher's own stillness thresholds (config.WATCH_REAIM_DEG,
-        config.WATCH_STATIONARY_TIMEOUT_S) for a consistent feel, but not
-        its state -- see the module docstring on why. vision_memory is
-        None in a session with no camera loop (or --no-memory), in which
-        case placement can never be confirmed; this just no-ops rather
-        than crashing."""
+        stayed put long enough to count as "set down." Reuses
+        ObjectWatcher's own re-aim threshold (config.WATCH_REAIM_DEG) for
+        a consistent feel on what counts as "actually moved," but NOT its
+        stationary-timeout (config.WATCH_STATIONARY_TIMEOUT_S) -- that
+        constant answers a different question (when ObjectWatcher should
+        stop staring at something that's done moving) than this one does
+        (how long before this reminder trusts a position as a stable
+        baseline). config.REMINDER_PLACEMENT_SETTLE_S is its own,
+        deliberately shorter constant -- see its own comment. vision_memory
+        is None in a session with no camera loop (or --no-memory), in
+        which case placement can never be confirmed; this just no-ops
+        rather than crashing.
+
+        A check_question reminder skips the settle wait entirely and
+        confirms on the very first sighting. This is the third time a
+        "requires REMINDER_PLACEMENT_SETTLE_S/WATCH_STATIONARY_TIMEOUT_S
+        of stillness first" gate has turned out to be the wrong
+        precondition for an object that's actively being handled rather
+        than set down and left alone (see the due_at/placement decoupling
+        and the REMINDER_PLACEMENT_SETTLE_S split above it in tick()/this
+        module's history) -- a check_question specifically means "tell me
+        if this gets disturbed," and something worth watching for
+        disturbance is exactly the kind of object whose bearing jitters
+        past WATCH_REAIM_DEG between any two sightings just from being
+        held, never mind picked up and put back. Waiting for stability
+        before starting to watch meant disturbance-watching could go
+        unreachable for precisely the reminders that most needed it live,
+        reported as "detects my phone for like a few frames" and then
+        nothing happens. Trusting the first sighting is safe here because
+        _check_for_disturbance's own WATCH_LOST_GRACE_S debounce is
+        already the thing guarding against one noisy reading -- this gate
+        was doing that job a second, redundant, and for this case
+        unreachable way."""
         if vision_memory is None:
             return
         detections = vision_memory.last_detections or []
         match = next((d for d in detections if d.object_class == r.object_class), None)
         if match is None:
             return  # not currently visible this tick -- nothing new to learn, keep waiting
+        if r.check_question is not None:
+            r.tracked_bearing = match.bearing_deg
+            r.placement_confirmed = True
+            return
         if r.tracked_bearing is None or abs(match.bearing_deg - r.tracked_bearing) > config.WATCH_REAIM_DEG:
             r.tracked_bearing = match.bearing_deg  # first sighting, or a real move -- reset the settle clock
             r._settled_since = now
-        elif r._settled_since is not None and now - r._settled_since >= config.WATCH_STATIONARY_TIMEOUT_S:
+        elif r._settled_since is not None and now - r._settled_since >= config.REMINDER_PLACEMENT_SETTLE_S:
             r.placement_confirmed = True
 
     def _check_for_disturbance(self, r: Reminder, now: float, vision_memory) -> bool:
@@ -425,6 +494,26 @@ class ReminderEngine:
                             _fire(r, lamp)
                             fired_any = True
                             r.last_fired_at = now
+            elif r.kind == "object_check" and r.alert_on_detection:
+                # Prohibition mode -- see the field's own comment. No
+                # placement, no settle wait, no debounce, no judge_view()
+                # round trip: object_class showing up in this tick's
+                # detections at all is itself the thing being reported, so
+                # fire on the very first sighting, using whatever bearing
+                # this scan gives -- no need to track it across ticks first.
+                detections = (vision_memory.last_detections or []) if vision_memory is not None else []
+                match = next((d for d in detections if d.object_class == r.object_class), None)
+                if match is not None:
+                    r.tracked_bearing = match.bearing_deg
+                    _fire(r, lamp)
+                    r.active = False  # one-shot -- caught once, reported, done
+                    fired_any = True
+                elif r.due_at is not None and now >= r.due_at:
+                    # Watch window elapsed and it was never seen -- quietly
+                    # done, same as a presence reminder that never saw a
+                    # departure. Nothing to report, so nothing is said.
+                    r.active = False
+                    expired_any = True
             elif r.kind == "object_check":
                 if not r.placement_confirmed:
                     self._update_placement(r, now, vision_memory)
@@ -432,7 +521,7 @@ class ReminderEngine:
                         fired_any = True  # not a fire, but placement_confirmed/tracked_bearing changed -- persist it
                 # Deliberately NOT an elif against the placement branch above.
                 # Placement confirmation requires the object to sit still for
-                # WATCH_STATIONARY_TIMEOUT_S -- fine for a bottle set down and
+                # REMINDER_PLACEMENT_SETTLE_S -- fine for a bottle set down and
                 # left alone, but an object being actively used (a book being
                 # read, page turns and hand adjustments) can keep resetting
                 # that settle timer and may never confirm at all. Gating the

@@ -150,6 +150,27 @@ def is_speaking() -> bool:
     return _speak_lock.locked()
 
 
+_muted = threading.Event()
+
+
+def set_muted(muted: bool) -> None:
+    """main.py's 'm' toggle -- module-level, not threaded through as a
+    param, so every caller of speak() (chat.py's replies, behavior/
+    reminders.py's _fire() announcements, both funnel through this one
+    function) is silenced uniformly without needing to know mute exists.
+    chat.py's own wake-word loop also checks is_muted() directly (see its
+    _voice_suspended helper) to stop opening the mic in the first place,
+    not just to swallow the reply after the fact."""
+    if muted:
+        _muted.set()
+    else:
+        _muted.clear()
+
+
+def is_muted() -> bool:
+    return _muted.is_set()
+
+
 def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
                           silence_s: float = config.VOICE_SILENCE_TIMEOUT_S,
                           no_speech_timeout_s: float = config.VOICE_NO_SPEECH_TIMEOUT_S,
@@ -189,16 +210,18 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
 
     on_loud, if given, fires at most once per call, synchronously from the
     audio callback, the instant a single block's RMS crosses
-    config.VOICE_YELL_RMS_THRESHOLD -- deliberately not routed through
+    config.VOICE_FLINCH_RMS_THRESHOLD -- deliberately not routed through
     emotion.analyze()/transcribe(), which only run on the full clip after
-    recording stops. A startled flinch needs to land while the yell is
-    still happening, not a second-plus later once the whole utterance has
-    been transcribed and classified; this is intentionally a dumb,
-    immediate loudness trip-wire, not a tone judgment. Safe to call
-    lamp.play_sound()/set_target_pose() from it directly -- both just
-    enqueue/update state without blocking (see sim_backend.py's
-    _SoundWorker and Trajectory), so this doesn't need to hop off the
-    audio callback thread first."""
+    recording stops. A startled flinch needs to land while the loud tone
+    is still happening, not a second-plus later once the whole utterance
+    has been transcribed and classified; this is intentionally a dumb,
+    immediate loudness trip-wire, not a tone judgment -- deliberately a
+    lower/separate bar than config.VOICE_YELL_RMS_THRESHOLD's "yelling"
+    text label, see that constant's own comment for why they used to be
+    the same number and aren't anymore. Safe to call lamp.play_sound()/
+    set_target_pose() from it directly -- both just enqueue/update state
+    without blocking (see sim_backend.py's _SoundWorker and Trajectory),
+    so this doesn't need to hop off the audio callback thread first."""
     threshold = config.VOICE_GATE_RMS_THRESHOLD
     chunks: list[np.ndarray] = []
     lock = threading.Lock()
@@ -211,7 +234,7 @@ def record_until_silence(max_s: float = config.VOICE_MAX_RECORD_S,
             chunks.append(indata.copy())
         rms = _rms(indata)
         now = time.monotonic()
-        if on_loud is not None and not state["loud_fired"] and rms >= config.VOICE_YELL_RMS_THRESHOLD:
+        if on_loud is not None and not state["loud_fired"] and rms >= config.VOICE_FLINCH_RMS_THRESHOLD:
             state["loud_fired"] = True
             on_loud(rms)
         if rms > threshold:
@@ -455,6 +478,9 @@ def speak(text: str) -> None:
     garbled audio instead of one waiting for the other."""
     if not text:
         return
+    if is_muted():
+        print(f"[voice] muted -- not speaking: {text}")
+        return
     with _speak_lock:
         voice = _load_piper()
         if voice is not None:
@@ -464,7 +490,9 @@ def speak(text: str) -> None:
 
 
 def _speak_piper(voice, text: str) -> None:
-    chunks = list(voice.synthesize(text))
+    from piper.config import SynthesisConfig
+    syn_config = SynthesisConfig(length_scale=config.PIPER_LENGTH_SCALE)
+    chunks = list(voice.synthesize(text, syn_config=syn_config))
     if not chunks:
         return
     sr = chunks[0].sample_rate

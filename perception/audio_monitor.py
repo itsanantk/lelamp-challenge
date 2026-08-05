@@ -24,8 +24,8 @@ import config
 
 
 class AudioActivityMonitor:
-    def __init__(self, sustain_s: float = 0.6, threshold: float | None = None):
-        self._sustain_s = sustain_s
+    def __init__(self, sustain_s: float | None = None, threshold: float | None = None):
+        self._sustain_s = sustain_s if sustain_s is not None else config.AUDIO_GATE_SUSTAIN_S
         self._threshold = threshold if threshold is not None else config.AUDIO_GATE_RMS_THRESHOLD
         self._active_until = 0.0
         self._lock = threading.Lock()

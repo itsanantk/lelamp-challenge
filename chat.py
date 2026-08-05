@@ -191,11 +191,14 @@ def _apply_reminder_action(reminder_action: dict, reminder_engine) -> None:
                                  duration_s=reminder_action.get("duration_s"),
                                  object_class=reminder_action.get("object_class"),
                                  due_in_s=reminder_action.get("due_in_s"),
-                                 check_question=reminder_action.get("check_question"))
+                                 check_question=reminder_action.get("check_question"),
+                                 alert_on_detection=reminder_action.get("alert_on_detection", False))
         detail = f" every {r.interval_s / 60:.0f} min" if r.interval_s else ""
         if r.kind == "object_check":
             detail = f" watching for {r.object_class}, due in {(r.due_at - time.time()) / 60:.0f} min"
-            if r.check_question:
+            if r.alert_on_detection:
+                detail += " (alert on sight)"
+            elif r.check_question:
                 detail += f" ({r.check_question!r})"
         expiry = f", expires in {r.expires_at - time.time():.0f}s" if r.expires_at else ""
         print(f"[chat] reminder #{r.id} set ({r.kind}{detail}{expiry}): {r.message}")
@@ -367,14 +370,24 @@ _TONE_GESTURES = {"quiet": _droop}
 def _on_loud_during_listen(lamp: SimulatedLamp, rms: float) -> None:
     """Wired as voice.record_until_silence's on_loud -- fires from the
     audio callback thread the instant a single block crosses
-    config.VOICE_YELL_RMS_THRESHOLD, well before the utterance finishes
+    config.VOICE_FLINCH_RMS_THRESHOLD, well before the utterance finishes
     recording, gets transcribed, or gets tone-classified. Deliberately
     skips _wait_out_attention_seek (unlike every other reactive gesture
     here): a startle is involuntary -- it shouldn't politely wait for the
-    current gesture to finish the way a considered reaction does."""
+    current gesture to finish the way a considered reaction does.
+
+    Two sounds, not one: "startled" (see its own comment in sim_backend.py
+    -- sharp/dissonant on purpose, deliberately NOT a chirp) plays first
+    for the flinch itself, then "attention_seek" (the actual curious "hm?"
+    chirp used elsewhere for noticing something) right after -- reads as
+    startle, then alert/questioning, rather than one ambiguous blip. Both
+    just enqueue onto the same sound worker (see lamp.play_sound/
+    _SoundWorker), so this is still non-blocking and safe to call directly
+    from the audio callback thread."""
     print(f"[voice] loud sound detected (rms={rms:.4f}) -- flinching")
     _jerk_back(lamp)
     lamp.play_sound("startled")
+    lamp.play_sound("attention_seek")
 
 
 def _flash_tone(lamp: SimulatedLamp, label: str, show_gui: bool, seconds: float = 0.6,
@@ -536,7 +549,7 @@ def _listen(speaker_detector: SpeakerDetector | None, max_s: float | None = None
 
 def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: MemoryStore | None = None,
         fsm=None, vision_memory=None, shutdown_event: threading.Event | None = None,
-        reminder_engine=None) -> None:
+        reminder_engine=None, paused_event: threading.Event | None = None) -> None:
     """lamp/store/fsm/vision_memory are supplied by main.py when this runs
     embedded on a background thread (--chat) instead of as its own
     process -- see the module docstring. Left as None, this owns and
@@ -544,6 +557,11 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
     this; vision_memory has no standalone equivalent (there's no live
     camera loop to ask), so recall always falls back to the remembered
     bearing in that mode, same as it always has.
+
+    paused_event mirrors main.py's own 'p' pause toggle -- standalone
+    chat.py never sets it (nothing to pause it in service of), so this
+    degrades to always-None/never-paused there, same as reminder_engine's
+    own standalone fallback above.
 
     reminder_engine has no standalone equivalent either, for the same
     reason -- presence/recurring reminders need main.py's own per-frame
@@ -724,11 +742,32 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
         return last_engaged_seen_t is not None and \
             time.monotonic() - last_engaged_seen_t < _ENGAGED_WAKE_GRACE_S
 
+    def _voice_suspended() -> bool:
+        """True if main.py's pause ('p') or mute ('m') should stop new
+        voice interaction from starting. Two different reasons (don't
+        react to camera-setup fumbling vs. just don't want it talking)
+        that happen to need the identical mechanism here -- neither
+        should open the mic for a fresh wake-word listen, and both need
+        to be re-checked live during an open follow-up window, not just
+        once up front (see keep_waiting's own comment below)."""
+        return (paused_event is not None and paused_event.is_set()) or voice.is_muted()
+
     try:
         in_conversation = False  # True while listening for a follow-up without needing the wake word again
         while True:
             if shutdown_event is not None and shutdown_event.is_set():
                 break
+            if _voice_suspended() and not in_conversation:
+                # Don't even open the mic for wake-word scanning while
+                # paused/muted -- ambient noise or an accidental "hey
+                # lamp" during camera setup (or just not wanting it to
+                # talk) shouldn't be able to kick off a conversation.
+                # `not in_conversation` matters: an already
+                # in-flight follow-up exchange is left to finish rather
+                # than getting cut off mid-reply just because pause landed
+                # a beat too early.
+                time.sleep(0.2)
+                continue
             speaker_bearing = None
             tone_label = None
             if args.voice:
@@ -785,19 +824,37 @@ def run(args: argparse.Namespace, lamp: SimulatedLamp | None = None, store: Memo
                         no_speech_timeout_s=config.CONVERSATION_FOLLOWUP_TIMEOUT_S,
                         shutdown_event=shutdown_event,
                         on_loud=lambda rms: _on_loud_during_listen(lamp, rms),
-                        # Only for the "you're engaged, go ahead and talk"
-                        # invitation (in_conversation False here) -- a real
-                        # in-conversation follow-up deliberately omits this,
-                        # since losing eye contact briefly while thinking of
-                        # a reply is expected, not a sign of walking away.
-                        # Real bug this fixes: this call can block up to
-                        # CONVERSATION_FOLLOWUP_TIMEOUT_S (~60s) with
-                        # nothing re-checking engagement the whole time --
-                        # someone engaged when the call started could go
-                        # fully idle and still be heard with no wake word,
-                        # because the decision was made once, up front, and
-                        # never revisited during the wait.
-                        keep_waiting=None if in_conversation else _check_engaged)
+                        # _check_engaged is only for the "you're engaged, go
+                        # ahead and talk" invitation (in_conversation False
+                        # here) -- a real in-conversation follow-up
+                        # deliberately omits it, since losing eye contact
+                        # briefly while thinking of a reply is expected, not
+                        # a sign of walking away. Real bug this fixes: this
+                        # call can block up to CONVERSATION_FOLLOWUP_TIMEOUT_S
+                        # (~60s) with nothing re-checking engagement the
+                        # whole time -- someone engaged when the call
+                        # started could go fully idle and still be heard
+                        # with no wake word, because the decision was made
+                        # once, up front, and never revisited during the
+                        # wait.
+                        #
+                        # _voice_suspended is checked in *both* branches,
+                        # unlike _check_engaged -- the top-of-loop
+                        # pause/mute skip only ever fires when not
+                        # in_conversation, so once a conversation was open
+                        # even once, in_conversation stayed True and
+                        # pause/mute silently did nothing until this exact
+                        # call timed out on its own (up to a full
+                        # CONVERSATION_FOLLOWUP_TIMEOUT_S later, and reset
+                        # again by every further exchange) -- the real live
+                        # bug report ("pausing still runs the chat and
+                        # voice"). keep_waiting is only polled before
+                        # speech starts (see record_until_silence's own
+                        # docstring), so this doesn't cut off someone
+                        # mid-sentence, only stops it from opening a new
+                        # waiting window once paused/muted.
+                        keep_waiting=(lambda: not _voice_suspended()) if in_conversation
+                        else (lambda: _check_engaged() and not _voice_suspended()))
 
                 if n_faces > 1:
                     print(f"[multi-user] {n_faces} faces in frame, "

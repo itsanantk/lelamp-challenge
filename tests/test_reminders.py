@@ -403,12 +403,25 @@ def test_object_check_confirms_placement_once_it_holds_still_long_enough():
     vm = _FakeVisionMemory(detections=[_FakeDetection("bottle", 15.0)])
 
     engine.tick(now=r.created_at, face_found=True, lamp=lamp, vision_memory=vm)
-    engine.tick(now=r.created_at + reminders_mod.config.WATCH_STATIONARY_TIMEOUT_S + 0.1,
+    engine.tick(now=r.created_at + reminders_mod.config.REMINDER_PLACEMENT_SETTLE_S + 0.1,
                 face_found=True, lamp=lamp, vision_memory=vm)
 
     assert r.placement_confirmed
     assert r.tracked_bearing == 15.0
     assert lamp.sounds == []  # confirming placement isn't firing -- just bookkeeping
+
+
+def test_object_check_does_not_confirm_placement_just_under_the_settle_threshold():
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="check your water", object_class="bottle", due_in_s=3600.0)
+    lamp = _FakeLamp()
+    vm = _FakeVisionMemory(detections=[_FakeDetection("bottle", 15.0)])
+
+    engine.tick(now=r.created_at, face_found=True, lamp=lamp, vision_memory=vm)
+    engine.tick(now=r.created_at + reminders_mod.config.REMINDER_PLACEMENT_SETTLE_S - 0.1,
+                face_found=True, lamp=lamp, vision_memory=vm)
+
+    assert not r.placement_confirmed
 
 
 def test_object_check_a_real_move_resets_the_settle_clock():
@@ -420,7 +433,7 @@ def test_object_check_a_real_move_resets_the_settle_clock():
                 vision_memory=_FakeVisionMemory([_FakeDetection("bottle", 15.0)]))
     # Nearly settled, then it moves to a clearly different spot -- should
     # NOT confirm at the old timing, the clock restarts from the move.
-    almost_settled = r.created_at + reminders_mod.config.WATCH_STATIONARY_TIMEOUT_S - 0.1
+    almost_settled = r.created_at + reminders_mod.config.REMINDER_PLACEMENT_SETTLE_S - 0.1
     engine.tick(now=almost_settled, face_found=True, lamp=lamp,
                 vision_memory=_FakeVisionMemory([_FakeDetection("bottle", 60.0)]))
     engine.tick(now=almost_settled + 0.2, face_found=True, lamp=lamp,
@@ -428,6 +441,45 @@ def test_object_check_a_real_move_resets_the_settle_clock():
 
     assert not r.placement_confirmed
     assert r.tracked_bearing == 60.0
+
+
+def test_object_check_with_a_check_question_confirms_placement_on_first_sighting():
+    # The actual reported bug: an actively-handled object (a phone) never
+    # holds still long enough to pass REMINDER_PLACEMENT_SETTLE_S, so
+    # disturbance-watching never started. A check_question reminder must
+    # confirm on the very first sighting -- no settle wait at all.
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="don't touch your phone", object_class="cell phone",
+                    due_in_s=300.0, check_question="is the phone still untouched, sitting where it was left")
+    lamp = _FakeLamp()
+    vm = _FakeVisionMemory(detections=[_FakeDetection("cell phone", 15.0)])
+
+    engine.tick(now=r.created_at, face_found=True, lamp=lamp, vision_memory=vm)
+
+    assert r.placement_confirmed
+    assert r.tracked_bearing == 15.0
+
+
+def test_object_check_with_a_check_question_confirms_despite_bearing_jitter_between_sightings():
+    # Simulates the real failure mode: the object is seen, then seen again
+    # at a meaningfully different bearing (natural jitter from being held,
+    # not necessarily a real move) before it's ever detected twice in a
+    # row at the same spot. The old settle-based logic would keep
+    # resetting its clock forever in this pattern and never confirm.
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="don't touch your phone", object_class="cell phone",
+                    due_in_s=300.0, check_question="is the phone still untouched, sitting where it was left")
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at, face_found=True, lamp=lamp,
+                vision_memory=_FakeVisionMemory([_FakeDetection("cell phone", 15.0)]))
+    assert r.placement_confirmed  # already true after just the first tick
+
+    # A later, differently-angled sighting must not be treated as "not
+    # settled yet" -- there's no settle concept left for this case.
+    engine.tick(now=r.created_at + 0.1, face_found=True, lamp=lamp,
+                vision_memory=_FakeVisionMemory([_FakeDetection("cell phone", 40.0)]))
+    assert r.placement_confirmed
 
 
 def test_object_check_fires_by_pointing_at_the_bearing_once_the_deadline_hits():
@@ -611,6 +663,59 @@ def test_object_check_still_fires_at_the_deadline_even_if_placement_never_confir
     assert lamp.sounds == ["attention_seek"]
     assert not r.placement_confirmed
     assert not r.active  # no check_question -- fires directly and deactivates
+
+
+def test_object_check_with_alert_on_detection_fires_immediately_on_first_sighting():
+    # The actual reported bug: "don't let me touch my phone" needs to fire
+    # the instant YOLO catches the phone, no placement/settle/debounce at
+    # all -- detection itself is the violation.
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="get off your phone", object_class="cell phone",
+                    due_in_s=300.0, alert_on_detection=True)
+    lamp = _FakeLamp()
+    vm = _FakeVisionMemory([_FakeDetection("cell phone", 12.0)])
+
+    engine.tick(now=r.created_at + 1.0, face_found=True, lamp=lamp, vision_memory=vm)
+
+    assert lamp.sounds == ["attention_seek"]
+    assert len(lamp.pose_calls) == 1  # pointed at the sighting, not a generic wiggle
+    assert r.tracked_bearing == 12.0
+    assert not r.active  # one-shot -- caught once, reported, done
+
+
+def test_object_check_with_alert_on_detection_does_nothing_while_unseen():
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="get off your phone", object_class="cell phone",
+                    due_in_s=300.0, alert_on_detection=True)
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at + 10.0, face_found=True, lamp=lamp, vision_memory=_FakeVisionMemory([]))
+
+    assert lamp.sounds == []
+    assert r.active
+
+
+def test_object_check_with_alert_on_detection_deactivates_quietly_if_never_seen():
+    engine = ReminderEngine()
+    r = engine.add(kind="object_check", message="get off your phone", object_class="cell phone",
+                    due_in_s=1.0, alert_on_detection=True)
+    lamp = _FakeLamp()
+
+    engine.tick(now=r.created_at + 2.0, face_found=True, lamp=lamp, vision_memory=_FakeVisionMemory([]))
+
+    assert lamp.sounds == []  # never caught -- nothing to report
+    assert not r.active
+
+
+def test_object_check_with_alert_on_detection_is_included_in_watched_classes():
+    # Needs fast scan cadence even more than a disturbance watch does --
+    # there's no debounce to protect, so scan cadence is the entire delay
+    # between a pickup and the lamp noticing it (see watched_classes's docstring).
+    engine = ReminderEngine()
+    engine.add(kind="object_check", message="get off your phone", object_class="cell phone",
+               due_in_s=300.0, alert_on_detection=True)
+
+    assert engine.watched_classes() == ["cell phone"]
 
 
 def test_object_check_without_vision_memory_never_confirms_placement():

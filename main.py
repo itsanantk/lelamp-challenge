@@ -20,6 +20,19 @@ Keys (interactive mode):
     q       quit
     c       clear stored memory, reset learned attention-seek timing, and cancel all reminders
             (live -- unlike --fresh-memory, doesn't need a restart)
+    p       pause/resume -- freezes the reactive/learning loop, wake-word/voice listening
+            (with --chat --voice), and --record's output, so you can get a camera set up
+            without the lamp reacting to the fumbling. Live preview and the lamp's own idle
+            motion/breathing keep running -- it stays visually alive, just stops noticing
+            anything new, and an already in-flight conversation is left to finish rather than
+            cut off mid-reply
+    h       show/hide the debug HUD panel -- cuts the composite window's pixel count by
+            ~32% and skips its (relatively costly) redraw; useful while recording, since an
+            external screen recorder's own cost is driven by what's on screen, not anything
+            this process can throttle in itself
+    m       mute/unmute -- silences wake-word listening and every voice.speak() call
+            (conversational replies AND reminder announcements), without freezing tracking/
+            reminders/etc. the way 'p' does. The two are independent and stack
     SPACE   (with --label) toggle "I am currently looking at the lamp" ground truth
 """
 from __future__ import annotations
@@ -27,10 +40,28 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import queue
 import threading
 import time
 
 import cv2
+
+# OpenCV defaults to using every logical core for its own internal
+# parallel ops (resize, cvtColor, the hstack/vstack in viz.compose_panels)
+# -- unlike vision_memory.py's torch.set_num_threads(4), which only
+# throttles YOLO's periodic scan, this runs on every single frame, so it's
+# a much more constant source of thread oversubscription against
+# MediaPipe/whisper/torch all sharing the same cores. Reported live: the
+# app got visibly slower and laggier the moment an external screen
+# recorder started -- another sustained heavy CPU consumer landing on top
+# of a process that was already claiming far more concurrent work than
+# the core count can serve without contention collides constantly instead
+# of occasionally. Must run before any cv2 call, so it's here at import
+# time, same reasoning as torch's cap living at vision_memory.py's own
+# import time. Not live-verified against an actual running recorder (that
+# needs a human to test) -- if this doesn't fully fix it, the recorder's
+# own encoder is the remaining suspect, not this app.
+cv2.setNumThreads(4)
 
 import chat
 import config
@@ -63,6 +94,52 @@ def _open_log_writer(enabled: bool):
     ])
     print(f"[log] writing labeled session log to {path}")
     return f, writer
+
+
+class _AsyncVideoWriter:
+    """Runs cv2.VideoWriter's actual encode+write on its own thread instead
+    of the main loop. --record's write() call used to sit directly in the
+    hot path, encoding a large composite frame (webcam + lamp panel + debug
+    text, easily 2500+px wide) synchronously every tick -- on top of an
+    already CPU-bound pipeline (YOLO + MediaPipe + wake-word polling), live
+    testing found this was enough to visibly slow the whole interactive
+    loop down the moment --record was on, not just add a fixed constant
+    cost. The main loop now just enqueues a frame (cheap, no encoding) and
+    this thread drains it independently.
+
+    The queue is bounded and drops the newest frame in a submit() call
+    that arrives while the queue is full, rather than blocking the caller
+    -- if the encoder falls behind, the interactive session staying smooth
+    matters more than the recorded file never skipping a frame. release()
+    isn't safe to call from two threads at once, so composite frames are
+    only ever encoded on this one thread, start to finish."""
+    def __init__(self, path, width: int, height: int, fps: float = 20.0, max_queued: int = 8):
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self._writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height))
+        self._queue: queue.Queue = queue.Queue(maxsize=max_queued)
+        self._dropped = 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            frame = self._queue.get()
+            if frame is None:  # stop() sentinel
+                break
+            self._writer.write(frame)
+
+    def submit(self, frame) -> None:
+        try:
+            self._queue.put_nowait(frame)
+        except queue.Full:
+            self._dropped += 1
+
+    def stop(self) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout=5.0)
+        self._writer.release()
+        if self._dropped:
+            print(f"[record] encoder fell behind -- dropped {self._dropped} frame(s) from the output")
 
 
 def run(args: argparse.Namespace) -> None:
@@ -111,8 +188,16 @@ def run(args: argparse.Namespace) -> None:
 
     chat_thread = None
     chat_shutdown = None
+    chat_paused = None
     if args.chat:
         chat_shutdown = threading.Event()
+        # Mirrors the 'p' pause toggle over to chat.py's own thread -- see
+        # that Event's own docstring on chat.run for what it actually
+        # gates. A plain Event, not a param passed fresh each toggle,
+        # since chat.run only ever reads it from its own loop; the two
+        # threads never contend over who sets it (only the key-handling
+        # code below ever calls .set()/.clear()).
+        chat_paused = threading.Event()
         chat_args = argparse.Namespace(no_gui=True, voice=args.voice, mute=args.mute, ask=None,
                                         no_multi_user=args.no_multi_user, wake_word=args.wake_word)
         # store=None here on purpose -- MemoryAgent's own sqlite3 connection
@@ -121,7 +206,7 @@ def run(args: argparse.Namespace) -> None:
         chat_thread = threading.Thread(
             target=chat.run, args=(chat_args,),
             kwargs={"lamp": lamp, "fsm": fsm, "vision_memory": vision_memory, "shutdown_event": chat_shutdown,
-                    "reminder_engine": reminder_engine},
+                    "reminder_engine": reminder_engine, "paused_event": chat_paused},
             daemon=True)
         chat_thread.start()
 
@@ -141,6 +226,25 @@ def run(args: argparse.Namespace) -> None:
     info_panel_cache = None
     INFO_PANEL_REFRESH_EVERY = 4  # debug text panel is cheap to read stale for a few frames, expensive to redraw every frame at this resolution
     window_name = "LeLamp Challenge - webcam | lamp sim | fsm"
+    # Toggled with 'p' -- for getting a camera/tripod set up without the
+    # lamp reacting to the fumbling (attention-seeking at you for not
+    # looking at it, presence reminders firing because you stepped out of
+    # frame, the adaptation engine learning from a non-interaction that
+    # was never real). The live camera preview keeps running while paused
+    # (still useful for framing the shot) -- only the reactive/learning
+    # side of the loop and --record's output stop. See the pause-toggle
+    # block below for exactly what's skipped and why dt bookkeeping still
+    # runs regardless (avoids a large-dt jump on the first tick after
+    # resuming).
+    paused = False
+    # Toggled with 'h' -- the debug/HUD text panel is ~500 of the
+    # composite's ~1580px height and one of the costlier things drawn each
+    # frame (see its own comment below). Recording (this app's own
+    # --record or an external screen recorder) is the case where that
+    # actually matters: a screen recorder's capture/encode cost is driven
+    # by what's on screen, not by anything in this process, so this is a
+    # real independent lever cv2.setNumThreads (above) can't reach.
+    show_hud = True
     window_ready = False
 
     try:
@@ -155,122 +259,133 @@ def run(args: argparse.Namespace) -> None:
             dt = now - last_t
             last_t = now
 
-            engaged = reading.engaged if reading else False
-            bearing = reading.user_bearing_deg if reading else None
-            # Ambient mic gate (perception/audio_monitor.py) misses two
-            # cases: TTS on headphones (no room bleed to pick up) and a
-            # user turn mid-recording where the gate hasn't tripped yet --
-            # voice.is_speaking()/is_listening() know both directly rather
-            # than inferring them acoustically.
-            user_busy = (audio_monitor.is_active() if audio_monitor is not None else False) \
-                or voice.is_speaking() or voice.is_listening()
-            if ambient_sensor is not None:
-                ambient_sensor.update(frame, now)
-                fsm.ambient_brightness_nudge = ambient_sensor.brightness_nudge()
-            fsm_state = fsm.update(engaged=engaged, user_bearing_deg=bearing, dt=dt, user_busy=user_busy)
+            # Always runs, even paused -- steps whatever pose trajectory is
+            # already in flight and advances the idle breathing/sway clock
+            # (see SimulatedLamp.update/get_current_pose). Both are
+            # self-contained animation, not reactions to anything: nothing
+            # here sets a *new* target pose or notices anything about you.
+            # Pausing is about not reacting to a person fumbling with a
+            # camera, not about the lamp going visibly rigid on screen
+            # while that happens -- a lamp that freezes mid-gesture the
+            # instant you hit pause reads as broken, not paused.
             lamp.update(dt)
 
-            if adapt_engine is not None:
-                if prev_fsm_state != State.ATTENTION_SEEKING and fsm_state == State.ATTENTION_SEEKING:
-                    adapt_engine.on_attention_seek_started()
-                if prev_fsm_state != State.ENGAGED and fsm_state == State.ENGAGED:
-                    adapt_engine.on_engaged()
-                adapt_engine.on_check_timeout()
-                adapt_engine.apply_to(fsm)  # keep the FSM synced as the engine adapts mid-session
-            prev_fsm_state = fsm_state
+            if not paused:
+                engaged = reading.engaged if reading else False
+                bearing = reading.user_bearing_deg if reading else None
+                # Ambient mic gate (perception/audio_monitor.py) misses two
+                # cases: TTS on headphones (no room bleed to pick up) and a
+                # user turn mid-recording where the gate hasn't tripped yet --
+                # voice.is_speaking()/is_listening() know both directly rather
+                # than inferring them acoustically.
+                user_busy = (audio_monitor.is_active() if audio_monitor is not None else False) \
+                    or voice.is_speaking() or voice.is_listening()
+                if ambient_sensor is not None:
+                    ambient_sensor.update(frame, now)
+                    fsm.ambient_brightness_nudge = ambient_sensor.brightness_nudge()
+                fsm_state = fsm.update(engaged=engaged, user_bearing_deg=bearing, dt=dt, user_busy=user_busy)
 
-            if reminder_engine is not None:
-                # Ticks regardless of vision_memory -- recurring/presence
-                # reminders don't need it at all (--no-memory shouldn't
-                # silently break them too), only object_check's own
-                # placement tracking does, and that's a no-op internally
-                # when vision_memory is None (see _update_placement).
-                # time.time() (wall clock), not the perf_counter-based
-                # `now`/`dt` above -- reminders persist across restarts and
-                # compare against real elapsed time, which perf_counter's
-                # arbitrary per-process origin can't do. face_found (not
-                # fsm_state/engaged) is presence's actual signal -- "did I
-                # get up from my desk" means "is a face even in frame,"
-                # not "am I currently looking at the lamp specifically."
-                # Uses vision_memory.last_detections from *last* tick's
-                # scan here (maybe_scan() for this tick hasn't run yet
-                # below) -- harmless, detections only refresh every
-                # 0.35s/0.18s anyway, one tick's staleness is nothing.
-                reminder_engine.tick(time.time(), reading.face_found if reading else False,
-                                      lamp, vision_memory=vision_memory)
+                if adapt_engine is not None:
+                    if prev_fsm_state != State.ATTENTION_SEEKING and fsm_state == State.ATTENTION_SEEKING:
+                        adapt_engine.on_attention_seek_started()
+                    if prev_fsm_state != State.ENGAGED and fsm_state == State.ENGAGED:
+                        adapt_engine.on_engaged()
+                    adapt_engine.on_check_timeout()
+                    adapt_engine.apply_to(fsm)  # keep the FSM synced as the engine adapts mid-session
+                prev_fsm_state = fsm_state
 
-            if not args.no_camera_pan:
-                # base_yaw is the same degrees-of-bearing convention as
-                # pose_for_look_at's yaw_deg input (positive = user's
-                # right), whatever subsystem last set the target pose --
-                # tracking, attention-seeking, an engaged look, even idle
-                # sway -- so reading it back is a simpler and more honest
-                # "what is the lamp currently looking at" than trying to
-                # separately track which subsystem currently owns the gaze.
-                # Computed before the YOLO scan below (not just before
-                # display) so both the detector's simulated FOV and the
-                # on-screen pan follow the exact same bearing this tick.
-                target_bearing = float(lamp.get_current_pose()[0])
-                follow = min(1.0, dt * config.CAMERA_PAN_FOLLOW_HZ)
-                pan_bearing_ema += (target_bearing - pan_bearing_ema) * follow
-
-            yolo_latency_ms = None
-            if vision_memory is not None:
-                # Only object detection is restricted to the pan window --
-                # engagement/face detection (above) always sees the full
-                # frame. Those are conceptually two different sensing
-                # channels here: whether a person is present and looking
-                # at it is something a lamp would want to notice
-                # regardless of which way its head happens to be turned;
-                # "what objects are around" is what the FOV constraint is
-                # actually meant to simulate (a camera mounted on the head
-                # that can't see what it isn't pointed at).
-                pan_zoom = config.CAMERA_PAN_ZOOM if not args.no_camera_pan else None
-                scanned = vision_memory.maybe_scan(frame, pan_bearing_deg=pan_bearing_ema, pan_zoom=pan_zoom)
-                if scanned is not None:  # only a real sample on ticks that actually ran YOLO
-                    yolo_latency_ms = vision_memory.last_scan_latency_ms
                 if reminder_engine is not None:
-                    # Recomputed fresh each tick from reminder_engine's own
-                    # source of truth, not incrementally mutated -- avoids
-                    # a ref-counting bug where two simultaneous object_check
-                    # reminders on the same class, or a race between adding
-                    # and removing, could leave the wrong classes tracked.
-                    # After maybe_scan() above (this tick's freshest
-                    # detections already landed in vision_memory), before
-                    # object_watcher.update() below, so the watcher sees
-                    # this tick's tracked_classes, not last tick's.
-                    object_watcher.tracked_classes = config.TRACKED_CLASSES + reminder_engine.pending_placement_classes()
-                # Runs before object_watcher.update() on purpose: if the
-                # sweep this tick turns an object up, object_watcher's own
-                # acquire pose (set below) needs to be the last
-                # set_target_pose call this tick, not overwritten by the
-                # scanner settling back to neutral (see idle_scan.py's
-                # docstring on why preemption is silent, not a competing
-                # pose command).
-                idle_scanner.update(fsm_state, object_watcher.active, dt)
-                object_watcher.update(vision_memory.last_detections, fsm_state, dt, user_bearing_deg=bearing)
-                # ObjectWatcher's own should_scan_fast() drops back to the
-                # slow interval once an object's held still for
-                # WATCH_FAST_SCAN_SETTLE_S -- which, for an object_check
-                # reminder, has always already happened by the time
-                # disturbance-watching starts (placement confirmation
-                # itself needs WATCH_STATIONARY_TIMEOUT_S of stillness).
-                # Without this OR, the first scan to actually catch a
-                # pickup would wait for the slow cadence to come back
-                # around before the disturbance debounce even starts
-                # counting -- see ReminderEngine.watched_classes's own
-                # docstring for the live bug report this fixes.
-                watching_for_disturbance = bool(reminder_engine.watched_classes()) if reminder_engine is not None else False
-                vision_memory.fast_mode = object_watcher.should_scan_fast() or watching_for_disturbance
+                    # Ticks regardless of vision_memory -- recurring/presence
+                    # reminders don't need it at all (--no-memory shouldn't
+                    # silently break them too), only object_check's own
+                    # placement tracking does, and that's a no-op internally
+                    # when vision_memory is None (see _update_placement).
+                    # time.time() (wall clock), not the perf_counter-based
+                    # `now`/`dt` above -- reminders persist across restarts and
+                    # compare against real elapsed time, which perf_counter's
+                    # arbitrary per-process origin can't do. face_found (not
+                    # fsm_state/engaged) is presence's actual signal -- "did I
+                    # get up from my desk" means "is a face even in frame,"
+                    # not "am I currently looking at the lamp specifically."
+                    # Uses vision_memory.last_detections from *last* tick's
+                    # scan here (maybe_scan() for this tick hasn't run yet
+                    # below) -- harmless, detections only refresh every
+                    # 0.35s/0.18s anyway, one tick's staleness is nothing.
+                    reminder_engine.tick(time.time(), reading.face_found if reading else False,
+                                          lamp, vision_memory=vision_memory)
 
-            if hand_wave is not None and fsm_state == State.ENGAGED:
-                # Only while ENGAGED -- waving hello is a thing you do
-                # when it's already paying attention to you, and it bounds
-                # this third model's cost to exactly the situations where
-                # a wave means anything (see config.py's own note).
-                wave_bearing = hand_wave.update(frame, now)
-                if wave_bearing is not None:
-                    play_wave_back(lamp, wave_bearing)
+                if not args.no_camera_pan:
+                    # base_yaw is the same degrees-of-bearing convention as
+                    # pose_for_look_at's yaw_deg input (positive = user's
+                    # right), whatever subsystem last set the target pose --
+                    # tracking, attention-seeking, an engaged look, even idle
+                    # sway -- so reading it back is a simpler and more honest
+                    # "what is the lamp currently looking at" than trying to
+                    # separately track which subsystem currently owns the gaze.
+                    # Computed before the YOLO scan below (not just before
+                    # display) so both the detector's simulated FOV and the
+                    # on-screen pan follow the exact same bearing this tick.
+                    target_bearing = float(lamp.get_current_pose()[0])
+                    follow = min(1.0, dt * config.CAMERA_PAN_FOLLOW_HZ)
+                    pan_bearing_ema += (target_bearing - pan_bearing_ema) * follow
+
+                yolo_latency_ms = None
+                if vision_memory is not None:
+                    # Only object detection is restricted to the pan window --
+                    # engagement/face detection (above) always sees the full
+                    # frame. Those are conceptually two different sensing
+                    # channels here: whether a person is present and looking
+                    # at it is something a lamp would want to notice
+                    # regardless of which way its head happens to be turned;
+                    # "what objects are around" is what the FOV constraint is
+                    # actually meant to simulate (a camera mounted on the head
+                    # that can't see what it isn't pointed at).
+                    pan_zoom = config.CAMERA_PAN_ZOOM if not args.no_camera_pan else None
+                    scanned = vision_memory.maybe_scan(frame, pan_bearing_deg=pan_bearing_ema, pan_zoom=pan_zoom)
+                    if scanned is not None:  # only a real sample on ticks that actually ran YOLO
+                        yolo_latency_ms = vision_memory.last_scan_latency_ms
+                    if reminder_engine is not None:
+                        # Recomputed fresh each tick from reminder_engine's own
+                        # source of truth, not incrementally mutated -- avoids
+                        # a ref-counting bug where two simultaneous object_check
+                        # reminders on the same class, or a race between adding
+                        # and removing, could leave the wrong classes tracked.
+                        # After maybe_scan() above (this tick's freshest
+                        # detections already landed in vision_memory), before
+                        # object_watcher.update() below, so the watcher sees
+                        # this tick's tracked_classes, not last tick's.
+                        object_watcher.tracked_classes = config.TRACKED_CLASSES + reminder_engine.pending_placement_classes()
+                    # Runs before object_watcher.update() on purpose: if the
+                    # sweep this tick turns an object up, object_watcher's own
+                    # acquire pose (set below) needs to be the last
+                    # set_target_pose call this tick, not overwritten by the
+                    # scanner settling back to neutral (see idle_scan.py's
+                    # docstring on why preemption is silent, not a competing
+                    # pose command).
+                    idle_scanner.update(fsm_state, object_watcher.active, dt)
+                    object_watcher.update(vision_memory.last_detections, fsm_state, dt, user_bearing_deg=bearing)
+                    # ObjectWatcher's own should_scan_fast() drops back to the
+                    # slow interval once an object's held still for
+                    # WATCH_FAST_SCAN_SETTLE_S -- which, for an object_check
+                    # reminder, has always already happened by the time
+                    # disturbance-watching starts (placement confirmation
+                    # itself needs WATCH_STATIONARY_TIMEOUT_S of stillness).
+                    # Without this OR, the first scan to actually catch a
+                    # pickup would wait for the slow cadence to come back
+                    # around before the disturbance debounce even starts
+                    # counting -- see ReminderEngine.watched_classes's own
+                    # docstring for the live bug report this fixes.
+                    watching_for_disturbance = bool(reminder_engine.watched_classes()) if reminder_engine is not None else False
+                    vision_memory.fast_mode = object_watcher.should_scan_fast() or watching_for_disturbance
+
+                if hand_wave is not None and fsm_state == State.ENGAGED:
+                    # Only while ENGAGED -- waving hello is a thing you do
+                    # when it's already paying attention to you, and it bounds
+                    # this third model's cost to exactly the situations where
+                    # a wave means anything (see config.py's own note).
+                    wave_bearing = hand_wave.update(frame, now)
+                    if wave_bearing is not None:
+                        play_wave_back(lamp, wave_bearing)
 
             # Detection/engagement math above all runs on the raw,
             # un-flipped frame (that's what the corrected user-relative
@@ -293,8 +408,16 @@ def run(args: argparse.Namespace) -> None:
             # Rebuilding this panel (putText for ~20+ lines at 1920-wide
             # scale) is one of the costlier steps in the frame at this
             # resolution, and nobody reads debug text at 30fps -- refresh
-            # it every few frames instead of on every single one.
-            if info_panel_cache is None or frame_count % INFO_PANEL_REFRESH_EVERY == 0:
+            # it every few frames instead of on every single one. Skipped
+            # entirely while show_hud is off ('h') -- this panel is also
+            # the single biggest chunk of the composite window's pixel
+            # count (500 of ~1580px tall), which matters for recording:
+            # an external screen recorder has to capture and encode
+            # whatever's actually on screen, and that cost is completely
+            # outside this process's own thread caps (see cv2.setNumThreads
+            # above) -- fewer on-screen pixels is a real, independent lever
+            # a thread cap can't reach.
+            if show_hud and (info_panel_cache is None or frame_count % INFO_PANEL_REFRESH_EVERY == 0):
                 info = fsm.debug_info()
                 side_lines = [f"{k}: {v}" for k, v in info.items()]
                 if adapt_engine is not None:
@@ -332,11 +455,38 @@ def run(args: argparse.Namespace) -> None:
                 row1_width = webcam_hud.shape[1] + lamp_panel.shape[1]
                 info_panel_cache = viz.make_text_panel(row1_width, 500, side_lines, title="FSM + MEMORY + DEBUG",
                                                         columns=3, scale=1.8)
-            composite = viz.compose_panels(webcam_hud, lamp_panel, info_panel_cache)
+            composite = viz.compose_panels(webcam_hud, lamp_panel, info_panel_cache if show_hud else None)
+            # Loud and unmissable on purpose -- this is the difference
+            # between a clean take and one where the lamp visibly freezes
+            # mid-gesture (paused) or the lamp answers a question with dead
+            # air (muted) and it just looks broken on camera. Stacked, not
+            # both crammed onto one line, so either state reads clearly
+            # whether the other is also active. Positioned below
+            # draw_webcam_hud's own STATE bar (viz.py's bar_h = 36 *
+            # _UI_SCALE = 108px at this frame's scale) rather than on top
+            # of it -- PAUSED used to land in that same top-left corner and
+            # overlap it. Each label gets its own filled backing rect
+            # (sized off the actual text, not guessed) so it's readable
+            # regardless of what's under it in the live feed, same idea as
+            # the state bar's own background.
+            status_labels = []
+            if paused:
+                status_labels.append(("PAUSED (p to resume)", (0, 0, 255)))
+            if voice.is_muted():
+                status_labels.append(("MUTED (m to unmute)", (0, 165, 255)))
+            font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3
+            y = 160
+            for label, color in status_labels:
+                (text_w, text_h), baseline = cv2.getTextSize(label, font, scale, thickness)
+                x = 30
+                cv2.rectangle(composite, (x - 10, y - text_h - 10), (x + text_w + 10, y + baseline + 10),
+                              (20, 20, 20), -1)
+                cv2.putText(composite, label, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+                y += text_h + 30
 
             loop_latency_ms = (time.perf_counter() - loop_t0) * 1000
 
-            if log_writer is not None and reading is not None:
+            if log_writer is not None and reading is not None and not paused:
                 log_writer.writerow([
                     reading.timestamp_ms, reading.face_found, int(reading.engaged), fsm_state.name,
                     ground_truth_label, reading.yaw_deg, reading.pitch_deg,
@@ -345,12 +495,15 @@ def run(args: argparse.Namespace) -> None:
                     round(loop_latency_ms, 2),
                 ])
 
-            if args.record:
+            if args.record and not paused:
+                # Excluded while paused on purpose, same reasoning as
+                # skipping the reactive block above -- camera/tripod setup
+                # fumbling shouldn't end up baked into the output file
+                # either. See _AsyncVideoWriter's own docstring for why
+                # this is a submit() to a queue, not a direct write().
                 if video_writer is None:
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    video_writer = cv2.VideoWriter(str(out_path), fourcc, 20.0,
-                                                    (composite.shape[1], composite.shape[0]))
-                video_writer.write(composite)
+                    video_writer = _AsyncVideoWriter(out_path, composite.shape[1], composite.shape[0])
+                video_writer.submit(composite)
 
             frame_count += 1
 
@@ -372,6 +525,35 @@ def run(args: argparse.Namespace) -> None:
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
+            if key == ord("p"):
+                paused = not paused
+                if chat_paused is not None:
+                    chat_paused.set() if paused else chat_paused.clear()
+                print(f"[main] {'paused' if paused else 'resumed'}")
+            if key == ord("m"):
+                # Deliberately separate from 'p' -- pause freezes the whole
+                # reactive loop (tracking, reminders, YOLO scanning), which
+                # is more than you always want; sometimes the lamp should
+                # keep noticing/tracking you on camera but just not talk.
+                # Lives in voice.py itself (a module-level toggle, not an
+                # Event threaded through kwargs the way chat_paused is)
+                # since speak() needs to see it from every caller --
+                # chat.py's replies AND behavior/reminders.py's own
+                # announcements, which don't go through chat.py's loop at
+                # all -- see voice.set_muted's own docstring.
+                voice.set_muted(not voice.is_muted())
+                print(f"[main] voice {'muted' if voice.is_muted() else 'unmuted'}")
+            if key == ord("h"):
+                show_hud = not show_hud
+                # Resize immediately rather than waiting for the next
+                # composite -- WINDOW_NORMAL stretches the image to fill
+                # whatever size the window already is, so without this the
+                # very next frame displays visibly squashed/stretched
+                # until something else happens to trigger a resize.
+                row1_w = webcam_hud.shape[1] + lamp_panel.shape[1]
+                row1_h = webcam_hud.shape[0] + (500 if show_hud else 0)
+                cv2.resizeWindow(window_name, row1_w, row1_h)
+                print(f"[main] HUD panel {'shown' if show_hud else 'hidden'}")
             if args.label and key == ord(" "):
                 ground_truth_label = 1 - ground_truth_label
             if key == ord("c") and store is not None:
@@ -421,7 +603,7 @@ def run(args: argparse.Namespace) -> None:
         if store is not None:
             store.close()
         if video_writer is not None:
-            video_writer.release()
+            video_writer.stop()  # drains any still-queued frames before releasing -- see _AsyncVideoWriter
             print(f"[record] saved composite video to {out_path}")
         if log_file is not None:
             log_file.close()

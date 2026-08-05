@@ -8,9 +8,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import cv2
 import numpy as np
 
-from conversation.agent import MemoryAgent, RecallResult, LIGHT_ACTIONS
+from conversation.agent import MemoryAgent, RecallResult, LIGHT_ACTIONS, _encode_frame_for_vision, _VISION_MAX_DIM
 
 
 def _agent():
@@ -75,6 +76,7 @@ def test_create_reminder_recurring_records_the_intended_action():
     assert agent.last_reminder_action == {
         "action": "create", "kind": "recurring", "message": "stand up", "interval_s": 1800.0,
         "duration_s": None, "object_class": None, "due_in_s": None, "check_question": None,
+        "alert_on_detection": False,
     }
 
 
@@ -128,6 +130,42 @@ def test_create_reminder_object_check_records_a_check_question_when_given():
     })
     assert result == {"created": True, "kind": "object_check"}
     assert agent.last_reminder_action["check_question"] == "is this water bottle full or empty"
+
+
+def test_create_reminder_object_check_records_alert_on_detection_when_given():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "object_check", "object_name": "phone",
+        "deadline_minutes": 5, "message": "get off your phone",
+        "alert_on_detection": True,
+    })
+    assert result == {"created": True, "kind": "object_check"}
+    assert agent.last_reminder_action["alert_on_detection"] is True
+
+
+def test_create_reminder_object_check_alert_on_detection_ignores_check_question():
+    # alert_on_detection has nothing to visually judge -- see the tool
+    # spec's own description. A check_question set alongside it (e.g. the
+    # model forgetting the two are mutually exclusive) must not leak
+    # through and accidentally route this into the disturbance-watch/
+    # judge_view() path instead.
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "object_check", "object_name": "phone",
+        "deadline_minutes": 5, "message": "get off your phone",
+        "alert_on_detection": True, "check_question": "is the phone still untouched",
+    })
+    assert agent.last_reminder_action["alert_on_detection"] is True
+    assert agent.last_reminder_action["check_question"] is None
+
+
+def test_create_reminder_object_check_defaults_alert_on_detection_to_false():
+    agent = _agent()
+    result, image = agent._execute_tool("create_reminder", {
+        "action": "create", "kind": "object_check", "object_name": "water bottle",
+        "deadline_minutes": 60, "message": "did you finish your water?",
+    })
+    assert agent.last_reminder_action["alert_on_detection"] is False
 
 
 def test_create_reminder_object_check_requires_an_object_name():
@@ -267,6 +305,24 @@ def test_describe_current_view_returns_jpeg_bytes_for_a_real_frame():
     assert result == {"available": True}
     assert isinstance(image, bytes) and len(image) > 0
     assert image[:2] == b"\xff\xd8"  # JPEG magic bytes
+
+
+def test_encode_frame_for_vision_downscales_a_large_frame():
+    # Real bug this fixes: sending the full 1920x1080 frame to a
+    # vision-LLM call untouched was traced live to a single judge_view()
+    # round trip taking ~12-13s. Confirms the downscale actually happens,
+    # not just that the function runs.
+    large = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    jpeg_bytes = _encode_frame_for_vision(large)
+    decoded = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert max(decoded.shape[:2]) == _VISION_MAX_DIM
+
+
+def test_encode_frame_for_vision_leaves_a_small_frame_untouched():
+    small = np.zeros((48, 64, 3), dtype=np.uint8)
+    jpeg_bytes = _encode_frame_for_vision(small)
+    decoded = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert decoded.shape[:2] == (48, 64)
 
 
 def test_judge_view_returns_none_with_no_frame_provider():

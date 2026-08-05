@@ -86,6 +86,14 @@ and pointing back at it when the deadline hits -- you can't yet judge the object
 (whether a bottle is full or empty), so don't promise that in your reply, just confirm you'll \
 check on it.
 
+If instead the user wants you to catch them touching/using something they shouldn't (e.g. \
+"make sure I don't go on my phone for five minutes", "don't let me touch my phone while I'm \
+working"), that's a prohibition, not a check-on-it-later -- pass alert_on_detection=true. This \
+is a different mechanism from the disturbance-watch above: there's no baseline position to \
+compare against and nothing to visually judge, so it fires the instant the object is seen at \
+all, not when it moves from somewhere. Don't set check_question for this case -- there's no \
+judgment call being made, so it would just go unused.
+
 recall_object_location only knows a fixed list of common object types (the classes your \
 object detector recognizes) -- it has no idea what a "black water bottle" or "the blue \
 notebook" is beyond the generic class. If recall_object_location comes back found=false, or \
@@ -165,17 +173,18 @@ TOOL_SPECS = [
                                      "watches whether the PERSON is at the desk -- fires once "
                                      "each time they leave (a face stops being detected), then "
                                      "re-arms once they're back. 'object_check': watches a named "
-                                     "OBJECT and actually checks on it -- either 'make sure I do "
-                                     "something with X by/in a certain time' (a plain presence/ "
-                                     "location check), or 'make sure I DON'T touch/use X for a "
-                                     "while' (a watch that also catches it being disturbed early -- "
-                                     "see deadline_minutes and check_question below). Prefer "
-                                     "'object_check' over 'recurring' any time a specific object is "
-                                     "named, even for phrasing like 'make sure I'm not on my phone "
-                                     "for five minutes' -- 'recurring' can only nag on a timer, it "
-                                     "can't actually look at anything. Required for a 'create' "
-                                     "action; for 'cancel', omit to cancel every active reminder "
-                                     "instead of just one kind."},
+                                     "OBJECT -- 'make sure I do something with X by/in a certain "
+                                     "time' (a plain presence/location check), 'make sure I DON'T "
+                                     "keep using X' (a disturbance watch, catches a moved/missing "
+                                     "object early -- see check_question below), or 'make sure I "
+                                     "DON'T touch/use X AT ALL for a while' (a prohibition -- see "
+                                     "alert_on_detection below). Prefer 'object_check' over "
+                                     "'recurring' any time a specific object is named, even for "
+                                     "phrasing like 'make sure I'm not on my phone for five "
+                                     "minutes' -- 'recurring' can only nag on a timer, it can't "
+                                     "actually look at anything. Required for a 'create' action; "
+                                     "for 'cancel', omit to cancel every active reminder instead "
+                                     "of just one kind."},
             "interval_minutes": {"type": "number",
                                   "description": "required when creating a 'recurring' reminder "
                                                   "-- how often it fires, in minutes"},
@@ -196,15 +205,31 @@ TOOL_SPECS = [
                                                   "bounded object_check -- duration_minutes doesn't "
                                                   "apply to this kind (see its own description)."},
             "check_question": {"type": "string",
-                                "description": "optional, 'object_check' only -- if the request "
-                                                "implies judging something about the object's "
-                                                "state, not just confirming it's still there, "
-                                                "phrase that as a short question you'd want "
+                                "description": "optional, 'object_check' only, and not used "
+                                                "together with alert_on_detection -- if the "
+                                                "request implies judging something about the "
+                                                "object's state, not just confirming it's still "
+                                                "there, phrase that as a short question you'd want "
                                                 "answered from a live look at it (e.g. 'make sure "
                                                 "I drink all my water' -> 'is this water bottle "
                                                 "full or empty'). Omit when there's nothing to "
                                                 "visually judge (e.g. 'check on my keys' just "
-                                                "needs to confirm where they are)."},
+                                                "needs to confirm where they are, and a "
+                                                "prohibition like 'don't touch my phone' has "
+                                                "nothing to judge either -- see "
+                                                "alert_on_detection)."},
+            "alert_on_detection": {"type": "boolean",
+                                    "description": "optional, 'object_check' only -- true for a "
+                                                    "prohibition ('make sure I don't go on my "
+                                                    "phone', 'don't let me touch X'), where the "
+                                                    "object being detected at all is itself the "
+                                                    "violation. Fires immediately on the first "
+                                                    "sighting, no baseline position, no judgment "
+                                                    "call -- do not also set check_question for "
+                                                    "this. Omit (or false) for the normal case: "
+                                                    "watching where an object was set down and "
+                                                    "reporting if it moves or when the deadline "
+                                                    "hits."},
             "duration_minutes": {"type": "number",
                                   "description": "optional, for 'recurring'/'presence' only -- if "
                                                   "the user only wants this active for a limited "
@@ -234,6 +259,29 @@ TOOL_SPECS = [
         "required": [],
     },
 ]
+
+
+_VISION_MAX_DIM = 1024  # long edge, px -- see _encode_frame_for_vision
+
+
+def _encode_frame_for_vision(frame: np.ndarray) -> bytes | None:
+    """JPEG-encodes frame for a vision-LLM call (describe_current_view,
+    judge_view), downscaling first if either dimension exceeds
+    _VISION_MAX_DIM. main.py's own frame is config.FRAME_WIDTH x
+    FRAME_HEIGHT (1920x1080) -- sending that untouched meant uploading
+    and having the model process roughly 4x the pixels a coarse judgment
+    ("is the phone still there," "is this bottle full or empty") ever
+    needed, which live testing traced to a single judge_view() round trip
+    taking ~12-13s. 1024px on the long edge is a reasoned cut, not a
+    live-verified one -- if a future check needs to read small text
+    reliably and starts missing it, raise this rather than assume it's
+    unrelated."""
+    h, w = frame.shape[:2]
+    scale = _VISION_MAX_DIM / max(h, w)
+    if scale < 1.0:
+        frame = cv2.resize(frame, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+    ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    return jpeg.tobytes() if ok else None
 
 
 def _anthropic_tools() -> list[dict]:
@@ -375,6 +423,7 @@ class MemoryAgent:
                 object_class = None
                 due_in_s = None
                 check_question = None
+                alert_on_detection = False
                 if kind == "object_check":
                     object_name = str(tool_input.get("object_name") or "").strip()
                     if not object_name:
@@ -386,7 +435,11 @@ class MemoryAgent:
                                          "for an object_check reminder"}, None
                     object_class = normalize_class(object_name)
                     due_in_s = float(deadline_minutes) * 60.0
-                    check_question = str(tool_input.get("check_question") or "").strip() or None
+                    alert_on_detection = bool(tool_input.get("alert_on_detection", False))
+                    # Not both -- alert_on_detection has nothing to judge (see its own tool-spec
+                    # description), so a check_question set alongside it would just go unused.
+                    check_question = None if alert_on_detection else \
+                        (str(tool_input.get("check_question") or "").strip() or None)
                 duration_s = None
                 duration_minutes = tool_input.get("duration_minutes")
                 if duration_minutes:
@@ -396,7 +449,8 @@ class MemoryAgent:
                 self.last_reminder_action = {"action": "create", "kind": kind, "message": message,
                                               "interval_s": interval_s, "duration_s": duration_s,
                                               "object_class": object_class, "due_in_s": due_in_s,
-                                              "check_question": check_question}
+                                              "check_question": check_question,
+                                              "alert_on_detection": alert_on_detection}
                 return {"created": True, "kind": kind}, None
             if action == "cancel":
                 kind = tool_input.get("kind")
@@ -412,10 +466,10 @@ class MemoryAgent:
             frame = self.get_frame()
             if frame is None:
                 return {"available": False, "reason": "no frame captured yet"}, None
-            ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            if not ok:
+            jpeg_bytes = _encode_frame_for_vision(frame)
+            if jpeg_bytes is None:
                 return {"available": False, "reason": "couldn't encode the current frame"}, None
-            return {"available": True}, jpeg.tobytes()
+            return {"available": True}, jpeg_bytes
         return {"error": f"unknown tool {name}"}, None
 
     def ask(self, user_text: str) -> str:
@@ -597,10 +651,10 @@ class MemoryAgent:
         frame = self.get_frame()
         if frame is None:
             return None
-        ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        if not ok:
+        jpeg_bytes = _encode_frame_for_vision(frame)
+        if jpeg_bytes is None:
             return None
-        b64 = base64.b64encode(jpeg.tobytes()).decode("ascii")
+        b64 = base64.b64encode(jpeg_bytes).decode("ascii")
         # Without this framing, a generic vision-model answer reads in
         # third person ("he was looking at the camera") -- wrong on both
         # counts here: this image IS your own camera view (first person,

@@ -10,11 +10,22 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import chat
 from behavior.state_machine import State
+
+
+@pytest.fixture(autouse=True)
+def _unmute_after():
+    # voice.set_muted is process-global (see its own docstring) -- a test
+    # that mutes and forgets to clean up would silently break every later
+    # test in the whole suite that touches voice.speak(), not just this
+    # file's own tests.
+    yield
+    chat.voice.set_muted(False)
 
 
 class _FakeLamp:
@@ -124,10 +135,12 @@ class _FakeReminderEngine:
         self.cancelled = []
 
     def add(self, kind, message, interval_s=None, duration_s=None, object_class=None, due_in_s=None,
-            check_question=None):
-        self.added.append((kind, message, interval_s, duration_s, object_class, due_in_s, check_question))
+            check_question=None, alert_on_detection=False):
+        self.added.append((kind, message, interval_s, duration_s, object_class, due_in_s, check_question,
+                            alert_on_detection))
         return type("R", (), {"id": 1, "kind": kind, "message": message, "interval_s": interval_s,
                                "object_class": object_class, "check_question": check_question,
+                               "alert_on_detection": alert_on_detection,
                                "due_at": (time.time() + due_in_s) if due_in_s else None,
                                "expires_at": (time.time() + duration_s) if duration_s else None})()
 
@@ -140,7 +153,7 @@ def test_apply_reminder_action_create_adds_to_the_engine():
     engine = _FakeReminderEngine()
     chat._apply_reminder_action(
         {"action": "create", "kind": "recurring", "message": "stand up", "interval_s": 1800.0}, engine)
-    assert engine.added == [("recurring", "stand up", 1800.0, None, None, None, None)]
+    assert engine.added == [("recurring", "stand up", 1800.0, None, None, None, None, False)]
 
 
 def test_apply_reminder_action_create_passes_a_duration_through():
@@ -148,7 +161,7 @@ def test_apply_reminder_action_create_passes_a_duration_through():
     chat._apply_reminder_action(
         {"action": "create", "kind": "presence", "message": "come back", "interval_s": None,
          "duration_s": 20.0}, engine)
-    assert engine.added == [("presence", "come back", None, 20.0, None, None, None)]
+    assert engine.added == [("presence", "come back", None, 20.0, None, None, None, False)]
 
 
 def test_apply_reminder_action_create_passes_object_check_fields_through():
@@ -158,7 +171,17 @@ def test_apply_reminder_action_create_passes_object_check_fields_through():
          "interval_s": None, "object_class": "bottle", "due_in_s": 3600.0,
          "check_question": "is this bottle full or empty"}, engine)
     assert engine.added == [("object_check", "did you finish your water?", None, None, "bottle", 3600.0,
-                              "is this bottle full or empty")]
+                              "is this bottle full or empty", False)]
+
+
+def test_apply_reminder_action_create_passes_alert_on_detection_through():
+    engine = _FakeReminderEngine()
+    chat._apply_reminder_action(
+        {"action": "create", "kind": "object_check", "message": "get off your phone",
+         "interval_s": None, "object_class": "cell phone", "due_in_s": 300.0,
+         "check_question": None, "alert_on_detection": True}, engine)
+    assert engine.added == [("object_check", "get off your phone", None, None, "cell phone", 300.0,
+                              None, True)]
 
 
 def test_apply_reminder_action_cancel_targets_the_engine():
@@ -234,10 +257,13 @@ def test_flash_tone_on_tense_plays_no_sound_or_gesture():
     assert lamp.pose_calls == []
 
 
-def test_on_loud_during_listen_jerks_back_and_plays_startled():
+def test_on_loud_during_listen_jerks_back_and_plays_startled_then_chirps():
+    # Two sounds in order: the sharp startle snap first, then the actual
+    # "attention_seek" chirp right after -- see _on_loud_during_listen's
+    # own comment for why one sound alone read as an ambiguous blip.
     lamp = _FakeLamp()
     chat._on_loud_during_listen(lamp, rms=0.05)
-    assert lamp.sounds == ["startled"]
+    assert lamp.sounds == ["startled", "attention_seek"]
     assert len(lamp.pose_calls) == 1
 
 
@@ -650,12 +676,17 @@ def test_engaged_invitation_listen_gets_a_keep_waiting_callback(monkeypatch):
     assert seen_keep_waiting[0] is not None and callable(seen_keep_waiting[0])
 
 
-def test_a_real_followup_listen_gets_no_keep_waiting_callback(monkeypatch):
+def test_a_real_followup_listen_gets_a_keep_waiting_that_ignores_engagement(monkeypatch):
     # The opposite case: once actually in an open conversation
     # (in_conversation True), losing eye contact briefly while thinking of
     # a reply is expected, not a sign of walking away -- that listen must
-    # NOT be cut short by keep_waiting the way the engaged-invitation one
-    # deliberately is above.
+    # NOT be cut short by _check_engaged the way the engaged-invitation one
+    # deliberately is above. It's not plain None either, though -- it still
+    # needs to be a real callback so pause ('p' in main.py) can interrupt
+    # an open follow-up window, not just the engaged-invitation case (see
+    # _not_paused's own comment at the real call site for the live bug
+    # this covers: in_conversation staying True meant pause used to do
+    # nothing for up to a full follow-up timeout).
     monkeypatch.setattr(chat.voice, "preload", lambda: None)
     monkeypatch.setattr(chat.voice, "wait_for_wake_word", lambda *a, **k: "wake")
     monkeypatch.setattr(chat.voice, "speak", lambda text: None)
@@ -696,7 +727,178 @@ def test_a_real_followup_listen_gets_no_keep_waiting_callback(monkeypatch):
     chat.run(args, lamp=_FakeLamp(), store=_FakeStore(), fsm=_FakeFSM(State.DISENGAGED))
 
     assert calls["n"] == 2
-    assert seen_keep_waiting == [None]
+    assert len(seen_keep_waiting) == 1
+    keep_waiting = seen_keep_waiting[0]
+    assert keep_waiting is not None
+    assert keep_waiting() is True  # no paused_event given to chat.run here -- never blocks
+
+
+def test_a_real_followup_listens_keep_waiting_returns_false_once_paused(monkeypatch):
+    # The actual live bug: pausing mid-conversation used to do nothing --
+    # in_conversation stayed True, and the follow-up listen's keep_waiting
+    # was plain None, so nothing ever re-checked pause during the wait.
+    # Same setup as the test above, but flips paused_event after capturing
+    # the callback and checks it changes the result -- see the comment by
+    # that flip below for why it isn't set before chat.run runs.
+    monkeypatch.setattr(chat.voice, "preload", lambda: None)
+    monkeypatch.setattr(chat.voice, "wait_for_wake_word", lambda *a, **k: "wake")
+    monkeypatch.setattr(chat.voice, "speak", lambda text: None)
+
+    seen_keep_waiting = []
+    calls = {"n": 0}
+
+    def _fake_listen(speaker_detector, max_s=None, no_speech_timeout_s=None, shutdown_event=None, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "what's the time", None, 0, np.zeros(1600, dtype="float32")
+        seen_keep_waiting.append(kwargs.get("keep_waiting"))
+        return "quit", None, 0, np.zeros(1600, dtype="float32")
+
+    monkeypatch.setattr(chat, "_listen", _fake_listen)
+
+    class _FakeAgent:
+        def __init__(self, store, get_frame=None, apply_light=None):
+            self.last_light_action = None
+            self.last_reminder_action = None
+            self.last_recall = type("R", (), {"observation": None})()
+
+        def ask(self, question):
+            return "reply"
+
+    monkeypatch.setattr(chat, "MemoryAgent", _FakeAgent)
+
+    class _FakeStore:
+        def list_known_classes(self):
+            return []
+
+        def close(self):
+            pass
+
+    args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
+                               no_multi_user=True, wake_word="hey lamp")
+    # NOT set going in -- if it were, chat.run's own top-of-loop pause
+    # check would skip straight past the wake-word/first-listen flow
+    # before in_conversation ever became True, and the loop would spin on
+    # that check forever (no shutdown_event given here to break it). Set
+    # afterward instead, on the captured callback itself -- this is also a
+    # more faithful test: in the real thing, paused_event can flip *while*
+    # record_until_silence is already mid-poll on this exact closure.
+    paused_event = threading.Event()
+
+    chat.run(args, lamp=_FakeLamp(), store=_FakeStore(), fsm=_FakeFSM(State.DISENGAGED),
+             paused_event=paused_event)
+
+    assert calls["n"] == 2
+    keep_waiting = seen_keep_waiting[0]
+    assert keep_waiting is not None
+    assert keep_waiting() is True  # not paused during the run -- confirms the callback is live, not hardcoded
+
+    paused_event.set()
+    assert keep_waiting() is False  # same callback instance, now reflects pause
+
+
+def test_pause_skips_opening_the_mic_for_a_fresh_wake_word_listen(monkeypatch):
+    # Not in a conversation at all, pause already set from the start --
+    # the loop must spin on the pause check and never call
+    # wait_for_wake_word/_listen in the first place.
+    monkeypatch.setattr(chat.voice, "preload", lambda: None)
+    wake_word_calls = {"n": 0}
+    monkeypatch.setattr(chat.voice, "wait_for_wake_word", lambda *a, **k: wake_word_calls.update(n=wake_word_calls["n"] + 1))
+    listen_calls = {"n": 0}
+    monkeypatch.setattr(chat, "_listen", lambda *a, **k: listen_calls.update(n=listen_calls["n"] + 1))
+
+    class _FakeAgent:
+        def __init__(self, store, get_frame=None, apply_light=None):
+            self.last_light_action = None
+            self.last_reminder_action = None
+            self.last_recall = type("R", (), {"observation": None})()
+
+        def ask(self, question):
+            return "reply"
+
+    monkeypatch.setattr(chat, "MemoryAgent", _FakeAgent)
+
+    class _FakeStore:
+        def list_known_classes(self):
+            return []
+
+        def close(self):
+            pass
+
+    args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
+                               no_multi_user=True, wake_word="hey lamp")
+    paused_event = threading.Event()
+    paused_event.set()
+    shutdown_event = threading.Event()
+
+    # Flip shutdown after a few spins so the loop actually exits -- there's
+    # no other way out while paused_event stays set the whole time.
+    spins = {"n": 0}
+
+    def _count_and_maybe_stop(s):
+        spins["n"] += 1
+        if spins["n"] >= 3:
+            shutdown_event.set()
+
+    monkeypatch.setattr(chat.time, "sleep", _count_and_maybe_stop)
+
+    chat.run(args, lamp=_FakeLamp(), store=_FakeStore(), fsm=_FakeFSM(State.DISENGAGED),
+             shutdown_event=shutdown_event, paused_event=paused_event)
+
+    assert wake_word_calls["n"] == 0
+    assert listen_calls["n"] == 0
+    assert spins["n"] >= 3
+
+
+def test_mute_skips_opening_the_mic_for_a_fresh_wake_word_listen(monkeypatch):
+    # Same as the pause test above, but via voice.set_muted -- mute is
+    # main.py's separate 'm' toggle (independent of 'p'/paused_event, see
+    # _voice_suspended's own comment), and must gate the exact same
+    # top-of-loop skip.
+    monkeypatch.setattr(chat.voice, "preload", lambda: None)
+    wake_word_calls = {"n": 0}
+    monkeypatch.setattr(chat.voice, "wait_for_wake_word", lambda *a, **k: wake_word_calls.update(n=wake_word_calls["n"] + 1))
+    listen_calls = {"n": 0}
+    monkeypatch.setattr(chat, "_listen", lambda *a, **k: listen_calls.update(n=listen_calls["n"] + 1))
+
+    class _FakeAgent:
+        def __init__(self, store, get_frame=None, apply_light=None):
+            self.last_light_action = None
+            self.last_reminder_action = None
+            self.last_recall = type("R", (), {"observation": None})()
+
+        def ask(self, question):
+            return "reply"
+
+    monkeypatch.setattr(chat, "MemoryAgent", _FakeAgent)
+
+    class _FakeStore:
+        def list_known_classes(self):
+            return []
+
+        def close(self):
+            pass
+
+    args = argparse.Namespace(no_gui=True, voice=True, mute=True, ask=None,
+                               no_multi_user=True, wake_word="hey lamp")
+    chat.voice.set_muted(True)
+    shutdown_event = threading.Event()
+
+    spins = {"n": 0}
+
+    def _count_and_maybe_stop(s):
+        spins["n"] += 1
+        if spins["n"] >= 3:
+            shutdown_event.set()
+
+    monkeypatch.setattr(chat.time, "sleep", _count_and_maybe_stop)
+
+    chat.run(args, lamp=_FakeLamp(), store=_FakeStore(), fsm=_FakeFSM(State.DISENGAGED),
+             shutdown_event=shutdown_event)
+
+    assert wake_word_calls["n"] == 0
+    assert listen_calls["n"] == 0
+    assert spins["n"] >= 3
 
 
 def test_relax_to_idle_does_not_fight_an_active_engaged_look():

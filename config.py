@@ -125,6 +125,19 @@ WATCH_STATIONARY_TIMEOUT_S = 3.0  # give up watching a still-visible-but-not-mov
                                     # and return to a normal resting look after this long --
                                     # continuing to stare at something that stopped moving
                                     # reads as fixation, not attentiveness
+REMINDER_PLACEMENT_SETTLE_S = 1.5  # behavior/reminders.py's own placement-confirmation
+                                     # threshold -- used to just reuse WATCH_STATIONARY_TIMEOUT_S
+                                     # above for a "consistent feel," but that constant answers
+                                     # a different question ("when should I stop staring at
+                                     # something that's done moving") than this one does ("how
+                                     # long before I trust this position as a stable baseline
+                                     # to detect a disturbance against"). Kept short on purpose:
+                                     # every object_check reminder is gated behind this before
+                                     # the deadline check even gets a bearing to point at, and
+                                     # before disturbance-watching can start at all -- live
+                                     # testing showed the full 3.0s (compounded with however
+                                     # long it took to even get an initial sighting) reading as
+                                     # a confusingly long silence right after asking for a watch.
 WATCH_REACQUIRE_MARGIN = 2.5  # after giving up on a stationary object, require this many
                                 # times WATCH_REAIM_DEG of movement to re-acquire -- otherwise
                                 # a tiny bump on an otherwise-still phone would restart the
@@ -202,6 +215,18 @@ WHISPER_MODEL = "small.en"
 WAKE_WHISPER_MODEL = "tiny.en"
 VOICE_SAMPLE_RATE = 16000
 
+# Piper's own speaking-rate knob (see conversation/voice.py's _speak_piper),
+# separate from SAPI5's "rate" property below -- Piper is the primary TTS
+# path when its model files are present, SAPI5 is only the fallback, and
+# they don't share a control (this one scales phoneme duration, not wpm).
+# The model's own default is 1.0 (see en_US-amy-medium.onnx.json's
+# inference.length_scale); live testing found that read too slow/deliberate
+# for back-and-forth conversation. Lower = faster. 0.85 not chosen by ear
+# alone -- it's a bounded first cut, same caveat as every other threshold in
+# this file: raise it back toward 1.0 if it starts reading as rushed rather
+# than brisk.
+PIPER_LENGTH_SCALE = 0.85
+
 # Wake-word gated instead of a blind fixed-length recording window: the
 # mic passively polls in short chunks, only transcribing a chunk (via the
 # same local Whisper model) once it actually contains sound, and only
@@ -241,22 +266,59 @@ CONVERSATION_FOLLOWUP_TIMEOUT_S = 60.0
 # the same session (mostly 0.0000-0.0066).
 VOICE_GATE_RMS_THRESHOLD = 0.008
 
-# A real yell's RMS floor -- shared between conversation/voice.py (fires
-# the jerk-back/startled reaction live, mid-recording, off the raw audio
-# callback) and conversation/emotion.py (labels the whole utterance
-# "yelling" after the fact). One shared number so "did that count as a
-# yell" means the same thing whether it's judged in real time on a single
-# callback block or after the fact on peak-RMS over the full clip. Well
-# above VOICE_GATE_RMS_THRESHOLD and above conversation/emotion.py's own
-# _LOUD_RMS ("tense"/"energetic" territory) -- tuned by ear, same caveat
-# as every other threshold in this file.
-VOICE_YELL_RMS_THRESHOLD = 0.032
+# The "yelling" TEXT LABEL floor -- conversation/emotion.py's _classify(),
+# judged after the fact on peak-RMS over the full recorded clip. This used
+# to also gate the live jerk-back/startled reaction (conversation/
+# voice.py's on_loud callback) -- split apart (see VOICE_FLINCH_RMS_
+# THRESHOLD below) because the two need different sensitivities: the
+# physical flinch is a "did a loud tone happen at all" trip-wire that
+# should fire often and immediately, while the "yelling" label is a
+# rarer, more extreme classification. Sharing one number meant raising it
+# to stop the flinch mis-firing on merely-raised speech also silently
+# raised the bar for the text label past where it should sit, and vice
+# versa. Well above VOICE_GATE_RMS_THRESHOLD and conversation/emotion.py's
+# own _LOUD_RMS ("tense"/"energetic" territory). 0.032 (the original
+# value) fired on ordinary talking -- live-measured RMS while just
+# speaking normally sometimes reached exactly that. 0.04 (tried next) was
+# still too close to that same normal-talking peak to leave real margin.
+VOICE_YELL_RMS_THRESHOLD = 0.5
+
+# The live jerk-back/startled reaction's own floor (conversation/voice.py's
+# on_loud callback, checked synchronously off raw audio mid-recording --
+# see that callback's own docstring for why this is deliberately a dumb
+# immediate trip-wire, not a tone judgment, not VOICE_YELL_RMS_THRESHOLD
+# above). Also reused by conversation/emotion.py's _ANGRY_RMS as the point
+# where the "tense"/"energetic" text classification stops blending in
+# speaking rate and trusts loudness alone -- a live physical reaction and
+# the text label a moment later should agree on when a loud tone actually
+# happened. Set above VOICE_GATE_RMS_THRESHOLD/normal-talking peaks (up to
+# ~0.032, see VOICE_YELL_RMS_THRESHOLD's own comment) but far below
+# VOICE_YELL_RMS_THRESHOLD itself -- a startle reaction should trip on a
+# genuinely raised voice, not require the same extremity as the "yelling"
+# text label.
+VOICE_FLINCH_RMS_THRESHOLD = 0.07
 
 # --- Interruption awareness -------------------------------------------------
 # RMS level (float32 samples, [-1, 1]) above which the mic counts as
-# "something's going on" -- talking, TV, music. Measured ambient noise
-# floor on this machine was ~0.00003; this leaves well over 2 orders of
-# magnitude of headroom. Mic gain/distance varies by setup, so treat this
-# as a starting point, not a calibrated constant.
-AUDIO_GATE_RMS_THRESHOLD = 0.02
-AUDIO_GATE_SUSTAIN_S = 0.6  # how long "recently active" holds true after the last loud block
+# "something's going on" -- talking, TV, music. This shares the same
+# physical mic as VOICE_GATE_RMS_THRESHOLD above (one laptop mic, no
+# separate lamp hardware), so it should never have been calibrated
+# separately -- it was, and it inherited the same bug that constant was
+# already fixed for: 0.02 sits above the real-speech peaks this mic
+# actually produces (~0.010-0.016, see VOICE_GATE_RMS_THRESHOLD's
+# comment), so ordinary talking never crossed it and interruption
+# awareness was silently a no-op since it was added. Matched to
+# VOICE_GATE_RMS_THRESHOLD's already-validated value instead of picking
+# a new one -- same mic, same room, same "comfortably below real speech,
+# above the ambient floor" reasoning applies.
+AUDIO_GATE_RMS_THRESHOLD = 0.008
+
+# How long is_active() keeps reporting "busy" after the last loud block --
+# equivalently, how many consecutive silent seconds it takes to actually
+# count as quiet again. This IS the "wait N seconds of continuous silence"
+# gate (see AudioActivityMonitor's own docstring), it was just tuned too
+# short: 0.6s doesn't survive a normal conversational breath/pause, so
+# talking to someone else with even a one-beat gap read as "quiet" and let
+# attention-seeking start mid-conversation. 3.0s tolerates a real pause
+# without tolerating an actually-finished conversation for long.
+AUDIO_GATE_SUSTAIN_S = 3.0
