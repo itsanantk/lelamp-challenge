@@ -5,7 +5,9 @@ motion/light/sound, keeps a memory of objects it's seen, and can answer
 questions about that memory through an LLM. Full writeup with diagrams is
 in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); a criteria-by-criteria
 mapping to the challenge brief is in
-[docs/requirements_traceability.md](docs/requirements_traceability.md).
+[docs/requirements_traceability.md](docs/requirements_traceability.md);
+quick-reference evaluation numbers (no prose to dig through) are in
+[docs/EVALUATION.md](docs/EVALUATION.md).
 
 I don't have a physical LeLamp, so the arm/light/speaker are simulated
 behind a small hardware abstraction layer (`lamp/hal.py`). A real driver
@@ -353,6 +355,49 @@ specific segment.
 
 ## Evaluation
 
+Real numbers, from a real labeled session (`session_20260804_134637.csv`,
+1224 frames over 70.1s, a deliberate mixed pattern of quick glances and
+longer stretches). Full methodology, discussion, and the separate voice/
+recall-pipeline latency breakdown are in `docs/ARCHITECTURE.md` §4 — this
+is the short version.
+
+**Engagement detection reliability**
+
+| | precision | recall | F1 | accuracy |
+|---|---|---|---|---|
+| raw (n=1224) | 0.851 | 0.856 | 0.853 | 0.880 |
+| windowed, excludes ±500ms around a label change (n=1002) | 0.933 | 0.972 | **0.952** | 0.962 |
+
+Flicker: 11.1 predicted-state changes/min. The raw/windowed gap is mostly
+the hysteresis working as designed (see §4) — not noise being excluded to
+flatter the number.
+
+**Latency (p50 / p95 / p99 / max, ms)**
+
+| Stage | n | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|
+| Engagement (frame -> yaw/pitch) | 1224 | 13.8 | 17.1 | 19.2 | 23.9 |
+| YOLO memory scan (when it runs) | 63 | 44.3 | 55.9 | 61.4 | 64.2 |
+| Full per-frame loop | 1224 | 44.4 | 84.4 | 132.1 | 153.6 |
+
+**End-to-end voice/recall latency** (measured directly against the real
+local models + LLM API on this machine, not from the per-frame CSV log —
+see §4 for why those need separate methodology):
+
+| Stage | Latency |
+|---|---|
+| Wake-word chunk transcription (tiny.en) | ~155ms |
+| Full-question transcription (small.en) | ~1.0s |
+| LLM reply, no tool call | ~1.6s |
+| LLM reply, tool-triggering turn | ~3.4s |
+| Vision judgment (judge_view, downscaled frame) | ~2.5s |
+| TTS synthesis (compute only) | 105-167ms |
+
+Rough feel for a full voice round trip: **4-6 seconds**, wake-word to
+reply-starts-playing, for a typical question.
+
+To reproduce or re-run against a fresh session:
+
 ```
 python main.py --label     # run for a minute or two, toggling SPACE to match reality
 python -m eval.engagement_eval     # precision/recall/F1/flicker-rate from that session
@@ -430,4 +475,5 @@ tests/                     263 tests total, no camera/mic required -- one file p
                             e.g. tests/test_reminders.py, tests/test_agent.py, tests/test_hand_wave.py
 docs/ARCHITECTURE.md       full writeup
 docs/requirements_traceability.md   challenge brief -> where it's addressed
+docs/EVALUATION.md         quick-reference eval numbers, no prose
 ```

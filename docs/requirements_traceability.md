@@ -11,15 +11,15 @@ checkable in one pass instead of hunting through the full writeup.
 | Data flow (high/low-level) | `docs/ARCHITECTURE.md` §2 (per-frame loop + recall sequence diagrams) |
 | Design decisions and tradeoffs | `docs/ARCHITECTURE.md` §3 |
 | Demo video | see README "Recording the actual video" |
-| Engagement detection reliability metrics | `eval/engagement_eval.py` — precision/recall/F1/flicker-rate |
-| End-to-end latency measurements | `eval/latency_eval.py` — p50/p95/p99/max per stage |
+| Engagement detection reliability metrics | **[docs/EVALUATION.md](EVALUATION.md)** — windowed F1 0.952 (precision 0.933, recall 0.972), raw F1 0.853, 11.1 flicker/min. Reproducible via `eval/engagement_eval.py`; full discussion in `docs/ARCHITECTURE.md` §4 |
+| End-to-end latency measurements | **[docs/EVALUATION.md](EVALUATION.md)** — per-frame pipeline (engagement p50 13.8ms, YOLO p50 44.3ms, full loop p50 44.4ms) *and* the voice/recall pipeline (wake word, transcription, LLM, vision judgment, TTS — ~4-6s typical round trip). Reproducible via `eval/latency_eval.py`; full discussion in `docs/ARCHITECTURE.md` §4 |
 
 ## What we're looking for
 
 | Criteria | Where |
 |---|---|
 | Architecture — well-structured, cleanly separated modules | `perception/` only produces readings, `behavior/` only talks to the `LampActuator` interface, `memory/store.py` is the single read/write point, `conversation/` only reasons over tool results. See `docs/ARCHITECTURE.md` §1 for the boundaries and why. |
-| Perception pipeline — reliable real-time engagement detection | `perception/engagement.py`: MediaPipe head pose, two-threshold hysteresis (deadband + dwell frames) against single-cutoff flicker. Measured in `eval/engagement_eval.py`. |
+| Perception pipeline — reliable real-time engagement detection | `perception/engagement.py`: MediaPipe head pose, two-threshold hysteresis (deadband + dwell frames) against single-cutoff flicker. Windowed F1 0.952, per-frame p50 13.8ms — see [docs/EVALUATION.md](EVALUATION.md). |
 | Behavior design — expressive and natural reactions | `lamp/motion.py`: anticipation + overshoot easing, randomized per-move so nothing repeats identically. `behavior/state_machine.py`: attention-seeking escalates in intensity across attempts instead of repeating the same gesture. `lamp/sim_backend.py`: synthesized sound cues, randomized per play. |
 | Memory system — accurate store/retrieve | `memory/store.py` (SQLite) + `conversation/agent.py` tool-use: the LLM can only answer from `recall_object_location`/`list_seen_objects` results, so it can't fabricate a location not actually in the store. |
 | Tradeoff reasoning | `docs/ARCHITECTURE.md` §3 — each design decision states the alternative considered and why it lost (e.g. head pose vs. iris tracking, discrete-burst vs. continuous object tracking). |
